@@ -994,8 +994,8 @@ function parseTabConfigJson(configJson) {
   return parseJsonObject(configJson, {});
 }
 
-function getDeviceUpdateTimeMs(deviceName) {
-  const row = db.prepare('SELECT updateTime FROM devices WHERE name = ?').get(deviceName);
+async function getDeviceUpdateTimeMs(deviceName) {
+  const row = await dbx.get('SELECT updateTime FROM devices WHERE name = ?', [deviceName]);
   if (!row?.updateTime) return null;
   const timestamp = Date.parse(row.updateTime);
   return Number.isFinite(timestamp) ? timestamp : null;
@@ -1063,24 +1063,20 @@ function parseAssignmentId(assignmentId) {
   return { tabNumber, widgetName };
 }
 
-function getTabsForDevice(deviceName) {
-  return db
-    .prepare('SELECT id, device_name, number, label, icon, show_label, created_at, config_json FROM tabs WHERE device_name = ? ORDER BY number ASC')
-    .all(deviceName);
+async function getTabsForDevice(deviceName) {
+  return dbx.all('SELECT id, device_name, number, label, icon, show_label, created_at, config_json FROM tabs WHERE device_name = ? ORDER BY number ASC', [deviceName]);
 }
 
-function getTabByNumber(deviceName, tabNumber) {
-  return db
-    .prepare('SELECT id, device_name, number, label, icon, show_label, created_at, config_json FROM tabs WHERE device_name = ? AND number = ?')
-    .get(deviceName, tabNumber);
+async function getTabByNumber(deviceName, tabNumber) {
+  return dbx.get('SELECT id, device_name, number, label, icon, show_label, created_at, config_json FROM tabs WHERE device_name = ? AND number = ?', [deviceName, tabNumber]);
 }
 
-function saveTabConfigById(tabId, layoutMap) {
-  db.prepare('UPDATE tabs SET config_json = ? WHERE id = ?').run(JSON.stringify(layoutMap), tabId);
+async function saveTabConfigById(tabId, layoutMap) {
+  await dbx.run('UPDATE tabs SET config_json = ? WHERE id = ?', [JSON.stringify(layoutMap), tabId]);
 }
 
-function listWidgetAssignmentsFromTabLayouts(deviceName) {
-  const tabs = getTabsForDevice(deviceName);
+async function listWidgetAssignmentsFromTabLayouts(deviceName) {
+  const tabs = await getTabsForDevice(deviceName);
   const rows = [];
 
   tabs.forEach((tab) => {
@@ -1103,12 +1099,12 @@ function listWidgetAssignmentsFromTabLayouts(deviceName) {
   return rows;
 }
 
-function ensureHomeTabExists(deviceName) {
+async function ensureHomeTabExists(deviceName) {
   // Insert default home tab if it doesn't exist
   try {
-    const homeTab = db.prepare('SELECT id FROM tabs WHERE number = 1 AND device_name = ?').get(deviceName);
+    const homeTab = await dbx.get('SELECT id FROM tabs WHERE number = 1 AND device_name = ?', [deviceName]);
     if (!homeTab) {
-      db.prepare('INSERT INTO tabs (label, icon, show_label, number, device_name, config_json) VALUES (?, ?, ?, ?, ?, ?)').run('Home', 'home', 1, 1, deviceName, '{}');
+      await dbx.run('INSERT INTO tabs (label, icon, show_label, number, device_name, config_json) VALUES (?, ?, ?, ?, ?, ?)', ['Home', 'home', 1, 1, deviceName, '{}']);
       console.log('Default home tab created');
     }
   } catch (error) {
@@ -1116,8 +1112,8 @@ function ensureHomeTabExists(deviceName) {
   }
 }
 
-function doesDeviceExist(deviceName) {
-  const device = db.prepare('SELECT name FROM devices WHERE name = ?').get(deviceName);
+async function doesDeviceExist(deviceName) {
+  const device = await dbx.get('SELECT name FROM devices WHERE name = ?', [deviceName]);
   return !!device;
 }
 
@@ -1136,30 +1132,28 @@ function buildDefaultHomeTab(deviceName) {
   // endRegion #98
 }
 
-function ensureDeviceExists(deviceName) {
-  db.prepare('INSERT OR IGNORE INTO devices (name, updateTime) VALUES (?, CURRENT_TIMESTAMP)').run(deviceName);
-  ensureHomeTabExists(deviceName);
+async function ensureDeviceExists(deviceName) {
+  await dbx.run('INSERT OR IGNORE INTO devices (name, updateTime) VALUES (?, CURRENT_TIMESTAMP)', [deviceName]);
+  await ensureHomeTabExists(deviceName);
 }
-function touchDeviceUpdateTime(deviceName) {
-  db.prepare('UPDATE devices SET updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(deviceName);
+async function touchDeviceUpdateTime(deviceName) {
+  await dbx.run('UPDATE devices SET updateTime = CURRENT_TIMESTAMP WHERE name = ?', [deviceName]);
 }
 
 // Devices API Endpoints
 fastify.get('/api/devices', async (request, reply) => {
   try {
-    const devices = db.prepare('SELECT name, updateTime FROM devices ORDER BY updateTime DESC').all();
-    return devices.map((device) => {
-      const tabs = getTabsForDevice(device.name);
+    const devices = await dbx.all('SELECT name, updateTime FROM devices ORDER BY updateTime DESC');
+    const result = [];
+    for (const device of devices) {
+      const tabs = await getTabsForDevice(device.name);
       const widgetCount = tabs.reduce((count, tab) => {
         const layoutMap = parseTabConfigJson(tab.config_json);
         return count + Object.keys(layoutMap).length;
       }, 0);
-
-      return {
-        ...device,
-        widgets: widgetCount,
-      };
-    });
+      result.push({ ...device, widgets: widgetCount });
+    }
+    return result;
   } catch (error) {
     console.error('Error fetching devices:', error);
     reply.status(500).send({ error: 'Failed to fetch devices' });
@@ -1173,8 +1167,8 @@ fastify.get('/api/devices/:deviceName/settings', async (request, reply) => {
   }
 
   try {
-    const row = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(deviceName);
-    const lastModifiedMs = getDeviceUpdateTimeMs(deviceName);
+    const row = await dbx.get('SELECT device_settings_json FROM devices WHERE name = ?', [deviceName]);
+    const lastModifiedMs = await getDeviceUpdateTimeMs(deviceName);
     if (!row) {
       return sendJsonWithConditionalCache(request, reply, {}, null);
     }
@@ -1198,15 +1192,15 @@ const upsertDeviceSettings = async (request, reply) => {
   }
 
   try {
-    ensureDeviceExists(deviceName);
-    const row = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(deviceName);
+    await ensureDeviceExists(deviceName);
+    const row = await dbx.get('SELECT device_settings_json FROM devices WHERE name = ?', [deviceName]);
     const existingSettings = parseJsonObject(row?.device_settings_json, {});
     const merged = { ...existingSettings, ...incoming };
 
-    db.prepare('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(
+    await dbx.run('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?', [
       JSON.stringify(merged),
       deviceName
-    );
+    ]);
 
     return merged;
   } catch (error) {
@@ -1238,17 +1232,17 @@ fastify.patch('/api/devices/:deviceName', async (request, reply) => {
   }
 
   try {
-    const existingDevice = db.prepare('SELECT name FROM devices WHERE name = ?').get(deviceName);
+    const existingDevice = await dbx.get('SELECT name FROM devices WHERE name = ?', [deviceName]);
     if (!existingDevice) {
       return reply.status(404).send({ error: 'Device not found' });
     }
 
-    const alreadyUsed = db.prepare('SELECT name FROM devices WHERE name = ?').get(trimmedNewName);
+    const alreadyUsed = await dbx.get('SELECT name FROM devices WHERE name = ?', [trimmedNewName]);
     if (alreadyUsed) {
       return reply.status(409).send({ error: 'A device with that name already exists' });
     }
 
-    db.prepare('UPDATE devices SET name = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(trimmedNewName, deviceName);
+    await dbx.run('UPDATE devices SET name = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?', [trimmedNewName, deviceName]);
     return { success: true, name: trimmedNewName, message: 'Device name updated successfully' };
   } catch (error) {
     console.error('Error updating device name:', error);
@@ -1268,35 +1262,38 @@ fastify.post('/api/devices/:deviceName/copy-from/:sourceDeviceName', async (requ
   }
 
   try {
-    const sourceExists = db.prepare('SELECT name FROM devices WHERE name = ?').get(sourceDeviceName);
+    const sourceExists = await dbx.get('SELECT name FROM devices WHERE name = ?', [sourceDeviceName]);
     if (!sourceExists) {
       return reply.status(404).send({ error: 'Source device not found' });
     }
 
-    ensureDeviceExists(deviceName);
-    const sourceDeviceSettings = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(sourceDeviceName);
+    await ensureDeviceExists(deviceName);
+    const sourceDeviceSettings = await dbx.get('SELECT device_settings_json FROM devices WHERE name = ?', [sourceDeviceName]);
 
-    const copyTransaction = db.transaction(() => {
-      db.prepare('DELETE FROM tabs WHERE device_name = ?').run(deviceName);
+    await dbx.tx(async (tx) => {
+      await tx.run('DELETE FROM tabs WHERE device_name = ?', [deviceName]);
 
-      db.prepare(`
+      await tx.run(`
         INSERT INTO tabs (device_name, label, icon, show_label, number, created_at, config_json)
         SELECT ?, label, icon, show_label, number, created_at, COALESCE(config_json, '{}')
         FROM tabs
         WHERE device_name = ?
         ORDER BY number ASC
-      `).run(deviceName, sourceDeviceName);
+      `, [deviceName, sourceDeviceName]);
 
-      db.prepare('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(
+      await tx.run('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?', [
         sourceDeviceSettings?.device_settings_json || '{}',
         deviceName
-      );
+      ]);
 
-      ensureHomeTabExists(deviceName);
-      touchDeviceUpdateTime(deviceName);
+      // ensure the permanent home tab exists, then bump the device update time
+      const homeTab = await tx.get('SELECT id FROM tabs WHERE number = 1 AND device_name = ?', [deviceName]);
+      if (!homeTab) {
+        await tx.run('INSERT INTO tabs (label, icon, show_label, number, device_name, config_json) VALUES (?, ?, ?, ?, ?, ?)', ['Home', 'home', 1, 1, deviceName, '{}']);
+      }
+      await tx.run('UPDATE devices SET updateTime = CURRENT_TIMESTAMP WHERE name = ?', [deviceName]);
     });
 
-    copyTransaction();
     return { success: true, message: 'Device tabs and widget settings copied successfully' };
   } catch (error) {
     console.error('Error copying device data:', error);
@@ -1312,10 +1309,9 @@ fastify.delete('/api/devices/:deviceName', async (request, reply) => {
   }
 
   try {
-    const stmt = db.prepare('DELETE FROM devices WHERE name = ?');
-    const result = stmt.run(deviceName);
+    const result = await dbx.run('DELETE FROM devices WHERE name = ?', [deviceName]);
 
-    if (result.changes === 0) {
+    if (result.rowCount === 0) {
       return reply.status(404).send({ error: 'Device not found' });
     }
 
@@ -2230,8 +2226,8 @@ fastify.get('/api/devices/:deviceName/tabs', async (request, reply) => {
   }
 
   try {
-    const tabs = db.prepare('SELECT * FROM tabs WHERE device_name = ? ORDER BY number ASC').all(deviceName);
-    const lastModifiedMs = getDeviceUpdateTimeMs(deviceName);
+    const tabs = await dbx.all('SELECT * FROM tabs WHERE device_name = ? ORDER BY number ASC', [deviceName]);
+    const lastModifiedMs = await getDeviceUpdateTimeMs(deviceName);
     // region #98 - expected to get removed in the future (legacy empty-tabs API fallback)
     if (tabs.length === 0) {
       return sendJsonWithConditionalCache(request, reply, [buildDefaultHomeTab(deviceName)], null);
@@ -2249,7 +2245,7 @@ fastify.post('/api/devices/:deviceName/tabs', async (request, reply) => {
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
   const { label, icon, show_label } = request.body;
 
   if (!label || !icon) {
@@ -2257,12 +2253,11 @@ fastify.post('/api/devices/:deviceName/tabs', async (request, reply) => {
   }
 
   try {
-    const maxOrder = db.prepare('SELECT MAX(number) as max FROM tabs WHERE device_name = ?').get(deviceName);
+    const maxOrder = await dbx.get('SELECT MAX(number) as max FROM tabs WHERE device_name = ?', [deviceName]);
     const nextTabNumber = (maxOrder.max || 0) + 1;
 
-    const stmt = db.prepare('INSERT INTO tabs (device_name, label, icon, show_label, number, config_json) VALUES (?, ?, ?, ?, ?, ?) RETURNING *');
-    const row = stmt.get(deviceName, label, icon, show_label ? 1 : 0, nextTabNumber, '{}');
-    touchDeviceUpdateTime(deviceName);
+    const row = await dbx.get('INSERT INTO tabs (device_name, label, icon, show_label, number, config_json) VALUES (?, ?, ?, ?, ?, ?) RETURNING *', [deviceName, label, icon, show_label ? 1 : 0, nextTabNumber, '{}']);
+    await touchDeviceUpdateTime(deviceName);
 
     return row;
   } catch (error) {
@@ -2277,7 +2272,7 @@ fastify.patch('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply)
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
   if (parseInt(tabNumber) === 1) {
     return reply.status(400).send({ error: 'Cannot modify home tab' });
   }
@@ -2305,9 +2300,8 @@ fastify.patch('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply)
 
     values.push(tabNumber);
     values.push(deviceName);
-    const stmt = db.prepare(`UPDATE tabs SET ${updates.join(', ')} WHERE number = ? AND device_name = ? RETURNING *`);
-    const row = stmt.get(...values);
-    touchDeviceUpdateTime(deviceName);
+    const row = await dbx.get(`UPDATE tabs SET ${updates.join(', ')} WHERE number = ? AND device_name = ? RETURNING *`, values);
+    await touchDeviceUpdateTime(deviceName);
 
     return row;
   } catch (error) {
@@ -2323,16 +2317,14 @@ fastify.patch('/api/devices/:deviceName/tabs/reorder', async (request, reply) =>
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
 
   if (!Array.isArray(orderedTabNumbers)) {
     return reply.status(400).send({ error: 'orderedTabNumbers array is required' });
   }
 
   try {
-    const nonHomeTabs = db
-      .prepare('SELECT id, number FROM tabs WHERE device_name = ? AND number != 1 ORDER BY number ASC')
-      .all(deviceName);
+    const nonHomeTabs = await dbx.all('SELECT id, number FROM tabs WHERE device_name = ? AND number != 1 ORDER BY number ASC', [deviceName]);
 
     if (orderedTabNumbers.length !== nonHomeTabs.length) {
       return reply.status(400).send({ error: 'orderedTabNumbers length does not match current tab count' });
@@ -2352,24 +2344,18 @@ fastify.patch('/api/devices/:deviceName/tabs/reorder', async (request, reply) =>
     const tabsByNumber = new Map(nonHomeTabs.map(tab => [tab.number, tab]));
     const orderedTabIds = orderedTabNumbers.map(number => tabsByNumber.get(number).id);
 
-    const reorderTransaction = db.transaction((ids) => {
-      const tempStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-      const finalStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-
-      ids.forEach((id, index) => {
-        // Move to temporary values to avoid UNIQUE(device_name, number) collisions.
-        tempStmt.run(-1000 - index, id, deviceName);
-      });
-
-      ids.forEach((id, index) => {
-        finalStmt.run(index + 2, id, deviceName);
-      });
+    await dbx.tx(async (tx) => {
+      // Move to temporary values to avoid UNIQUE(device_name, number) collisions.
+      for (let index = 0; index < orderedTabIds.length; index++) {
+        await tx.run('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?', [-1000 - index, orderedTabIds[index], deviceName]);
+      }
+      for (let index = 0; index < orderedTabIds.length; index++) {
+        await tx.run('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?', [index + 2, orderedTabIds[index], deviceName]);
+      }
     });
+    await touchDeviceUpdateTime(deviceName);
 
-    reorderTransaction(orderedTabIds);
-    touchDeviceUpdateTime(deviceName);
-
-    const updatedTabs = db.prepare('SELECT * FROM tabs WHERE device_name = ? ORDER BY number ASC').all(deviceName);
+    const updatedTabs = await dbx.all('SELECT * FROM tabs WHERE device_name = ? ORDER BY number ASC', [deviceName]);
     return updatedTabs;
   } catch (error) {
     console.error('Error reordering tabs:', error);
@@ -2382,7 +2368,7 @@ fastify.delete('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
 
   if (parseInt(tabNumber) === 1) {
     return reply.status(400).send({ error: 'Cannot delete home tab' });
@@ -2391,12 +2377,12 @@ fastify.delete('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply
   try {
     const parsedTabNumber = parseInt(tabNumber, 10);
 
-    const sourceTab = getTabByNumber(deviceName, parsedTabNumber);
+    const sourceTab = await getTabByNumber(deviceName, parsedTabNumber);
     if (!sourceTab) {
       return reply.status(404).send({ error: 'Tab not found' });
     }
 
-    const homeTab = getTabByNumber(deviceName, 1);
+    const homeTab = await getTabByNumber(deviceName, 1);
     const sourceLayoutMap = parseTabConfigJson(sourceTab.config_json);
     const homeLayoutMap = parseTabConfigJson(homeTab?.config_json);
     let homeChanged = false;
@@ -2409,31 +2395,22 @@ fastify.delete('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply
     });
 
     if (homeTab && homeChanged) {
-      saveTabConfigById(homeTab.id, homeLayoutMap);
+      await saveTabConfigById(homeTab.id, homeLayoutMap);
     }
 
-    const deleteStmt = db.prepare('DELETE FROM tabs WHERE number = ? AND device_name = ?');
-    deleteStmt.run(parsedTabNumber, deviceName);
+    await dbx.run('DELETE FROM tabs WHERE number = ? AND device_name = ?', [parsedTabNumber, deviceName]);
 
-    const remainingTabs = db
-      .prepare('SELECT id FROM tabs WHERE device_name = ? AND number != 1 ORDER BY number ASC')
-      .all(deviceName);
+    const remainingTabs = await dbx.all('SELECT id FROM tabs WHERE device_name = ? AND number != 1 ORDER BY number ASC', [deviceName]);
 
-    const renumberTransaction = db.transaction((tabRows) => {
-      const tempStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-      const finalStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-
-      tabRows.forEach((row, index) => {
-        tempStmt.run(-2000 - index, row.id, deviceName);
-      });
-
-      tabRows.forEach((row, index) => {
-        finalStmt.run(index + 2, row.id, deviceName);
-      });
+    await dbx.tx(async (tx) => {
+      for (let index = 0; index < remainingTabs.length; index++) {
+        await tx.run('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?', [-2000 - index, remainingTabs[index].id, deviceName]);
+      }
+      for (let index = 0; index < remainingTabs.length; index++) {
+        await tx.run('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?', [index + 2, remainingTabs[index].id, deviceName]);
+      }
     });
-
-    renumberTransaction(remainingTabs);
-    touchDeviceUpdateTime(deviceName);
+    await touchDeviceUpdateTime(deviceName);
 
     return { success: true, message: 'Tab deleted successfully' };
   } catch (error) {
@@ -2449,8 +2426,8 @@ fastify.get('/api/devices/:deviceName/widget-assignments', async (request, reply
     return reply.status(400).send({ error: 'deviceName is required' });
   }
   try {
-    const lastModifiedMs = getDeviceUpdateTimeMs(deviceName);
-    return sendJsonWithConditionalCache(request, reply, listWidgetAssignmentsFromTabLayouts(deviceName), lastModifiedMs);
+    const lastModifiedMs = await getDeviceUpdateTimeMs(deviceName);
+    return sendJsonWithConditionalCache(request, reply, await listWidgetAssignmentsFromTabLayouts(deviceName), lastModifiedMs);
   } catch (error) {
     console.error('Error fetching widget assignments:', error);
     reply.status(500).send({ error: 'Failed to fetch widget assignments' });
@@ -2468,9 +2445,9 @@ fastify.post('/api/devices/:deviceName/widget-assignments', async (request, repl
   }
 
   try {
-    ensureDeviceExists(deviceName);
+    await ensureDeviceExists(deviceName);
     const parsedTabNumber = parseInt(tabNumber, 10);
-    const tab = getTabByNumber(deviceName, parsedTabNumber);
+    const tab = await getTabByNumber(deviceName, parsedTabNumber);
     if (!tab) {
       return reply.status(404).send({ error: 'Tab not found' });
     }
@@ -2489,8 +2466,8 @@ fastify.post('/api/devices/:deviceName/widget-assignments', async (request, repl
       layout_h: null,
     };
 
-    saveTabConfigById(tab.id, layoutMap);
-    touchDeviceUpdateTime(deviceName);
+    await saveTabConfigById(tab.id, layoutMap);
+    await touchDeviceUpdateTime(deviceName);
 
     return {
       id: buildAssignmentId(parsedTabNumber, widget_name),
@@ -2520,7 +2497,7 @@ fastify.delete('/api/devices/:deviceName/widget-assignments/:id', async (request
       return reply.status(400).send({ error: 'Invalid assignment id' });
     }
 
-    const tab = getTabByNumber(deviceName, parsedId.tabNumber);
+    const tab = await getTabByNumber(deviceName, parsedId.tabNumber);
     if (!tab) {
       return reply.status(404).send({ error: 'Assignment not found' });
     }
@@ -2531,8 +2508,8 @@ fastify.delete('/api/devices/:deviceName/widget-assignments/:id', async (request
     }
 
     delete layoutMap[parsedId.widgetName];
-    saveTabConfigById(tab.id, layoutMap);
-    touchDeviceUpdateTime(deviceName);
+    await saveTabConfigById(tab.id, layoutMap);
+    await touchDeviceUpdateTime(deviceName);
     return { success: true, message: 'Assignment deleted successfully' };
   } catch (error) {
     console.error('Error deleting widget assignment:', error);
@@ -2547,20 +2524,20 @@ fastify.delete('/api/devices/:deviceName/widget-assignments/widget/:widgetName',
   }
 
   try {
-    const tabs = getTabsForDevice(deviceName);
+    const tabs = await getTabsForDevice(deviceName);
     let changed = false;
 
-    tabs.forEach((tab) => {
+    for (const tab of tabs) {
       const layoutMap = parseTabConfigJson(tab.config_json);
       if (widgetName in layoutMap) {
         delete layoutMap[widgetName];
-        saveTabConfigById(tab.id, layoutMap);
+        await saveTabConfigById(tab.id, layoutMap);
         changed = true;
       }
-    });
+    }
 
     if (changed) {
-      touchDeviceUpdateTime(deviceName);
+      await touchDeviceUpdateTime(deviceName);
     }
     return { success: true, message: 'Widget assignments deleted successfully' };
   } catch (error) {
@@ -2591,9 +2568,9 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout', async (reque
   }
 
   try {
-    ensureDeviceExists(deviceName);
+    await ensureDeviceExists(deviceName);
     const parsedTabNumber = parseInt(tabNumber, 10);
-    const tab = getTabByNumber(deviceName, parsedTabNumber);
+    const tab = await getTabByNumber(deviceName, parsedTabNumber);
     if (!tab) {
       return reply.status(404).send({ error: 'Assignment not found' });
     }
@@ -2621,9 +2598,9 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout', async (reque
       ...normalizedLayout,
       ...mergedSettings,
     };
-    saveTabConfigById(tab.id, layoutMap);
+    await saveTabConfigById(tab.id, layoutMap);
 
-    touchDeviceUpdateTime(deviceName);
+    await touchDeviceUpdateTime(deviceName);
     return {
       id: buildAssignmentId(parsedTabNumber, widget_name),
       device_name: deviceName,
@@ -2648,9 +2625,9 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout/bulk', async (
   }
 
   try {
-    ensureDeviceExists(deviceName);
+    await ensureDeviceExists(deviceName);
     const tabsByNumber = new Map(
-      getTabsForDevice(deviceName).map(tab => [tab.number, {
+      (await getTabsForDevice(deviceName)).map(tab => [tab.number, {
         tab,
         layoutMap: parseTabConfigJson(tab.config_json),
         changed: false,
@@ -2688,14 +2665,14 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout/bulk', async (
       anyChanged = true;
     }
 
-    tabsByNumber.forEach((tabEntry) => {
+    for (const tabEntry of tabsByNumber.values()) {
       if (tabEntry.changed) {
-        saveTabConfigById(tabEntry.tab.id, tabEntry.layoutMap);
+        await saveTabConfigById(tabEntry.tab.id, tabEntry.layoutMap);
       }
-    });
+    }
 
     if (anyChanged) {
-      touchDeviceUpdateTime(deviceName);
+      await touchDeviceUpdateTime(deviceName);
     }
 
     return { success: true, message: 'Layouts updated successfully' };
