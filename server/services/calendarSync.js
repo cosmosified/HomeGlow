@@ -50,7 +50,7 @@ class CalendarSyncService {
     this.isSyncing.set(sourceId, true);
 
     try {
-      const source = this.db.prepare('SELECT * FROM calendar_sources WHERE id = ? AND enabled = 1').get(sourceId);
+      const source = await this.db.get('SELECT * FROM calendar_sources WHERE id = ? AND enabled = 1', [sourceId]);
       if (!source) {
         console.log(`Source ${sourceId} not found or disabled`);
         return { success: false, error: 'Source not found or disabled' };
@@ -71,17 +71,15 @@ class CalendarSyncService {
         events = await this.fetchAppleCalDAVEvents(source);
       }
 
-      this.db.prepare('DELETE FROM calendar_events_cache WHERE source_id = ?').run(sourceId);
+      await this.db.run('DELETE FROM calendar_events_cache WHERE source_id = ?', [sourceId]);
 
-      const insertStmt = this.db.prepare(`
-        INSERT OR REPLACE INTO calendar_events_cache
-        (source_id, event_uid, title, start_time, end_time, description, location, all_day, raw_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      const insertMany = this.db.transaction((events) => {
+      await this.db.tx(async (tx) => {
         for (const event of events) {
-          insertStmt.run(
+          await tx.run(`
+            INSERT OR REPLACE INTO calendar_events_cache
+            (source_id, event_uid, title, start_time, end_time, description, location, all_day, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
             sourceId,
             event.uid,
             event.title,
@@ -91,18 +89,16 @@ class CalendarSyncService {
             event.location || null,
             event.all_day ? 1 : 0,
             JSON.stringify(event.raw || {})
-          );
+          ]);
         }
       });
 
-      insertMany(events);
-
       const duration = Date.now() - startTime;
 
-      this.db.prepare(`
+      await this.db.run(`
         INSERT OR REPLACE INTO calendar_sync_status (source_id, last_sync_at, last_sync_status, last_sync_message, event_count)
         VALUES (?, datetime('now'), 'success', ?, ?)
-      `).run(sourceId, `Synced ${events.length} events in ${duration}ms`, events.length);
+      `, [sourceId, `Synced ${events.length} events in ${duration}ms`, events.length]);
 
       console.log(`Synced ${events.length} events for ${source.name} in ${duration}ms`);
 
@@ -110,10 +106,10 @@ class CalendarSyncService {
     } catch (error) {
       console.error(`Error syncing calendar source ${sourceId}:`, error.message);
 
-      this.db.prepare(`
+      await this.db.run(`
         INSERT OR REPLACE INTO calendar_sync_status (source_id, last_sync_at, last_sync_status, last_sync_message)
         VALUES (?, datetime('now'), 'error', ?)
-      `).run(sourceId, error.message);
+      `, [sourceId, error.message]);
 
       return { success: false, error: error.message };
     } finally {
@@ -210,7 +206,7 @@ class CalendarSyncService {
   }
 
   async fetchGoogleEvents(source) {
-    const account = googleConnection.getConnectedAccount(this.db);
+    const account = await googleConnection.getConnectedAccount(this.db);
     if (!account) {
       throw new Error('No Google account connected. Authorize Google in Connections.');
     }
@@ -249,7 +245,7 @@ class CalendarSyncService {
   }
 
   async syncAllSources() {
-    const sources = this.db.prepare('SELECT id FROM calendar_sources WHERE enabled = 1').all();
+    const sources = await this.db.all('SELECT id FROM calendar_sources WHERE enabled = 1');
     const results = [];
 
     for (const source of sources) {
@@ -260,10 +256,10 @@ class CalendarSyncService {
     return results;
   }
 
-  getCachedEvents(startDate, endDate) {
-    const sources = this.db.prepare(`
+  async getCachedEvents(startDate, endDate) {
+    const sources = await this.db.all(`
       SELECT id, name, color FROM calendar_sources WHERE enabled = 1
-    `).all();
+    `);
 
     const sourceMap = new Map(sources.map(s => [s.id, s]));
 
@@ -284,7 +280,7 @@ class CalendarSyncService {
 
     query += ' ORDER BY start_time ASC';
 
-    const rows = this.db.prepare(query).all(...params);
+    const rows = await this.db.all(query, params);
 
     return rows.map(row => {
       const source = sourceMap.get(row.source_id);
@@ -303,34 +299,34 @@ class CalendarSyncService {
     });
   }
 
-  getSyncStatus(sourceId) {
+  async getSyncStatus(sourceId) {
     if (sourceId) {
-      return this.db.prepare('SELECT * FROM calendar_sync_status WHERE source_id = ?').get(sourceId);
+      return this.db.get('SELECT * FROM calendar_sync_status WHERE source_id = ?', [sourceId]);
     }
-    return this.db.prepare(`
+    return this.db.all(`
       SELECT css.*, cs.name as source_name
       FROM calendar_sync_status css
       JOIN calendar_sources cs ON css.source_id = cs.id
-    `).all();
+    `);
   }
 
-  setSyncInterval(sourceId, intervalMinutes) {
-    this.db.prepare(`
+  async setSyncInterval(sourceId, intervalMinutes) {
+    await this.db.run(`
       INSERT OR REPLACE INTO calendar_sync_status (source_id, sync_interval_minutes)
       VALUES (?, ?)
       ON CONFLICT(source_id) DO UPDATE SET sync_interval_minutes = excluded.sync_interval_minutes
-    `).run(sourceId, intervalMinutes);
+    `, [sourceId, intervalMinutes]);
 
-    this.restartSyncJob(sourceId);
+    await this.restartSyncJob(sourceId);
   }
 
-  getSyncInterval(sourceId) {
-    const row = this.db.prepare('SELECT sync_interval_minutes FROM calendar_sync_status WHERE source_id = ?').get(sourceId);
+  async getSyncInterval(sourceId) {
+    const row = await this.db.get('SELECT sync_interval_minutes FROM calendar_sync_status WHERE source_id = ?', [sourceId]);
     return row?.sync_interval_minutes || 15;
   }
 
-  startSyncJob(sourceId) {
-    const interval = this.getSyncInterval(sourceId);
+  async startSyncJob(sourceId) {
+    const interval = await this.getSyncInterval(sourceId);
 
     if (this.syncIntervals.has(sourceId)) {
       clearInterval(this.syncIntervals.get(sourceId));
@@ -353,19 +349,19 @@ class CalendarSyncService {
     console.log(`Started sync job for source ${sourceId} every ${interval} minutes`);
   }
 
-  restartSyncJob(sourceId) {
+  async restartSyncJob(sourceId) {
     if (this.syncIntervals.has(sourceId)) {
       clearInterval(this.syncIntervals.get(sourceId));
       this.syncIntervals.delete(sourceId);
     }
-    this.startSyncJob(sourceId);
+    await this.startSyncJob(sourceId);
   }
 
-  startAllSyncJobs() {
-    const sources = this.db.prepare('SELECT id FROM calendar_sources WHERE enabled = 1').all();
+  async startAllSyncJobs() {
+    const sources = await this.db.all('SELECT id FROM calendar_sources WHERE enabled = 1');
 
     for (const source of sources) {
-      this.startSyncJob(source.id);
+      await this.startSyncJob(source.id);
     }
 
     setTimeout(() => {

@@ -69,7 +69,7 @@ test('fetchICSEvents normalizes SUMMARY/DESCRIPTION/LOCATION to strings', async 
     }
 });
 
-test('getCachedEvents maps cached rows with source metadata', () => {
+test('getCachedEvents maps cached rows with source metadata', async () => {
     const sources = [
         { id: 1, name: 'Family', color: '#123456' },
     ];
@@ -101,25 +101,21 @@ test('getCachedEvents maps cached rows with source metadata', () => {
     let capturedParams = [];
 
     const fakeDb = {
-        prepare(query) {
+        async all(query, params = []) {
             if (query.includes('SELECT id, name, color FROM calendar_sources')) {
-                return { all: () => sources };
+                return sources;
             }
             if (query.includes('SELECT * FROM calendar_events_cache')) {
-                return {
-                    all: (...params) => {
-                        capturedQuery = query;
-                        capturedParams = params;
-                        return rows;
-                    },
-                };
+                capturedQuery = query;
+                capturedParams = params;
+                return rows;
             }
             throw new Error(`Unexpected query: ${query}`);
         },
     };
 
     const service = new CalendarSyncService(fakeDb, () => null);
-    const mapped = service.getCachedEvents('2026-05-01', '2026-05-03');
+    const mapped = await service.getCachedEvents('2026-05-01', '2026-05-03');
 
     assert.equal(mapped.length, 2);
     assert.ok(capturedQuery.includes('end_time >= ?'));

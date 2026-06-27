@@ -2910,10 +2910,10 @@ fastify.delete('/api/prizes/:id', async (request, reply) => {
 // Google Connections routes
 fastify.get('/api/connections/google/status', async (request, reply) => {
   try {
-    const oauth = googleConnection.getOAuthStatus(db);
-    const account = googleConnection.getConnectedAccount(db);
+    const oauth = await googleConnection.getOAuthStatus(dbx);
+    const account = await googleConnection.getConnectedAccount(dbx);
     let redirectUri = '';
-    try { redirectUri = googleConnection.deriveRedirectUri(db, request); } catch (_) { }
+    try { redirectUri = googleConnection.deriveRedirectUri(dbx, request); } catch (_) { }
     return {
       encryption: { configured: oauth.encryption_configured, status: getEncryptionStatus() },
       oauth: {
@@ -2945,7 +2945,7 @@ fastify.post('/api/connections/google/config', async (request, reply) => {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
     }
     const { client_id, client_secret, redirect_uri_override } = request.body || {};
-    googleConnection.saveOAuthConfig(db, {
+    await googleConnection.saveOAuthConfig(dbx, {
       clientId: client_id,
       clientSecret: client_secret,
       redirectUriOverride: redirect_uri_override,
@@ -2962,14 +2962,14 @@ fastify.get('/api/connections/google/authorize', async (request, reply) => {
     if (!isEncryptionConfigured()) {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
     }
-    const status = googleConnection.getOAuthStatus(db);
+    const status = await googleConnection.getOAuthStatus(dbx);
     if (!status.has_client_id || !status.has_client_secret) {
       return reply.status(400).send({ error: 'Google OAuth credentials are not configured.' });
     }
-    const redirectUri = googleConnection.deriveRedirectUri(db, request);
+    const redirectUri = googleConnection.deriveRedirectUri(dbx, request);
     const returnUrl = request.query && request.query.return_url;
-    const state = googleConnection.createAuthState(db, redirectUri, returnUrl);
-    const url = googleConnection.buildAuthUrl(db, { redirectUri, state });
+    const state = await googleConnection.createAuthState(dbx, redirectUri, returnUrl);
+    const url = await googleConnection.buildAuthUrl(dbx, { redirectUri, state });
     return { url, redirect_uri: redirectUri };
   } catch (error) {
     console.error('Error building authorize URL:', error);
@@ -2999,13 +2999,13 @@ button:hover{background:#1d4ed8}</style></head>
     if (!code || !state) {
       return renderPage('Authorization failed', 'Missing authorization code or state.', false);
     }
-    const stateRow = googleConnection.consumeAuthState(db, state);
+    const stateRow = await googleConnection.consumeAuthState(dbx, state);
     if (!stateRow) {
       return renderPage('Authorization failed', 'Invalid or expired OAuth state.', false);
     }
-    const tokens = await googleConnection.exchangeCodeForTokens(db, { code, redirectUri: stateRow.redirect_uri });
+    const tokens = await googleConnection.exchangeCodeForTokens(dbx, { code, redirectUri: stateRow.redirect_uri });
     const userInfo = await googleConnection.fetchUserInfo(tokens.access_token);
-    googleConnection.upsertGoogleAccount(db, {
+    await googleConnection.upsertGoogleAccount(dbx, {
       sub: userInfo.sub,
       email: userInfo.email,
       name: userInfo.name,
@@ -3021,9 +3021,9 @@ button:hover{background:#1d4ed8}</style></head>
 
 fastify.get('/api/connections/google/albums', async (request, reply) => {
   try {
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(404).send({ error: 'No Google account connected.' });
-    const albums = await googlePhotos.listAlbums(db, account.id);
+    const albums = await googlePhotos.listAlbums(dbx, account.id);
     return { albums };
   } catch (error) {
     console.error('Error listing Google Photos albums:', error);
@@ -3033,9 +3033,9 @@ fastify.get('/api/connections/google/albums', async (request, reply) => {
 
 fastify.get('/api/connections/google/calendars', async (request, reply) => {
   try {
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(404).send({ error: 'No Google account connected.' });
-    const calendars = await googleCalendar.listCalendars(db, account.id);
+    const calendars = await googleCalendar.listCalendars(dbx, account.id);
     return { calendars };
   } catch (error) {
     console.error('Error listing Google calendars:', error);
@@ -3051,10 +3051,10 @@ fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
     if (source.type !== 'Google') {
       return reply.status(400).send({ error: 'This calendar type is read-only.' });
     }
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
-    const created = await googleCalendar.createEvent(db, account.id, source.url, request.body || {});
+    const created = await googleCalendar.createEvent(dbx, account.id, source.url, request.body || {});
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
     return { success: true, event: created };
   } catch (error) {
@@ -3071,10 +3071,10 @@ fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply
     if (source.type !== 'Google') {
       return reply.status(400).send({ error: 'This calendar type is read-only.' });
     }
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
-    const updated = await googleCalendar.updateEvent(db, account.id, source.url, eventId, request.body || {});
+    const updated = await googleCalendar.updateEvent(dbx, account.id, source.url, eventId, request.body || {});
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
     return { success: true, event: updated };
   } catch (error) {
@@ -3091,10 +3091,10 @@ fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, repl
     if (source.type !== 'Google') {
       return reply.status(400).send({ error: 'This calendar type is read-only.' });
     }
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
-    await googleCalendar.deleteEvent(db, account.id, source.url, eventId);
+    await googleCalendar.deleteEvent(dbx, account.id, source.url, eventId);
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
     return { success: true };
   } catch (error) {
@@ -3105,11 +3105,11 @@ fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, repl
 
 fastify.delete('/api/connections/google/account', async (request, reply) => {
   try {
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) {
       return { success: true, message: 'No Google account connected.' };
     }
-    await googleConnection.revokeAndDisconnect(db, account.id);
+    await googleConnection.revokeAndDisconnect(dbx, account.id);
     return { success: true };
   } catch (error) {
     console.error('Error disconnecting Google account:', error);
@@ -3151,7 +3151,7 @@ fastify.post('/api/calendar-sources', async (request, reply) => {
   if (!['ICS', 'CalDAV', 'Google', 'Apple'].includes(type)) {
     return reply.status(400).send({ error: 'Type must be ICS, CalDAV, Google, or Apple.' });
   }
-  if (type === 'Google' && !googleConnection.getConnectedAccount(db)) {
+  if (type === 'Google' && !(await googleConnection.getConnectedAccount(dbx))) {
     return reply.status(400).send({ error: 'Connect your Google account before adding a Google calendar.' });
   }
   if (type === 'Apple' && (!request.body.username || !password)) {
@@ -3300,7 +3300,7 @@ fastify.get('/api/calendar-events', async (request, reply) => {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
 
-    const events = calendarSyncService.getCachedEvents(start, end);
+    const events = await calendarSyncService.getCachedEvents(start, end);
     return events;
   } catch (error) {
     console.error('Error fetching calendar events:', error);
@@ -3314,7 +3314,7 @@ fastify.get('/api/calendar-sync/status', async (request, reply) => {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
-    const status = calendarSyncService.getSyncStatus();
+    const status = await calendarSyncService.getSyncStatus();
     return status;
   } catch (error) {
     console.error('Error fetching sync status:', error);
@@ -3329,7 +3329,7 @@ fastify.get('/api/calendar-sync/status/:sourceId', async (request, reply) => {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
-    const status = calendarSyncService.getSyncStatus(parseInt(sourceId));
+    const status = await calendarSyncService.getSyncStatus(parseInt(sourceId));
     return status || { source_id: sourceId, last_sync_at: null, last_sync_status: 'never' };
   } catch (error) {
     console.error('Error fetching sync status:', error);
@@ -3380,7 +3380,7 @@ fastify.patch('/api/calendar-sync/:sourceId/interval', async (request, reply) =>
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
 
-    calendarSyncService.setSyncInterval(parseInt(sourceId), interval_minutes);
+    await calendarSyncService.setSyncInterval(parseInt(sourceId), interval_minutes);
     return { success: true, message: `Sync interval set to ${interval_minutes} minutes` };
   } catch (error) {
     console.error('Error setting sync interval:', error);
@@ -3395,7 +3395,7 @@ fastify.get('/api/calendar-sync/:sourceId/interval', async (request, reply) => {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
-    const interval = calendarSyncService.getSyncInterval(parseInt(sourceId));
+    const interval = await calendarSyncService.getSyncInterval(parseInt(sourceId));
     return { source_id: parseInt(sourceId), interval_minutes: interval };
   } catch (error) {
     console.error('Error getting sync interval:', error);
@@ -3547,7 +3547,7 @@ fastify.post('/api/photo-sources/:id/test', async (request, reply) => {
       );
       return { success: true, assetCount: response.data.length || 0, message: `Immich connection successful (${response.data.length || 0} assets found)` };
     } else if (source.type === 'GooglePhotos') {
-      const account = googleConnection.getConnectedAccount(db);
+      const account = await googleConnection.getConnectedAccount(dbx);
       if (!account) {
         return reply.status(400).send({ success: false, error: 'No Google account connected. Connect one in Admin > Connections.' });
       }
@@ -3791,10 +3791,10 @@ fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, repl
     if (!source || source.type !== 'GooglePhotos') {
       return reply.status(404).send({ error: 'Google Photos source not found' });
     }
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
-    const session = await googlePhotosPicker.createSession(db, account.id);
+    const session = await googlePhotosPicker.createSession(dbx, account.id);
     await dbx.run(
       'UPDATE photo_sources SET picker_session_id = ?, picker_session_expire = ? WHERE id = ?',
       [session.id || null, session.expireTime || null, sourceId]
@@ -3823,10 +3823,10 @@ fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply
     if (!source.picker_session_id) {
       return { sessionId: null, mediaItemsSet: false };
     }
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
-    const session = await googlePhotosPicker.getSession(db, account.id, source.picker_session_id);
+    const session = await googlePhotosPicker.getSession(dbx, account.id, source.picker_session_id);
     return {
       sessionId: session.id,
       pickerUri: session.pickerUri,
@@ -3853,15 +3853,15 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
     if (!source.picker_session_id) {
       return reply.status(400).send({ error: 'No active picker session' });
     }
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount(dbx);
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
-    const session = await googlePhotosPicker.getSession(db, account.id, source.picker_session_id);
+    const session = await googlePhotosPicker.getSession(dbx, account.id, source.picker_session_id);
     if (!session.mediaItemsSet) {
       return reply.status(400).send({ error: 'Picker session not yet completed by user' });
     }
 
-    const items = await googlePhotosPicker.listPickedMediaItems(db, account.id, source.picker_session_id);
+    const items = await googlePhotosPicker.listPickedMediaItems(dbx, account.id, source.picker_session_id);
 
     let added = 0;
     let skipped = 0;
@@ -3873,7 +3873,7 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
       const existing = await dbx.get('SELECT id FROM google_picked_media WHERE source_id = ? AND google_media_id = ?', [sourceId, item.id]);
       if (existing) { skipped++; continue; }
       try {
-        const saved = await googlePhotosPicker.downloadMedia(db, account.id, sourceId, item);
+        const saved = await googlePhotosPicker.downloadMedia(dbx, account.id, sourceId, item);
         await dbx.run(`
           INSERT OR IGNORE INTO google_picked_media
             (source_id, google_media_id, filename, mime_type, local_path, width, height, created_time)
@@ -3896,7 +3896,7 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
     }
 
     try {
-      await googlePhotosPicker.deleteSession(db, account.id, source.picker_session_id);
+      await googlePhotosPicker.deleteSession(dbx, account.id, source.picker_session_id);
     } catch (e) {
       console.warn('Failed to delete picker session (non-fatal):', e.message);
     }
@@ -3915,9 +3915,9 @@ fastify.delete('/api/photo-sources/:sourceId/picker-session', async (request, re
     const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source) return reply.status(404).send({ error: 'Source not found' });
     if (source.picker_session_id) {
-      const account = googleConnection.getConnectedAccount(db);
+      const account = await googleConnection.getConnectedAccount(dbx);
       if (account) {
-        try { await googlePhotosPicker.deleteSession(db, account.id, source.picker_session_id); } catch (_) { }
+        try { await googlePhotosPicker.deleteSession(dbx, account.id, source.picker_session_id); } catch (_) { }
       }
     }
     await dbx.run('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?', [sourceId]);
@@ -4160,7 +4160,7 @@ const start = async () => {
 
     // Initialize calendar sync service
     if (process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
-      calendarSyncService = new CalendarSyncService(db, decryptPassword);
+      calendarSyncService = new CalendarSyncService(dbx, decryptPassword);
       calendarSyncService.initialize();
       console.log('Calendar sync service started');
     } else {

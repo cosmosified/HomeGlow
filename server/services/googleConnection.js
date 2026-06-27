@@ -19,24 +19,24 @@ const CLIENT_ID_KEY = 'GOOGLE_CLIENT_ID';
 const CLIENT_SECRET_KEY = 'GOOGLE_CLIENT_SECRET_ENC';
 const REDIRECT_URI_OVERRIDE_KEY = 'GOOGLE_REDIRECT_URI_OVERRIDE';
 
-function getSetting(db, key) {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+async function getSetting(db, key) {
+    const row = await db.get('SELECT value FROM settings WHERE key = ?', [key]);
     return row ? row.value : null;
 }
 
-function setSetting(db, key, value) {
-    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
+async function setSetting(db, key, value) {
+    await db.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value]);
 }
 
-function getOAuthConfig(db) {
-    const clientId = getSetting(db, CLIENT_ID_KEY) || '';
-    const clientSecretEnc = getSetting(db, CLIENT_SECRET_KEY) || '';
-    const redirectUriOverride = getSetting(db, REDIRECT_URI_OVERRIDE_KEY) || '';
+async function getOAuthConfig(db) {
+    const clientId = (await getSetting(db, CLIENT_ID_KEY)) || '';
+    const clientSecretEnc = (await getSetting(db, CLIENT_SECRET_KEY)) || '';
+    const redirectUriOverride = (await getSetting(db, REDIRECT_URI_OVERRIDE_KEY)) || '';
     return { clientId, clientSecretEnc, redirectUriOverride };
 }
 
-function getOAuthStatus(db) {
-    const { clientId, clientSecretEnc, redirectUriOverride } = getOAuthConfig(db);
+async function getOAuthStatus(db) {
+    const { clientId, clientSecretEnc, redirectUriOverride } = await getOAuthConfig(db);
     return {
         has_client_id: !!clientId,
         has_client_secret: !!clientSecretEnc,
@@ -46,24 +46,24 @@ function getOAuthStatus(db) {
     };
 }
 
-function saveOAuthConfig(db, { clientId, clientSecret, redirectUriOverride }) {
+async function saveOAuthConfig(db, { clientId, clientSecret, redirectUriOverride }) {
     if (clientId !== undefined) {
-        setSetting(db, CLIENT_ID_KEY, (clientId || '').trim());
+        await setSetting(db, CLIENT_ID_KEY, (clientId || '').trim());
     }
     if (clientSecret !== undefined && clientSecret !== null && clientSecret !== '') {
-        setSetting(db, CLIENT_SECRET_KEY, encrypt(clientSecret.trim()));
+        await setSetting(db, CLIENT_SECRET_KEY, encrypt(clientSecret.trim()));
     }
     if (redirectUriOverride !== undefined) {
-        setSetting(db, REDIRECT_URI_OVERRIDE_KEY, (redirectUriOverride || '').trim());
+        await setSetting(db, REDIRECT_URI_OVERRIDE_KEY, (redirectUriOverride || '').trim());
     }
 }
 
-function clearOAuthSecret(db) {
-    setSetting(db, CLIENT_SECRET_KEY, '');
+async function clearOAuthSecret(db) {
+    await setSetting(db, CLIENT_SECRET_KEY, '');
 }
 
-function deriveRedirectUri(db, request) {
-    const override = getSetting(db, REDIRECT_URI_OVERRIDE_KEY);
+async function deriveRedirectUri(db, request) {
+    const override = await getSetting(db, REDIRECT_URI_OVERRIDE_KEY);
     if (override && override.trim()) return override.trim();
 
     const forwardedProto = request.headers['x-forwarded-proto'];
@@ -74,32 +74,33 @@ function deriveRedirectUri(db, request) {
     return `${proto}://${host}/api/connections/google/callback`;
 }
 
-function pruneOldStates(db) {
-    db.prepare(
+async function pruneOldStates(db) {
+    await db.run(
         "DELETE FROM google_oauth_states WHERE datetime(created_at) < datetime('now', '-15 minutes')"
-    ).run();
+    );
 }
 
-function createAuthState(db, redirectUri, returnUrl) {
-    pruneOldStates(db);
+async function createAuthState(db, redirectUri, returnUrl) {
+    await pruneOldStates(db);
     const state = crypto.randomBytes(24).toString('base64url');
-    db.prepare(
-        'INSERT INTO google_oauth_states (state, redirect_uri, return_url) VALUES (?, ?, ?)'
-    ).run(state, redirectUri, returnUrl || null);
+    await db.run(
+        'INSERT INTO google_oauth_states (state, redirect_uri, return_url) VALUES (?, ?, ?)',
+        [state, redirectUri, returnUrl || null]
+    );
     return state;
 }
 
-function consumeAuthState(db, state) {
-    pruneOldStates(db);
-    const row = db.prepare('SELECT state, redirect_uri, return_url FROM google_oauth_states WHERE state = ?').get(state);
+async function consumeAuthState(db, state) {
+    await pruneOldStates(db);
+    const row = await db.get('SELECT state, redirect_uri, return_url FROM google_oauth_states WHERE state = ?', [state]);
     if (row) {
-        db.prepare('DELETE FROM google_oauth_states WHERE state = ?').run(state);
+        await db.run('DELETE FROM google_oauth_states WHERE state = ?', [state]);
     }
     return row;
 }
 
-function buildAuthUrl(db, { redirectUri, state, loginHint }) {
-    const { clientId } = getOAuthConfig(db);
+async function buildAuthUrl(db, { redirectUri, state, loginHint }) {
+    const { clientId } = await getOAuthConfig(db);
     if (!clientId) throw new Error('Google Client ID is not configured.');
 
     const params = new URLSearchParams({
@@ -117,7 +118,7 @@ function buildAuthUrl(db, { redirectUri, state, loginHint }) {
 }
 
 async function exchangeCodeForTokens(db, { code, redirectUri }) {
-    const { clientId, clientSecretEnc } = getOAuthConfig(db);
+    const { clientId, clientSecretEnc } = await getOAuthConfig(db);
     if (!clientId || !clientSecretEnc) {
         throw new Error('Google OAuth credentials are not configured.');
     }
@@ -155,8 +156,8 @@ async function fetchUserInfo(accessToken) {
     return await res.json();
 }
 
-function upsertGoogleAccount(db, { sub, email, name, picture, tokens }) {
-    const existing = db.prepare('SELECT id, refresh_token_enc FROM google_accounts WHERE google_sub = ?').get(sub);
+async function upsertGoogleAccount(db, { sub, email, name, picture, tokens }) {
+    const existing = await db.get('SELECT id, refresh_token_enc FROM google_accounts WHERE google_sub = ?', [sub]);
     const expiresInSec = tokens.expires_in || 3600;
     const expiry = new Date(Date.now() + expiresInSec * 1000).toISOString();
 
@@ -165,39 +166,39 @@ function upsertGoogleAccount(db, { sub, email, name, picture, tokens }) {
     const scopes = tokens.scope || GOOGLE_SCOPES.join(' ');
 
     if (existing) {
-        db.prepare(`
+        await db.run(`
             UPDATE google_accounts
             SET email = ?, name = ?, picture = ?, access_token_enc = ?, refresh_token_enc = ?,
                 token_expiry = ?, scopes = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        `).run(email, name, picture, accessEnc, refreshEnc, expiry, scopes, existing.id);
+        `, [email, name, picture, accessEnc, refreshEnc, expiry, scopes, existing.id]);
         return existing.id;
     } else {
-        const result = db.prepare(`
+        const result = await db.run(`
             INSERT INTO google_accounts (google_sub, email, name, picture, access_token_enc, refresh_token_enc, token_expiry, scopes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(sub, email, name, picture, accessEnc, refreshEnc, expiry, scopes);
-        return result.lastInsertRowid;
+        `, [sub, email, name, picture, accessEnc, refreshEnc, expiry, scopes]);
+        return result.insertId;
     }
 }
 
-function getConnectedAccount(db) {
-    const row = db.prepare(`
+async function getConnectedAccount(db) {
+    const row = await db.get(`
         SELECT id, email, name, picture, token_expiry, scopes, created_at, updated_at
         FROM google_accounts
         ORDER BY id ASC
         LIMIT 1
-    `).get();
+    `);
     return row || null;
 }
 
 async function refreshAccessToken(db, accountId) {
-    const row = db.prepare('SELECT refresh_token_enc FROM google_accounts WHERE id = ?').get(accountId);
+    const row = await db.get('SELECT refresh_token_enc FROM google_accounts WHERE id = ?', [accountId]);
     if (!row || !row.refresh_token_enc) {
         throw new Error('No refresh token available for this Google account.');
     }
     const refreshToken = decrypt(row.refresh_token_enc);
-    const { clientId, clientSecretEnc } = getOAuthConfig(db);
+    const { clientId, clientSecretEnc } = await getOAuthConfig(db);
     const clientSecret = decrypt(clientSecretEnc);
 
     const body = new URLSearchParams({
@@ -220,13 +221,13 @@ async function refreshAccessToken(db, accountId) {
     const expiresInSec = tokens.expires_in || 3600;
     const expiry = new Date(Date.now() + expiresInSec * 1000).toISOString();
     const accessEnc = encrypt(tokens.access_token);
-    db.prepare('UPDATE google_accounts SET access_token_enc = ?, token_expiry = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(accessEnc, expiry, accountId);
+    await db.run('UPDATE google_accounts SET access_token_enc = ?, token_expiry = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [accessEnc, expiry, accountId]);
     return tokens.access_token;
 }
 
 async function getValidAccessToken(db, accountId) {
-    const row = db.prepare('SELECT access_token_enc, token_expiry FROM google_accounts WHERE id = ?').get(accountId);
+    const row = await db.get('SELECT access_token_enc, token_expiry FROM google_accounts WHERE id = ?', [accountId]);
     if (!row) throw new Error('Google account not found.');
     const expiry = row.token_expiry ? new Date(row.token_expiry).getTime() : 0;
     if (Date.now() < expiry - 60 * 1000 && row.access_token_enc) {
@@ -236,7 +237,7 @@ async function getValidAccessToken(db, accountId) {
 }
 
 async function revokeAndDisconnect(db, accountId) {
-    const row = db.prepare('SELECT access_token_enc, refresh_token_enc FROM google_accounts WHERE id = ?').get(accountId);
+    const row = await db.get('SELECT access_token_enc, refresh_token_enc FROM google_accounts WHERE id = ?', [accountId]);
     if (!row) return;
     const tokens = [];
     if (row.refresh_token_enc) {
@@ -252,7 +253,7 @@ async function revokeAndDisconnect(db, accountId) {
             console.warn('Failed to revoke Google token:', err.message);
         }
     }
-    db.prepare('DELETE FROM google_accounts WHERE id = ?').run(accountId);
+    await db.run('DELETE FROM google_accounts WHERE id = ?', [accountId]);
 }
 
 module.exports = {
