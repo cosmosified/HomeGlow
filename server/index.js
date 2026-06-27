@@ -2091,7 +2091,7 @@ fastify.delete('/api/users/:id', async (request, reply) => {
 // Calendar routes (existing)
 fastify.get('/api/calendar', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM events').all();
+    const rows = await dbx.all('SELECT * FROM events');
     return rows;
   } catch (error) {
     console.error('Error fetching events:', error);
@@ -2102,9 +2102,8 @@ fastify.get('/api/calendar', async (request, reply) => {
 fastify.post('/api/calendar', async (request, reply) => {
   const { user_id, summary, start, end, description } = request.body;
   try {
-    const stmt = db.prepare('INSERT INTO events (user_id, summary, start, end, description) VALUES (?, ?, ?, ?, ?)');
-    const info = stmt.run(user_id, summary, start, end, description);
-    return { id: info.lastInsertRowid };
+    const info = await dbx.run('INSERT INTO events (user_id, summary, start, end, description) VALUES (?, ?, ?, ?, ?)', [user_id, summary, start, end, description]);
+    return { id: info.insertId };
   } catch (error) {
     console.error('Error adding event:', error);
     reply.status(500).send({ error: 'Failed to add event' });
@@ -2113,7 +2112,7 @@ fastify.post('/api/calendar', async (request, reply) => {
 
 fastify.get('/api/calendar/ics', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM events').all();
+    const rows = await dbx.all('SELECT * FROM events');
     const calendar = ical({ name: 'HomeGlow Calendar' });
     rows.forEach((event) => {
       calendar.createEvent({
