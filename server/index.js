@@ -2163,7 +2163,7 @@ function deserializeSettingValue(value) {
 fastify.get('/api/settings', async (request, reply) => {
   try {
     console.log('=== FETCHING SETTINGS ===');
-    const rows = db.prepare('SELECT key, value FROM settings').all();
+    const rows = await dbx.all('SELECT key, value FROM settings');
     console.log('Raw settings from database:', rows);
     // Convert array of {key, value} objects to a single object {key: value}
     const settings = rows.reduce((acc, row) => {
@@ -2191,7 +2191,7 @@ fastify.post('/api/settings/search', async (request, reply) => {
       const conditions = keys.map(() => 'key LIKE ?').join(' OR ');
       query += ' WHERE ' + conditions;
     }
-    const rows = db.prepare(query).all(...keys.map(key => key.replaceAll('*', '%')));
+    const rows = await dbx.all(query, keys.map(key => key.replaceAll('*', '%')));
     console.log('Raw settings from database:', rows);
     // Convert array of {key, value} objects to a single object {key: value}
     const settings = rows.reduce((acc, row) => {
@@ -2217,12 +2217,11 @@ fastify.post('/api/settings', async (request, reply) => {
   }
   try {
     // Use INSERT OR REPLACE to either insert a new setting or update an existing one
-    const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const result = stmt.run(key, value);
+    const result = await dbx.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value]);
     console.log('Database insert result:', result);
 
     // Verify the setting was saved
-    const verification = db.prepare('SELECT key, value FROM settings WHERE key = ?').get(key);
+    const verification = await dbx.get('SELECT key, value FROM settings WHERE key = ?', [key]);
     console.log('Verification query result:', verification);
 
     // Special verification for weather API key
