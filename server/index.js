@@ -3451,15 +3451,14 @@ fastify.post('/api/photo-sources', async (request, reply) => {
     const encryptedApiKey = api_key ? encryptPassword(api_key) : null;
     const encryptedPassword = password ? encryptPassword(password) : null;
     const encryptedRefreshToken = refresh_token ? encryptPassword(refresh_token) : null;
-    const maxOrder = db.prepare('SELECT MAX(sort_order) as max FROM photo_sources').get();
+    const maxOrder = await dbx.get('SELECT MAX(sort_order) as max FROM photo_sources');
     const nextOrder = (maxOrder.max || 0) + 1;
 
-    const stmt = db.prepare(`
+    const info = await dbx.run(`
       INSERT INTO photo_sources (name, type, url, api_key, username, password, album_id, refresh_token, enabled, sort_order)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(name, type, url || null, encryptedApiKey, username || null, encryptedPassword, album_id || null, encryptedRefreshToken, 1, nextOrder);
-    return { id: info.lastInsertRowid, success: true };
+    `, [name, type, url || null, encryptedApiKey, username || null, encryptedPassword, album_id || null, encryptedRefreshToken, 1, nextOrder]);
+    return { id: info.insertId, success: true };
   } catch (error) {
     console.error('Error adding photo source:', error);
     reply.status(500).send({ error: 'Failed to add photo source' });
@@ -3471,7 +3470,7 @@ fastify.patch('/api/photo-sources/:id', async (request, reply) => {
   const { name, type, url, api_key, username, password, album_id, refresh_token, enabled } = request.body;
 
   try {
-    const existing = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(id);
+    const existing = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [id]);
     if (!existing) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
@@ -3512,10 +3511,9 @@ fastify.patch('/api/photo-sources/:id', async (request, reply) => {
     }
 
     updateValues.push(id);
-    const stmt = db.prepare(`UPDATE photo_sources SET ${updateFields.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...updateValues);
+    const info = await dbx.run(`UPDATE photo_sources SET ${updateFields.join(', ')} WHERE id = ?`, updateValues);
 
-    if (info.changes === 0) {
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
     return { success: true, message: 'Photo source updated successfully' };
@@ -3528,17 +3526,16 @@ fastify.patch('/api/photo-sources/:id', async (request, reply) => {
 fastify.delete('/api/photo-sources/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const picked = db.prepare('SELECT local_path FROM google_picked_media WHERE source_id = ?').all(id);
+    const picked = await dbx.all('SELECT local_path FROM google_picked_media WHERE source_id = ?', [id]);
     for (const p of picked) googlePhotosPicker.removeLocalFile(p.local_path);
-    db.prepare('DELETE FROM google_picked_media WHERE source_id = ?').run(id);
+    await dbx.run('DELETE FROM google_picked_media WHERE source_id = ?', [id]);
 
     const homeglowDir = path.join(__dirname, 'uploads', 'homeglow-photos', String(id));
     try { fsSync.rmSync(homeglowDir, { recursive: true, force: true }); } catch (_) { }
-    db.prepare('DELETE FROM homeglow_photos WHERE source_id = ?').run(id);
+    await dbx.run('DELETE FROM homeglow_photos WHERE source_id = ?', [id]);
 
-    const stmt = db.prepare('DELETE FROM photo_sources WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const info = await dbx.run('DELETE FROM photo_sources WHERE id = ?', [id]);
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
     return { success: true, message: 'Photo source deleted successfully' };
@@ -3551,7 +3548,7 @@ fastify.delete('/api/photo-sources/:id', async (request, reply) => {
 fastify.post('/api/photo-sources/:id/test', async (request, reply) => {
   const { id } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(id);
+    const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [id]);
     if (!source) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
@@ -3578,10 +3575,10 @@ fastify.post('/api/photo-sources/:id/test', async (request, reply) => {
       if (!account) {
         return reply.status(400).send({ success: false, error: 'No Google account connected. Connect one in Admin > Connections.' });
       }
-      const count = db.prepare('SELECT COUNT(*) AS c FROM google_picked_media WHERE source_id = ?').get(source.id).c;
+      const count = (await dbx.get('SELECT COUNT(*) AS c FROM google_picked_media WHERE source_id = ?', [source.id])).c;
       return { success: true, message: `${count} picked photo${count === 1 ? '' : 's'} available for this source.` };
     } else if (source.type === 'HomeGlowPhotos') {
-      const count = db.prepare('SELECT COUNT(*) AS c FROM homeglow_photos WHERE source_id = ?').get(source.id).c;
+      const count = (await dbx.get('SELECT COUNT(*) AS c FROM homeglow_photos WHERE source_id = ?', [source.id])).c;
       return { success: true, message: `${count} uploaded photo${count === 1 ? '' : 's'} available for this source.` };
     }
     return reply.status(400).send({ success: false, error: `Unsupported photo source type: ${source.type}` });
@@ -3621,7 +3618,7 @@ fastify.get('/api/photo-proxy/:sourceId/:assetId', async (request, reply) => {
   const { size = 'preview' } = request.query;
 
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
@@ -3655,13 +3652,14 @@ fastify.get('/api/photo-proxy/:sourceId/:assetId', async (request, reply) => {
 fastify.get('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT id, type FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT id, type FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source || source.type !== 'HomeGlowPhotos') {
       return reply.status(404).send({ error: 'HomeGlow Photos source not found' });
     }
-    const rows = db.prepare(
-      'SELECT id, filename, original_name, mime_type, size, uploaded_at FROM homeglow_photos WHERE source_id = ? ORDER BY uploaded_at DESC'
-    ).all(sourceId);
+    const rows = await dbx.all(
+      'SELECT id, filename, original_name, mime_type, size, uploaded_at FROM homeglow_photos WHERE source_id = ? ORDER BY uploaded_at DESC',
+      [sourceId]
+    );
     return rows.map((r) => ({
       ...r,
       url: `/api/photo-sources/${sourceId}/uploaded/${r.id}/file`,
@@ -3677,9 +3675,10 @@ fastify.get('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
 fastify.get('/api/photo-sources/:sourceId/uploaded/:photoId/file', async (request, reply) => {
   const { sourceId, photoId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT filename, mime_type FROM homeglow_photos WHERE id = ? AND source_id = ?'
-    ).get(photoId, sourceId);
+    const row = await dbx.get(
+      'SELECT filename, mime_type FROM homeglow_photos WHERE id = ? AND source_id = ?',
+      [photoId, sourceId]
+    );
     if (!row) return reply.status(404).send({ error: 'Photo not found' });
     const filePath = path.join(__dirname, 'uploads', 'homeglow-photos', String(sourceId), row.filename);
     if (!fsSync.existsSync(filePath)) return reply.status(404).send({ error: 'File missing' });
@@ -3696,7 +3695,7 @@ fastify.get('/api/photo-sources/:sourceId/uploaded/:photoId/file', async (reques
 fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT id, type FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT id, type FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source || source.type !== 'HomeGlowPhotos') {
       return reply.status(404).send({ error: 'HomeGlow Photos source not found' });
     }
@@ -3720,10 +3719,11 @@ fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => 
         const filePath = path.join(uploadDir, filename);
         const buffer = await part.toBuffer();
         await fs.writeFile(filePath, buffer);
-        const info = db.prepare(
-          `INSERT INTO homeglow_photos (source_id, filename, original_name, mime_type, size) VALUES (?, ?, ?, ?, ?)`
-        ).run(sourceId, filename, part.filename || null, part.mimetype, buffer.length);
-        added.push({ id: info.lastInsertRowid, filename, original_name: part.filename });
+        const info = await dbx.run(
+          `INSERT INTO homeglow_photos (source_id, filename, original_name, mime_type, size) VALUES (?, ?, ?, ?, ?)`,
+          [sourceId, filename, part.filename || null, part.mimetype, buffer.length]
+        );
+        added.push({ id: info.insertId, filename, original_name: part.filename });
       } catch (err) {
         console.error('Upload failure for part:', err);
         failed.push({ name: part.filename, reason: err.message });
@@ -3740,13 +3740,14 @@ fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => 
 fastify.delete('/api/photo-sources/:sourceId/uploaded/:photoId', async (request, reply) => {
   const { sourceId, photoId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT filename FROM homeglow_photos WHERE id = ? AND source_id = ?'
-    ).get(photoId, sourceId);
+    const row = await dbx.get(
+      'SELECT filename FROM homeglow_photos WHERE id = ? AND source_id = ?',
+      [photoId, sourceId]
+    );
     if (!row) return reply.status(404).send({ error: 'Photo not found' });
     const filePath = path.join(__dirname, 'uploads', 'homeglow-photos', String(sourceId), row.filename);
     try { await fs.unlink(filePath); } catch (_) { }
-    db.prepare('DELETE FROM homeglow_photos WHERE id = ?').run(photoId);
+    await dbx.run('DELETE FROM homeglow_photos WHERE id = ?', [photoId]);
     return { success: true };
   } catch (error) {
     console.error('Error deleting uploaded photo:', error);
@@ -3757,9 +3758,10 @@ fastify.delete('/api/photo-sources/:sourceId/uploaded/:photoId', async (request,
 fastify.get('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request, reply) => {
   const { sourceId, mediaRowId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT local_path, mime_type FROM google_picked_media WHERE id = ? AND source_id = ?'
-    ).get(mediaRowId, sourceId);
+    const row = await dbx.get(
+      'SELECT local_path, mime_type FROM google_picked_media WHERE id = ? AND source_id = ?',
+      [mediaRowId, sourceId]
+    );
     if (!row || !fsSync.existsSync(row.local_path)) {
       return reply.status(404).send({ error: 'Picked media not found' });
     }
@@ -3775,9 +3777,10 @@ fastify.get('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request, r
 fastify.get('/api/photo-sources/:sourceId/picked', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const rows = db.prepare(
-      'SELECT id, google_media_id, filename, mime_type, width, height, created_time, downloaded_at FROM google_picked_media WHERE source_id = ? ORDER BY downloaded_at DESC'
-    ).all(sourceId);
+    const rows = await dbx.all(
+      'SELECT id, google_media_id, filename, mime_type, width, height, created_time, downloaded_at FROM google_picked_media WHERE source_id = ? ORDER BY downloaded_at DESC',
+      [sourceId]
+    );
     return rows.map((r) => ({
       ...r,
       thumbnail_url: `/api/photo-sources/${sourceId}/picked/${r.id}`,
@@ -3791,12 +3794,13 @@ fastify.get('/api/photo-sources/:sourceId/picked', async (request, reply) => {
 fastify.delete('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request, reply) => {
   const { sourceId, mediaRowId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT local_path FROM google_picked_media WHERE id = ? AND source_id = ?'
-    ).get(mediaRowId, sourceId);
+    const row = await dbx.get(
+      'SELECT local_path FROM google_picked_media WHERE id = ? AND source_id = ?',
+      [mediaRowId, sourceId]
+    );
     if (!row) return reply.status(404).send({ error: 'Picked media not found' });
     googlePhotosPicker.removeLocalFile(row.local_path);
-    db.prepare('DELETE FROM google_picked_media WHERE id = ?').run(mediaRowId);
+    await dbx.run('DELETE FROM google_picked_media WHERE id = ?', [mediaRowId]);
     return { success: true };
   } catch (error) {
     console.error('Error deleting picked media:', error);
@@ -3807,7 +3811,7 @@ fastify.delete('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request
 fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source || source.type !== 'GooglePhotos') {
       return reply.status(404).send({ error: 'Google Photos source not found' });
     }
@@ -3815,9 +3819,10 @@ fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, repl
     if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
 
     const session = await googlePhotosPicker.createSession(db, account.id);
-    db.prepare(
-      'UPDATE photo_sources SET picker_session_id = ?, picker_session_expire = ? WHERE id = ?'
-    ).run(session.id || null, session.expireTime || null, sourceId);
+    await dbx.run(
+      'UPDATE photo_sources SET picker_session_id = ?, picker_session_expire = ? WHERE id = ?',
+      [session.id || null, session.expireTime || null, sourceId]
+    );
 
     return {
       sessionId: session.id,
@@ -3835,7 +3840,7 @@ fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, repl
 fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source || source.type !== 'GooglePhotos') {
       return reply.status(404).send({ error: 'Google Photos source not found' });
     }
@@ -3856,7 +3861,7 @@ fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply
   } catch (error) {
     console.error('Error polling picker session:', error);
     if (error.status === 404 || error.status === 400) {
-      db.prepare('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?').run(sourceId);
+      await dbx.run('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?', [sourceId]);
     }
     reply.status(error.status || 500).send({ error: error.message || 'Failed to poll picker session' });
   }
@@ -3865,7 +3870,7 @@ fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply
 fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source || source.type !== 'GooglePhotos') {
       return reply.status(404).send({ error: 'Google Photos source not found' });
     }
@@ -3881,11 +3886,6 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
     }
 
     const items = await googlePhotosPicker.listPickedMediaItems(db, account.id, source.picker_session_id);
-    const insert = db.prepare(`
-      INSERT OR IGNORE INTO google_picked_media
-        (source_id, google_media_id, filename, mime_type, local_path, width, height, created_time)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
 
     let added = 0;
     let skipped = 0;
@@ -3894,11 +3894,15 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
       const mediaFile = item.mediaFile || {};
       const mime = mediaFile.mimeType;
       if (!googlePhotosPicker.isImageMime(mime)) { skipped++; continue; }
-      const existing = db.prepare('SELECT id FROM google_picked_media WHERE source_id = ? AND google_media_id = ?').get(sourceId, item.id);
+      const existing = await dbx.get('SELECT id FROM google_picked_media WHERE source_id = ? AND google_media_id = ?', [sourceId, item.id]);
       if (existing) { skipped++; continue; }
       try {
         const saved = await googlePhotosPicker.downloadMedia(db, account.id, sourceId, item);
-        insert.run(
+        await dbx.run(`
+          INSERT OR IGNORE INTO google_picked_media
+            (source_id, google_media_id, filename, mime_type, local_path, width, height, created_time)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
           sourceId,
           item.id,
           saved.filename,
@@ -3907,7 +3911,7 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
           saved.width,
           saved.height,
           item.createTime || null,
-        );
+        ]);
         added++;
       } catch (err) {
         console.error('Failed to ingest picked item', item.id, err.message);
@@ -3920,7 +3924,7 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
     } catch (e) {
       console.warn('Failed to delete picker session (non-fatal):', e.message);
     }
-    db.prepare('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?').run(sourceId);
+    await dbx.run('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?', [sourceId]);
 
     return { added, skipped, failed, total: items.length };
   } catch (error) {
@@ -3932,7 +3936,7 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
 fastify.delete('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await dbx.get('SELECT * FROM photo_sources WHERE id = ?', [sourceId]);
     if (!source) return reply.status(404).send({ error: 'Source not found' });
     if (source.picker_session_id) {
       const account = googleConnection.getConnectedAccount(db);
@@ -3940,7 +3944,7 @@ fastify.delete('/api/photo-sources/:sourceId/picker-session', async (request, re
         try { await googlePhotosPicker.deleteSession(db, account.id, source.picker_session_id); } catch (_) { }
       }
     }
-    db.prepare('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?').run(sourceId);
+    await dbx.run('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?', [sourceId]);
     return { success: true };
   } catch (error) {
     console.error('Error clearing picker session:', error);
@@ -3950,7 +3954,7 @@ fastify.delete('/api/photo-sources/:sourceId/picker-session', async (request, re
 
 fastify.get('/api/photo-items', async (request, reply) => {
   try {
-    const sources = db.prepare('SELECT * FROM photo_sources WHERE enabled = 1 ORDER BY sort_order, id').all();
+    const sources = await dbx.all('SELECT * FROM photo_sources WHERE enabled = 1 ORDER BY sort_order, id');
 
     if (sources.length === 0) {
       return [];
@@ -4002,9 +4006,10 @@ fastify.get('/api/photo-items', async (request, reply) => {
             source_type: 'Immich'
           }));
         } else if (source.type === 'GooglePhotos') {
-          const rows = db.prepare(
-            'SELECT id, google_media_id FROM google_picked_media WHERE source_id = ?'
-          ).all(source.id);
+          const rows = await dbx.all(
+            'SELECT id, google_media_id FROM google_picked_media WHERE source_id = ?',
+            [source.id]
+          );
           const photos = rows.map((r) => ({
             id: r.google_media_id,
             url: `/api/photo-sources/${source.id}/picked/${r.id}`,
@@ -4020,9 +4025,10 @@ fastify.get('/api/photo-items', async (request, reply) => {
           }
           return photos;
         } else if (source.type === 'HomeGlowPhotos') {
-          const rows = db.prepare(
-            'SELECT id, filename FROM homeglow_photos WHERE source_id = ? ORDER BY uploaded_at DESC'
-          ).all(source.id);
+          const rows = await dbx.all(
+            'SELECT id, filename FROM homeglow_photos WHERE source_id = ? ORDER BY uploaded_at DESC',
+            [source.id]
+          );
           const photos = rows.map((r) => ({
             id: `homeglow-${r.id}`,
             url: `/api/photo-sources/${source.id}/uploaded/${r.id}/file`,
