@@ -7,6 +7,7 @@ process.env.TZ = APP_TIMEZONE;
 const fastify = require('fastify')({ logger: true });
 const Database = require('better-sqlite3');
 const SqliteAdapter = require('./db/sqliteAdapter');
+const { createDatabase, bootstrapPostgresSchema } = require('./db');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -995,7 +996,7 @@ function parseTabConfigJson(configJson) {
 }
 
 async function getDeviceUpdateTimeMs(deviceName) {
-  const row = await dbx.get('SELECT updateTime FROM devices WHERE name = ?', [deviceName]);
+  const row = await dbx.get('SELECT updateTime AS "updateTime" FROM devices WHERE name = ?', [deviceName]);
   if (!row?.updateTime) return null;
   const timestamp = Date.parse(row.updateTime);
   return Number.isFinite(timestamp) ? timestamp : null;
@@ -1143,7 +1144,7 @@ async function touchDeviceUpdateTime(deviceName) {
 // Devices API Endpoints
 fastify.get('/api/devices', async (request, reply) => {
   try {
-    const devices = await dbx.all('SELECT name, updateTime FROM devices ORDER BY updateTime DESC');
+    const devices = await dbx.all('SELECT name, updateTime AS "updateTime" FROM devices ORDER BY updateTime DESC');
     const result = [];
     for (const device of devices) {
       const tabs = await getTabsForDevice(device.name);
@@ -1668,7 +1669,7 @@ fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
 fastify.get('/api/chore-history/summary/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const result = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [userId]);
+    const result = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [userId]);
     return { user_id: parseInt(userId), clam_total: result.total };
   } catch (error) {
     console.error('Error getting clam summary:', error);
@@ -1831,7 +1832,7 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       }
     }
 
-    const totalResult = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [user_id]);
+    const totalResult = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [user_id]);
 
     return { success: true, clam_total: totalResult.total };
   } catch (error) {
@@ -1873,7 +1874,7 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
       }
     }
 
-    const totalResult = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [user_id]);
+    const totalResult = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [user_id]);
 
     return { success: true, clam_total: totalResult.total };
   } catch (error) {
@@ -1886,7 +1887,7 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
 fastify.get('/api/users/:id/clams', async (request, reply) => {
   const { id } = request.params;
   try {
-    const result = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [id]);
+    const result = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [id]);
     return { user_id: parseInt(id), clam_total: result.total };
   } catch (error) {
     console.error('Error getting user clams:', error);
@@ -1905,7 +1906,7 @@ fastify.post('/api/users/:id/clams/add', async (request, reply) => {
     const useDate = date || getTodayLocalDateString();
     await dbx.run('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title) VALUES (?, NULL, ?, ?, ?)', [id, useDate, amount, 'Adjustment']);
 
-    const result = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [id]);
+    const result = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [id]);
     return { success: true, clam_total: result.total };
   } catch (error) {
     console.error('Error adding clams:', error);
@@ -1921,7 +1922,7 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
       return reply.status(400).send({ error: 'Valid positive amount is required' });
     }
 
-    const currentResult = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [id]);
+    const currentResult = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [id]);
     if (currentResult.total < amount) {
       return reply.status(400).send({ error: 'Insufficient clams' });
     }
@@ -1941,7 +1942,7 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
       }
     }
 
-    const result = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [id]);
+    const result = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [id]);
     return { success: true, clam_total: result.total };
   } catch (error) {
     console.error('Error reducing clams:', error);
@@ -1957,7 +1958,7 @@ fastify.get('/api/users', async (request, reply) => {
 
     const usersWithClams = [];
     for (const user of users) {
-      const clamResult = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [user.id]);
+      const clamResult = await dbx.get('SELECT CAST(COALESCE(SUM(clam_value), 0) AS INTEGER) as total FROM chore_history WHERE user_id = ?', [user.id]);
       usersWithClams.push({ ...user, clam_total: clamResult.total });
     }
 
@@ -3551,10 +3552,10 @@ fastify.post('/api/photo-sources/:id/test', async (request, reply) => {
       if (!account) {
         return reply.status(400).send({ success: false, error: 'No Google account connected. Connect one in Admin > Connections.' });
       }
-      const count = (await dbx.get('SELECT COUNT(*) AS c FROM google_picked_media WHERE source_id = ?', [source.id])).c;
+      const count = (await dbx.get('SELECT CAST(COUNT(*) AS INTEGER) AS c FROM google_picked_media WHERE source_id = ?', [source.id])).c;
       return { success: true, message: `${count} picked photo${count === 1 ? '' : 's'} available for this source.` };
     } else if (source.type === 'HomeGlowPhotos') {
-      const count = (await dbx.get('SELECT COUNT(*) AS c FROM homeglow_photos WHERE source_id = ?', [source.id])).c;
+      const count = (await dbx.get('SELECT CAST(COUNT(*) AS INTEGER) AS c FROM homeglow_photos WHERE source_id = ?', [source.id])).c;
       return { success: true, message: `${count} uploaded photo${count === 1 ? '' : 's'} available for this source.` };
     }
     return reply.status(400).send({ success: false, error: `Unsupported photo source type: ${source.type}` });
@@ -4137,14 +4138,25 @@ fastify.get('/api/system/backgroundTasks', async (request, reply) => {
 // Start server
 const start = async () => {
   try {
-    db = await ConnectOrCreateDb();
-    dbx = new SqliteAdapter(db); // async port over the same connection
-    if (!doesTableExist('settings')) {
-      console.log('settings table not found; running initial bootstrap migrations');
-      await runLegacyMigrations();
+    const engine = process.env.DB_ENGINE || 'sqlite';
+    if (engine === 'sqlite') {
+      db = await ConnectOrCreateDb();
+      dbx = new SqliteAdapter(db); // async port over the same connection
+      if (!doesTableExist('settings')) {
+        console.log('settings table not found; running initial bootstrap migrations');
+        await runLegacyMigrations();
+      }
+      const currentSchemaId = getCurrentSchemaVersion();
+      await applySchemaMigrations(currentSchemaId);
+    } else {
+      // PostgreSQL: use a fresh baseline schema instead of replaying the SQLite
+      // migration chain (see docs/db-abstraction-and-postgres-plan.md).
+      dbx = createDatabase({ engine });
+      const created = await bootstrapPostgresSchema(dbx);
+      console.log(created
+        ? 'Initialized PostgreSQL baseline schema (v14)'
+        : 'Connected to existing PostgreSQL database');
     }
-    const currentSchemaId = getCurrentSchemaVersion();
-    await applySchemaMigrations(currentSchemaId);
 
     if (process.env.HOMEGLOW_DISABLE_BACKGROUND_JOBS !== '1') {
       startNightlyCronJob(); // Start the nightly chore pruning job

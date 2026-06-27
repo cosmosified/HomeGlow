@@ -125,7 +125,11 @@ test('foreign_keys pragma is ON: ON DELETE CASCADE is enforced', async () => {
     }
 });
 
-test('engine selection: unknown throws, postgres not implemented yet', async () => {
+test('engine selection: unknown throws; postgres adapter constructs lazily', async () => {
     assert.throws(() => createDatabase({ engine: 'mysql' }), /Unknown DB_ENGINE/);
-    assert.throws(() => createDatabase({ engine: 'postgres' }), /not implemented yet/);
+    // Pool construction is lazy (no connection until first query), so this is safe
+    // and env-independent.
+    const pg = createDatabase({ engine: 'postgres', connectionString: 'postgres://u:p@127.0.0.1:1/none' });
+    assert.equal(pg.dialect, 'postgres');
+    await pg.close();
 });

@@ -1,8 +1,10 @@
 'use strict';
 
+const fs = require('node:fs');
 const path = require('node:path');
 const Database = require('better-sqlite3');
 const SqliteAdapter = require('./sqliteAdapter');
+const PostgresAdapter = require('./postgresAdapter');
 
 /**
  * The async persistence port. Both the SQLite adapter (now) and the PostgreSQL
@@ -56,10 +58,29 @@ function createDatabase(options = {}) {
     }
 
     if (engine === 'postgres') {
-        throw new Error("DB_ENGINE='postgres' is not implemented yet (planned for Phase 5).");
+        // Lazy-require pg so SQLite-only deployments don't need it loaded.
+        const { Pool } = require('pg');
+        const connectionString = options.connectionString || process.env.DATABASE_URL;
+        if (!connectionString) {
+            throw new Error("DB_ENGINE='postgres' requires DATABASE_URL (or options.connectionString).");
+        }
+        const pool = new Pool({ connectionString, max: options.poolMax || 5 });
+        return new PostgresAdapter(pool);
     }
 
     throw new Error(`Unknown DB_ENGINE '${engine}'. Expected 'sqlite' or 'postgres'.`);
 }
 
-module.exports = { createDatabase, SqliteAdapter };
+// On a fresh PostgreSQL database, load the baseline schema (equivalent to SQLite
+// schema version 14) if the core tables are not present yet. No-op once created.
+async function bootstrapPostgresSchema(db) {
+    const existing = await db.get("SELECT to_regclass('public.settings') AS t");
+    if (existing && existing.t) {
+        return false;
+    }
+    const schemaSql = fs.readFileSync(path.resolve(__dirname, 'schema.postgres.sql'), 'utf8');
+    await db.exec(schemaSql);
+    return true;
+}
+
+module.exports = { createDatabase, bootstrapPostgresSchema, SqliteAdapter, PostgresAdapter };
