@@ -1650,7 +1650,7 @@ fastify.get('/api/chore-history', async (request, reply) => {
 
     query += ' ORDER BY date DESC, created_at DESC';
 
-    const rows = db.prepare(query).all(...params);
+    const rows = await dbx.all(query, params);
     return rows;
   } catch (error) {
     console.error('Error fetching chore history:', error);
@@ -1661,7 +1661,7 @@ fastify.get('/api/chore-history', async (request, reply) => {
 fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const rows = db.prepare('SELECT * FROM chore_history WHERE user_id = ? ORDER BY date DESC, created_at DESC').all(userId);
+    const rows = await dbx.all('SELECT * FROM chore_history WHERE user_id = ? ORDER BY date DESC, created_at DESC', [userId]);
     return rows;
   } catch (error) {
     console.error('Error fetching user history:', error);
@@ -1672,7 +1672,7 @@ fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
 fastify.get('/api/chore-history/summary/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(userId);
+    const result = await dbx.get('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?', [userId]);
     return { user_id: parseInt(userId), clam_total: result.total };
   } catch (error) {
     console.error('Error getting clam summary:', error);
@@ -1687,9 +1687,8 @@ fastify.post('/api/chore-history', async (request, reply) => {
       return reply.status(400).send({ error: 'user_id and date are required' });
     }
 
-    const stmt = db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value) VALUES (?, ?, ?, ?)');
-    const info = stmt.run(user_id, chore_schedule_id || null, date, clam_value || 0);
-    return { id: info.lastInsertRowid, success: true };
+    const info = await dbx.run('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value) VALUES (?, ?, ?, ?)', [user_id, chore_schedule_id || null, date, clam_value || 0]);
+    return { id: info.insertId, success: true };
   } catch (error) {
     console.error('Error adding history entry:', error);
     reply.status(500).send({ error: 'Failed to add history entry' });
@@ -1702,14 +1701,14 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
     const since = new Date();
     since.setDate(since.getDate() - days);
     const sinceStr = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-${String(since.getDate()).padStart(2, '0')}`;
-    const rows = db.prepare(`
+    const rows = await dbx.all(`
       SELECT ch.id, ch.date, ch.clam_value, ch.title, ch.created_at,
              u.username
       FROM chore_history ch
       LEFT JOIN users u ON ch.user_id = u.id
       WHERE ch.date >= ? AND ch.clam_value != 0
       ORDER BY ch.date DESC, ch.created_at DESC
-    `).all(sinceStr);
+    `, [sinceStr]);
     return rows;
   } catch (error) {
     console.error('Error fetching recent chore history:', error);
@@ -1720,9 +1719,8 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
 fastify.delete('/api/chore-history/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM chore_history WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const info = await dbx.run('DELETE FROM chore_history WHERE id = ?', [id]);
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'History entry not found' });
     }
     return { success: true, message: 'History entry deleted successfully' };
