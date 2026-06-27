@@ -815,7 +815,7 @@ async function dailyBackgroundProcessing() {
     const today = getTodayLocalDateString();
 
     // We want to delete schedules that are completed and will never run again to avoid clutter
-    const schedulesToPrune = db.prepare(`
+    const schedulesToPrune = await dbx.all(`
       SELECT cs.id, cs.chore_id, cs.user_id, c.title
       FROM chore_schedules cs
       JOIN chores c ON cs.chore_id = c.id
@@ -825,13 +825,13 @@ async function dailyBackgroundProcessing() {
           SELECT 1 FROM chore_history ch
           WHERE ch.chore_schedule_id = cs.id
         )
-    `).all();
+    `);
     console.log(`Found ${schedulesToPrune.length} completed one-time chores to prune`);
 
     let prunedScheduleCount = 0;
     for (const schedule of schedulesToPrune) {
 
-      db.prepare('DELETE FROM chore_schedules WHERE id = ?').run(schedule.id);
+      await dbx.run('DELETE FROM chore_schedules WHERE id = ?', [schedule.id]);
       console.log(`Pruned schedule ID ${schedule.id}: "${schedule.title}" (user_id: ${schedule.user_id})`);
       prunedScheduleCount++;
     }
@@ -842,7 +842,7 @@ async function dailyBackgroundProcessing() {
     }
 
     // We should also delete chores that have no schedules to avoid clutter
-    const choresToPrune = db.prepare(`
+    const choresToPrune = await dbx.all(`
       SELECT c.id, c.title
       FROM chores c
       WHERE NOT EXISTS (
@@ -850,12 +850,12 @@ async function dailyBackgroundProcessing() {
           FROM chore_schedules cs
           WHERE cs.chore_id = c.id
       );
-    `).all();
+    `);
     console.log(`Found ${choresToPrune.length} orphaned chores to prune`);
 
     let prunedChoreCount = 0;
     for (const chore of choresToPrune) {
-      db.prepare('DELETE FROM chores WHERE id = ?').run(chore.id);
+      await dbx.run('DELETE FROM chores WHERE id = ?', [chore.id]);
       console.log(`Pruned chore ID ${chore.id}: "${chore.title}"`);
       prunedChoreCount++;
     }
@@ -866,7 +866,7 @@ async function dailyBackgroundProcessing() {
     }
 
     // bonus chores that persist from day to day should reset to unassigned
-    const choresToReset = db.prepare(`
+    const choresToReset = await dbx.all(`
       SELECT cs.id,
         cs.user_id,
         c.title
@@ -876,11 +876,11 @@ async function dailyBackgroundProcessing() {
         AND cs.visible = 1
         AND cs.user_id IS NOT NULL
         AND c.clam_value > 0;
-    `).all();
+    `);
     console.log(`Found ${choresToReset.length} bonus chores to reset`);
     let resetScheduleCount = 0;
     for (const schedule of choresToReset) {
-      db.prepare('UPDATE chore_schedules set user_id = NULL WHERE id = ?').run(schedule.id);
+      await dbx.run('UPDATE chore_schedules set user_id = NULL WHERE id = ?', [schedule.id]);
       console.log(`Reset schedule ID ${schedule.id}: "${schedule.title}" (user_id: ${schedule.user_id})`);
       resetScheduleCount++;
     }
@@ -892,7 +892,7 @@ async function dailyBackgroundProcessing() {
 
 
     // Handle sticky schedules: create one-time children for until-completed and once-completed parents that trigger today.
-    const stickyParentSchedules = db.prepare(`
+    const stickyParentSchedules = await dbx.all(`
       SELECT cs.id, cs.chore_id, cs.user_id, cs.crontab, cs.duration, cs.interval
       FROM chore_schedules cs
       WHERE cs.crontab IS NOT NULL
@@ -914,7 +914,7 @@ async function dailyBackgroundProcessing() {
               )
             )
         )
-    `).all();
+    `);
     console.log(`Found ${stickyParentSchedules.length} sticky schedules to check`);
 
     const startOfToday = new Date();
@@ -937,11 +937,11 @@ async function dailyBackgroundProcessing() {
       }
 
       if (today === next) {
-        const scheduleResult = db.prepare(`
+        const scheduleResult = await dbx.get(`
           INSERT INTO chore_schedules (chore_id, user_id, crontab, duration, visible, parent_schedule_id)
           VALUES (?, ?, NULL, 'day-of', 1, ?)
           RETURNING *
-        `).get(schedule.chore_id, schedule.user_id, schedule.id);
+        `, [schedule.chore_id, schedule.user_id, schedule.id]);
 
         triggeredSchedules.push(scheduleResult);
         stickySchedulesCreated++;
@@ -2715,12 +2715,11 @@ fastify.post('/api/test-api-key', async (request, reply) => {
 
   try {
     // Test direct database insertion
-    const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const result = stmt.run('WEATHER_API_KEY', apiKey);
+    const result = await dbx.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['WEATHER_API_KEY', apiKey]);
     console.log('Direct insert result:', result);
 
     // Verify it was saved
-    const verification = db.prepare('SELECT key, value FROM settings WHERE key = ?').get('WEATHER_API_KEY');
+    const verification = await dbx.get('SELECT key, value FROM settings WHERE key = ?', ['WEATHER_API_KEY']);
     console.log('Verification result:', verification);
 
     return {
@@ -2752,7 +2751,7 @@ fastify.get('/api/proxy', async (request, reply) => {
   let whitelist = [];
   try {
     // Fetch whitelist from DB. It should be a comma-separated string of hostnames.
-    const whitelistSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('PROXY_WHITELIST');
+    const whitelistSetting = await dbx.get('SELECT value FROM settings WHERE key = ?', ['PROXY_WHITELIST']);
     if (whitelistSetting && whitelistSetting.value) {
       whitelist = whitelistSetting.value.split(',').map(domain => domain.trim());
     }
