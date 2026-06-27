@@ -3431,7 +3431,7 @@ fastify.get('/api/calendar-sync/:sourceId/interval', async (request, reply) => {
 // Photo sources routes
 fastify.get('/api/photo-sources', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT id, name, type, url, album_id, enabled, sort_order, created_at FROM photo_sources ORDER BY sort_order, id').all();
+    const rows = await dbx.all('SELECT id, name, type, url, album_id, enabled, sort_order, created_at FROM photo_sources ORDER BY sort_order, id');
     return rows;
   } catch (error) {
     console.error('Error fetching photo sources:', error);
