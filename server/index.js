@@ -1409,7 +1409,7 @@ fastify.get('/api/chore-schedules', async (request, reply) => {
       query += ' WHERE ' + conditions.join(' AND ');
     }
 
-    const rows = db.prepare(query).all(...params);
+    const rows = await dbx.all(query, params);
     return rows;
   } catch (error) {
     console.error('Error fetching chore schedules:', error);
@@ -1420,7 +1420,7 @@ fastify.get('/api/chore-schedules', async (request, reply) => {
 fastify.get('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const row = db.prepare('SELECT cs.*, c.title, c.description, c.clam_value FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id WHERE cs.id = ?').get(id);
+    const row = await dbx.get('SELECT cs.*, c.title, c.description, c.clam_value FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id WHERE cs.id = ?', [id]);
     if (!row) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -1469,15 +1469,14 @@ fastify.post('/api/chore-schedules', async (request, reply) => {
       if (Number.isNaN(parsedParentScheduleId)) {
         return reply.status(400).send({ error: 'parent_schedule_id must be a number' });
       }
-      const parentExists = db.prepare('SELECT id FROM chore_schedules WHERE id = ?').get(parsedParentScheduleId);
+      const parentExists = await dbx.get('SELECT id FROM chore_schedules WHERE id = ?', [parsedParentScheduleId]);
       if (!parentExists) {
         return reply.status(400).send({ error: 'parent_schedule_id must reference an existing schedule' });
       }
       normalizedParentScheduleId = parsedParentScheduleId;
     }
 
-    const stmt = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(
+    const info = await dbx.run('INSERT INTO chore_schedules (chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id) VALUES (?, ?, ?, ?, ?, ?, ?)', [
       chore_id,
       user_id || null,
       crontab || null,
@@ -1485,8 +1484,8 @@ fastify.post('/api/chore-schedules', async (request, reply) => {
       visible !== undefined ? visible : 1,
       normalizedDuration === 'once-completed' ? normalizedInterval : null,
       normalizedParentScheduleId
-    );
-    return { id: info.lastInsertRowid, success: true };
+    ]);
+    return { id: info.insertId, success: true };
   } catch (error) {
     console.error('Error adding schedule:', error);
     reply.status(500).send({ error: 'Failed to add schedule' });
@@ -1508,12 +1507,11 @@ fastify.post('/api/chore-schedules/bulk', async (request, reply) => {
       }
     }
 
-    const stmt = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, crontab, visible) VALUES (?, ?, ?, ?)');
     const ids = [];
 
     for (const user_id of user_ids) {
-      const info = stmt.run(chore_id, user_id, crontab || null, visible !== undefined ? visible : 1);
-      ids.push(info.lastInsertRowid);
+      const info = await dbx.run('INSERT INTO chore_schedules (chore_id, user_id, crontab, visible) VALUES (?, ?, ?, ?)', [chore_id, user_id, crontab || null, visible !== undefined ? visible : 1]);
+      ids.push(info.insertId);
     }
 
     return { ids, success: true, count: ids.length };
@@ -1535,7 +1533,7 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       }
     }
 
-    const existingSchedule = db.prepare('SELECT id, crontab, duration, interval FROM chore_schedules WHERE id = ?').get(id);
+    const existingSchedule = await dbx.get('SELECT id, crontab, duration, interval FROM chore_schedules WHERE id = ?', [id]);
     if (!existingSchedule) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -1580,7 +1578,7 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
         if (parsedParentScheduleId === parseInt(id, 10)) {
           return reply.status(400).send({ error: 'A schedule cannot reference itself as parent_schedule_id' });
         }
-        const parentExists = db.prepare('SELECT id FROM chore_schedules WHERE id = ?').get(parsedParentScheduleId);
+        const parentExists = await dbx.get('SELECT id FROM chore_schedules WHERE id = ?', [parsedParentScheduleId]);
         if (!parentExists) {
           return reply.status(400).send({ error: 'parent_schedule_id must reference an existing schedule' });
         }
@@ -1595,10 +1593,9 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
     }
 
     params.push(id);
-    const stmt = db.prepare(`UPDATE chore_schedules SET ${updates.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...params);
+    const info = await dbx.run(`UPDATE chore_schedules SET ${updates.join(', ')} WHERE id = ?`, params);
 
-    if (info.changes === 0) {
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
     return { success: true };
@@ -1611,9 +1608,8 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
 fastify.delete('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM chore_schedules WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const info = await dbx.run('DELETE FROM chore_schedules WHERE id = ?', [id]);
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
     return { success: true, message: 'Schedule deleted successfully' };
