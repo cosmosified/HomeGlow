@@ -2893,7 +2893,7 @@ fastify.get('/api/proxy', async (request, reply) => {
 // Prize routes
 fastify.get('/api/prizes', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM prizes').all();
+    const rows = await dbx.all('SELECT * FROM prizes');
     return rows;
   } catch (error) {
     console.error('Error fetching prizes:', error);
@@ -2907,9 +2907,8 @@ fastify.post('/api/prizes', async (request, reply) => {
     return reply.status(400).send({ error: 'Prize name and a positive clam cost are required.' });
   }
   try {
-    const stmt = db.prepare('INSERT INTO prizes (name, clam_cost) VALUES (?, ?)');
-    const info = stmt.run(name, clam_cost);
-    return { id: info.lastInsertRowid };
+    const info = await dbx.run('INSERT INTO prizes (name, clam_cost) VALUES (?, ?)', [name, clam_cost]);
+    return { id: info.insertId };
   } catch (error) {
     console.error('Error adding prize:', error);
     reply.status(500).send({ error: 'Failed to add prize' });
@@ -2923,9 +2922,8 @@ fastify.patch('/api/prizes/:id', async (request, reply) => {
     return reply.status(400).send({ error: 'Prize name and a positive clam cost are required.' });
   }
   try {
-    const stmt = db.prepare('UPDATE prizes SET name = ?, clam_cost = ? WHERE id = ?');
-    const info = stmt.run(name, clam_cost, id);
-    if (info.changes === 0) {
+    const info = await dbx.run('UPDATE prizes SET name = ?, clam_cost = ? WHERE id = ?', [name, clam_cost, id]);
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
     return { success: true, message: 'Prize updated successfully' };
@@ -2938,9 +2936,8 @@ fastify.patch('/api/prizes/:id', async (request, reply) => {
 fastify.delete('/api/prizes/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM prizes WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const info = await dbx.run('DELETE FROM prizes WHERE id = ?', [id]);
+    if (info.rowCount === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
     return { success: true, message: 'Prize deleted successfully' };
