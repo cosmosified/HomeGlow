@@ -4088,7 +4088,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
 // Admin PIN routes
 fastify.get('/api/admin-pin/exists', async (request, reply) => {
   try {
-    const pin = db.prepare('SELECT id FROM admin_pin WHERE id = 1').get();
+    const pin = await dbx.get('SELECT id FROM admin_pin WHERE id = 1');
     return { exists: !!pin };
   } catch (error) {
     console.error('Error checking PIN existence:', error);
@@ -4113,14 +4113,12 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 
   try {
     const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
-    const existingPin = db.prepare('SELECT id FROM admin_pin WHERE id = 1').get();
+    const existingPin = await dbx.get('SELECT id FROM admin_pin WHERE id = 1');
 
     if (existingPin) {
-      const stmt = db.prepare('UPDATE admin_pin SET pin_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1');
-      stmt.run(pinHash);
+      await dbx.run('UPDATE admin_pin SET pin_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1', [pinHash]);
     } else {
-      const stmt = db.prepare('INSERT INTO admin_pin (id, pin_hash) VALUES (1, ?)');
-      stmt.run(pinHash);
+      await dbx.run('INSERT INTO admin_pin (id, pin_hash) VALUES (1, ?)', [pinHash]);
     }
 
     return { success: true, message: 'PIN set successfully' };
@@ -4132,7 +4130,7 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 
 fastify.delete('/api/admin-pin', async (request, reply) => {
   try {
-    db.prepare('DELETE FROM admin_pin WHERE id = 1').run();
+    await dbx.run('DELETE FROM admin_pin WHERE id = 1');
     return { success: true, message: 'PIN cleared successfully' };
   } catch (error) {
     console.error('Error clearing PIN:', error);
@@ -4148,7 +4146,7 @@ fastify.post('/api/admin-pin/verify', async (request, reply) => {
   }
 
   try {
-    const storedPin = db.prepare('SELECT pin_hash FROM admin_pin WHERE id = 1').get();
+    const storedPin = await dbx.get('SELECT pin_hash FROM admin_pin WHERE id = 1');
 
     if (!storedPin) {
       return reply.status(404).send({ error: 'No PIN configured' });
