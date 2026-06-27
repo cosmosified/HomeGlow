@@ -6,6 +6,7 @@ process.env.TZ = APP_TIMEZONE;
 
 const fastify = require('fastify')({ logger: true });
 const Database = require('better-sqlite3');
+const SqliteAdapter = require('./db/sqliteAdapter');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -737,6 +738,10 @@ const dbPath = process.env.DB_PATH
   : path.resolve(__dirname, 'data', 'tasks.db');
 console.log('Database path:', dbPath);
 let db; // Declare db variable outside to hold the single instance
+// Async persistence port (Phase 3 migration target). Wraps the SAME better-sqlite3
+// connection as `db`, so migrated (await dbx.*) and not-yet-migrated (db.prepare)
+// call sites operate on one connection during the incremental migration.
+let dbx = null;
 
 async function ConnectOrCreateDb() {
   try {
@@ -4176,6 +4181,7 @@ fastify.get('/api/system/backgroundTasks', async (request, reply) => {
 const start = async () => {
   try {
     db = await ConnectOrCreateDb();
+    dbx = new SqliteAdapter(db); // async port over the same connection
     if (!doesTableExist('settings')) {
       console.log('settings table not found; running initial bootstrap migrations');
       await runLegacyMigrations();
