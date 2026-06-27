@@ -40,3 +40,43 @@ jobs:
       - name: Run tests (${{ matrix.name }})
         run: npm test
         working-directory: ${{ matrix.path }}
+
+  # Run the backend suite against PostgreSQL so the persistence layer is verified
+  # on both engines (the characterization suite doubles as the cross-engine parity
+  # gate — see docs/db-abstraction-and-postgres-plan.md).
+  backend-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: homeglow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Install dependencies (backend)
+        run: npm install
+        working-directory: ./server
+
+      - name: Run backend tests against PostgreSQL
+        run: npm test
+        working-directory: ./server
+        env:
+          DB_ENGINE: postgres
+          DATABASE_URL: postgres://test:test@localhost:5432/homeglow_test
