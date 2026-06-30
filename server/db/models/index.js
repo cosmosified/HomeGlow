@@ -7,4 +7,7 @@ module.exports = {
     Setting: require('./Setting'),
     AdminPin: require('./AdminPin'),
     Prize: require('./Prize'),
+    Chore: require('./Chore'),
+    ChoreSchedule: require('./ChoreSchedule'),
+    ChoreHistory: require('./ChoreHistory'),
 };

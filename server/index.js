@@ -9,7 +9,7 @@ const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
 const { adoptOrMigrate } = require('./db/migrate');
-const { Setting, AdminPin, Prize, User } = require('./db/models');
+const { Setting, AdminPin, Prize, User, Chore, ChoreSchedule, ChoreHistory } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -1332,7 +1332,7 @@ fastify.delete('/api/devices/:deviceName', async (request, reply) => {
 // Chore routes (updated for new schema)
 fastify.get('/api/chores', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM chores').all();
+    const rows = await Chore.query();
     return rows;
   } catch (error) {
     console.error('Error fetching chores:', error);
@@ -1343,9 +1343,8 @@ fastify.get('/api/chores', async (request, reply) => {
 fastify.post('/api/chores', async (request, reply) => {
   const { title, description, clam_value } = request.body;
   try {
-    const stmt = db.prepare('INSERT INTO chores (title, description, clam_value) VALUES (?, ?, ?)');
-    const info = stmt.run(title, description, clam_value || 0);
-    return { id: info.lastInsertRowid, success: true };
+    const inserted = await Chore.query().insert({ title, description, clam_value: clam_value || 0 });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding chore:', error);
     reply.status(500).send({ error: 'Failed to add chore' });
@@ -1356,9 +1355,8 @@ fastify.patch('/api/chores/:id', async (request, reply) => {
   const { id } = request.params;
   const { title, description, clam_value } = request.body;
   try {
-    const stmt = db.prepare('UPDATE chores SET title = ?, description = ?, clam_value = ? WHERE id = ?');
-    const info = stmt.run(title, description, clam_value, id);
-    if (info.changes === 0) {
+    const updated = await Chore.query().patch({ title, description, clam_value }).where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Chore not found' });
     }
     return { success: true };
@@ -1371,10 +1369,11 @@ fastify.patch('/api/chores/:id', async (request, reply) => {
 fastify.delete('/api/chores/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    db.prepare('DELETE FROM chore_schedules WHERE chore_id = ?').run(id);
-    const stmt = db.prepare('DELETE FROM chores WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    // chore_schedules.chore_id has ON DELETE CASCADE (and chore_history.
+    // chore_schedule_id ON DELETE SET NULL), so deleting the chore removes its
+    // schedules automatically.
+    const deleted = await Chore.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Chore not found' });
     }
     return { success: true, message: 'Chore deleted successfully' };
@@ -1388,35 +1387,25 @@ fastify.delete('/api/chores/:id', async (request, reply) => {
 fastify.get('/api/chore-schedules', async (request, reply) => {
   try {
     const { user_id, visible, usage, chore_id } = request.query;
-    let query = 'SELECT cs.*, c.title, c.description, c.clam_value FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id';
-    const conditions = [];
-    const params = [];
+    const query = knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.title', 'c.description', 'c.clam_value');
 
     if (user_id !== undefined) {
-      conditions.push('cs.user_id = ?');
-      params.push(user_id);
+      query.where('cs.user_id', user_id);
     }
     if (visible !== undefined) {
-      conditions.push('cs.visible = ?');
-      params.push(visible === 'true' || visible === '1' ? 1 : 0);
+      query.where('cs.visible', visible === 'true' || visible === '1' ? 1 : 0);
     }
     if (usage !== undefined && usage === 'chart') {
-      conditions.push('cs.visible = ?');
-      params.push(1);
-      conditions.push('(cs.duration IS NULL OR cs.duration NOT IN (?, ?))');
-      params.push('until-completed', 'once-completed');
+      query.where('cs.visible', 1);
+      query.whereRaw('(cs.duration IS NULL OR cs.duration NOT IN (?, ?))', ['until-completed', 'once-completed']);
     }
     if (chore_id !== undefined) {
-      conditions.push('cs.chore_id = ?');
-      params.push(chore_id);
+      query.where('cs.chore_id', chore_id);
     }
 
-    if (conditions.length > 0) {
-      query += ' WHERE ' + conditions.join(' AND ');
-    }
-
-    const rows = db.prepare(query).all(...params);
-    return rows;
+    return await query;
   } catch (error) {
     console.error('Error fetching chore schedules:', error);
     reply.status(500).send({ error: 'Failed to fetch chore schedules' });
@@ -1426,7 +1415,11 @@ fastify.get('/api/chore-schedules', async (request, reply) => {
 fastify.get('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const row = db.prepare('SELECT cs.*, c.title, c.description, c.clam_value FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id WHERE cs.id = ?').get(id);
+    const row = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.title', 'c.description', 'c.clam_value')
+      .where('cs.id', id)
+      .first();
     if (!row) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -1475,24 +1468,23 @@ fastify.post('/api/chore-schedules', async (request, reply) => {
       if (Number.isNaN(parsedParentScheduleId)) {
         return reply.status(400).send({ error: 'parent_schedule_id must be a number' });
       }
-      const parentExists = db.prepare('SELECT id FROM chore_schedules WHERE id = ?').get(parsedParentScheduleId);
+      const parentExists = await ChoreSchedule.query().findById(parsedParentScheduleId);
       if (!parentExists) {
         return reply.status(400).send({ error: 'parent_schedule_id must reference an existing schedule' });
       }
       normalizedParentScheduleId = parsedParentScheduleId;
     }
 
-    const stmt = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(
+    const inserted = await ChoreSchedule.query().insert({
       chore_id,
-      user_id || null,
-      crontab || null,
-      normalizedDuration,
-      visible !== undefined ? visible : 1,
-      normalizedDuration === 'once-completed' ? normalizedInterval : null,
-      normalizedParentScheduleId
-    );
-    return { id: info.lastInsertRowid, success: true };
+      user_id: user_id || null,
+      crontab: crontab || null,
+      duration: normalizedDuration,
+      visible: visible !== undefined ? visible : 1,
+      interval: normalizedDuration === 'once-completed' ? normalizedInterval : null,
+      parent_schedule_id: normalizedParentScheduleId,
+    });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding schedule:', error);
     reply.status(500).send({ error: 'Failed to add schedule' });
@@ -1514,12 +1506,15 @@ fastify.post('/api/chore-schedules/bulk', async (request, reply) => {
       }
     }
 
-    const stmt = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, crontab, visible) VALUES (?, ?, ?, ?)');
     const ids = [];
-
     for (const user_id of user_ids) {
-      const info = stmt.run(chore_id, user_id, crontab || null, visible !== undefined ? visible : 1);
-      ids.push(info.lastInsertRowid);
+      const inserted = await ChoreSchedule.query().insert({
+        chore_id,
+        user_id,
+        crontab: crontab || null,
+        visible: visible !== undefined ? visible : 1,
+      });
+      ids.push(inserted.id);
     }
 
     return { ids, success: true, count: ids.length };
@@ -1541,7 +1536,7 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       }
     }
 
-    const existingSchedule = db.prepare('SELECT id, crontab, duration, interval FROM chore_schedules WHERE id = ?').get(id);
+    const existingSchedule = await ChoreSchedule.query().findById(id);
     if (!existingSchedule) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -1564,20 +1559,18 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       return reply.status(400).send({ error: 'interval is only allowed for once-completed schedules' });
     }
 
-    const updates = [];
-    const params = [];
+    const patch = {};
 
-    if (chore_id !== undefined) { updates.push('chore_id = ?'); params.push(chore_id); }
-    if (user_id !== undefined) { updates.push('user_id = ?'); params.push(user_id || null); }
-    if (crontab !== undefined) { updates.push('crontab = ?'); params.push(crontab || null); }
-    if (duration !== undefined) { updates.push('duration = ?'); params.push(nextDuration); }
+    if (chore_id !== undefined) { patch.chore_id = chore_id; }
+    if (user_id !== undefined) { patch.user_id = user_id || null; }
+    if (crontab !== undefined) { patch.crontab = crontab || null; }
+    if (duration !== undefined) { patch.duration = nextDuration; }
     if (interval !== undefined || duration !== undefined) {
-      updates.push('interval = ?');
-      params.push(nextDuration === 'once-completed' ? nextInterval : null);
+      patch.interval = nextDuration === 'once-completed' ? nextInterval : null;
     }
     if (parent_schedule_id !== undefined) {
       if (parent_schedule_id === null || parent_schedule_id === '') {
-        updates.push('parent_schedule_id = NULL');
+        patch.parent_schedule_id = null;
       } else {
         const parsedParentScheduleId = parseInt(parent_schedule_id, 10);
         if (Number.isNaN(parsedParentScheduleId)) {
@@ -1586,25 +1579,22 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
         if (parsedParentScheduleId === parseInt(id, 10)) {
           return reply.status(400).send({ error: 'A schedule cannot reference itself as parent_schedule_id' });
         }
-        const parentExists = db.prepare('SELECT id FROM chore_schedules WHERE id = ?').get(parsedParentScheduleId);
+        const parentExists = await ChoreSchedule.query().findById(parsedParentScheduleId);
         if (!parentExists) {
           return reply.status(400).send({ error: 'parent_schedule_id must reference an existing schedule' });
         }
-        updates.push('parent_schedule_id = ?');
-        params.push(parsedParentScheduleId);
+        patch.parent_schedule_id = parsedParentScheduleId;
       }
     }
-    if (visible !== undefined) { updates.push('visible = ?'); params.push(visible ? 1 : 0); }
+    if (visible !== undefined) { patch.visible = visible ? 1 : 0; }
 
-    if (updates.length === 0) {
+    if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
     }
 
-    params.push(id);
-    const stmt = db.prepare(`UPDATE chore_schedules SET ${updates.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...params);
+    const updated = await ChoreSchedule.query().patch(patch).where({ id });
 
-    if (info.changes === 0) {
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
     return { success: true };
@@ -1617,9 +1607,8 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
 fastify.delete('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM chore_schedules WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await ChoreSchedule.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
     return { success: true, message: 'Schedule deleted successfully' };
@@ -1633,35 +1622,16 @@ fastify.delete('/api/chore-schedules/:id', async (request, reply) => {
 fastify.get('/api/chore-history', async (request, reply) => {
   try {
     const { user_id, date, date_from, date_to } = request.query;
-    let query = 'SELECT * FROM chore_history';
-    const conditions = [];
-    const params = [];
+    const query = knex('chore_history');
 
-    if (user_id !== undefined) {
-      conditions.push('user_id = ?');
-      params.push(user_id);
-    }
-    if (date) {
-      conditions.push('date = ?');
-      params.push(date);
-    }
-    if (date_from) {
-      conditions.push('date >= ?');
-      params.push(date_from);
-    }
-    if (date_to) {
-      conditions.push('date <= ?');
-      params.push(date_to);
-    }
+    if (user_id !== undefined) query.where('user_id', user_id);
+    if (date) query.where('date', date);
+    if (date_from) query.where('date', '>=', date_from);
+    if (date_to) query.where('date', '<=', date_to);
 
-    if (conditions.length > 0) {
-      query += ' WHERE ' + conditions.join(' AND ');
-    }
+    query.orderBy([{ column: 'date', order: 'desc' }, { column: 'created_at', order: 'desc' }]);
 
-    query += ' ORDER BY date DESC, created_at DESC';
-
-    const rows = db.prepare(query).all(...params);
-    return rows;
+    return await query;
   } catch (error) {
     console.error('Error fetching chore history:', error);
     reply.status(500).send({ error: 'Failed to fetch chore history' });
@@ -1671,7 +1641,9 @@ fastify.get('/api/chore-history', async (request, reply) => {
 fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const rows = db.prepare('SELECT * FROM chore_history WHERE user_id = ? ORDER BY date DESC, created_at DESC').all(userId);
+    const rows = await knex('chore_history')
+      .where('user_id', userId)
+      .orderBy([{ column: 'date', order: 'desc' }, { column: 'created_at', order: 'desc' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching user history:', error);
@@ -1682,8 +1654,8 @@ fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
 fastify.get('/api/chore-history/summary/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(userId);
-    return { user_id: parseInt(userId), clam_total: result.total };
+    const total = await getUserClamTotal(userId);
+    return { user_id: parseInt(userId), clam_total: total };
   } catch (error) {
     console.error('Error getting clam summary:', error);
     reply.status(500).send({ error: 'Failed to get clam summary' });
@@ -1697,9 +1669,13 @@ fastify.post('/api/chore-history', async (request, reply) => {
       return reply.status(400).send({ error: 'user_id and date are required' });
     }
 
-    const stmt = db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value) VALUES (?, ?, ?, ?)');
-    const info = stmt.run(user_id, chore_schedule_id || null, date, clam_value || 0);
-    return { id: info.lastInsertRowid, success: true };
+    const inserted = await ChoreHistory.query().insert({
+      user_id,
+      chore_schedule_id: chore_schedule_id || null,
+      date,
+      clam_value: clam_value || 0,
+    });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding history entry:', error);
     reply.status(500).send({ error: 'Failed to add history entry' });
@@ -1712,14 +1688,12 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
     const since = new Date();
     since.setDate(since.getDate() - days);
     const sinceStr = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-${String(since.getDate()).padStart(2, '0')}`;
-    const rows = db.prepare(`
-      SELECT ch.id, ch.date, ch.clam_value, ch.title, ch.created_at,
-             u.username
-      FROM chore_history ch
-      LEFT JOIN users u ON ch.user_id = u.id
-      WHERE ch.date >= ? AND ch.clam_value != 0
-      ORDER BY ch.date DESC, ch.created_at DESC
-    `).all(sinceStr);
+    const rows = await knex('chore_history as ch')
+      .leftJoin('users as u', 'ch.user_id', 'u.id')
+      .select('ch.id', 'ch.date', 'ch.clam_value', 'ch.title', 'ch.created_at', 'u.username')
+      .where('ch.date', '>=', sinceStr)
+      .whereNot('ch.clam_value', 0)
+      .orderBy([{ column: 'ch.date', order: 'desc' }, { column: 'ch.created_at', order: 'desc' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching recent chore history:', error);
@@ -1730,9 +1704,8 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
 fastify.delete('/api/chore-history/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM chore_history WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await ChoreHistory.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'History entry not found' });
     }
     return { success: true, message: 'History entry deleted successfully' };
@@ -1750,7 +1723,11 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       return reply.status(400).send({ error: 'chore_schedule_id, user_id, and date are required' });
     }
 
-    const schedule = db.prepare('SELECT cs.*, c.clam_value, c.title FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id WHERE cs.id = ?').get(chore_schedule_id);
+    const schedule = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.clam_value', 'c.title')
+      .where('cs.id', chore_schedule_id)
+      .first();
     if (!schedule) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -1759,22 +1736,25 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       return reply.status(400).send({ error: 'Schedule is not visible' });
     }
 
-    const existing = db.prepare('SELECT id FROM chore_history WHERE chore_schedule_id = ? AND user_id = ? AND date = ?').get(chore_schedule_id, user_id, date);
+    const existing = await knex('chore_history').where({ chore_schedule_id, user_id, date }).first();
     if (existing) {
       return reply.status(409).send({ error: 'Chore already completed for this date' });
     }
 
-    db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title) VALUES (?, ?, ?, ?, ?)').run(user_id, chore_schedule_id, date, schedule.clam_value, schedule.title);
+    await ChoreHistory.query().insert({ user_id, chore_schedule_id, date, clam_value: schedule.clam_value, title: schedule.title });
 
     if (schedule.parent_schedule_id) {
-      const parentSchedule = db.prepare('SELECT id, duration, interval FROM chore_schedules WHERE id = ?').get(schedule.parent_schedule_id);
+      const parentSchedule = await knex('chore_schedules')
+        .select('id', 'duration', 'interval')
+        .where('id', schedule.parent_schedule_id)
+        .first();
       if (parentSchedule && parentSchedule.duration === 'once-completed') {
         const completionDate = parseDateOnlyToLocalDate(date);
         const nextDueDate = completionDate ? addIntervalToDate(completionDate, parentSchedule.interval) : null;
         const nextCrontab = buildDateCrontab(nextDueDate);
 
         if (nextCrontab) {
-          db.prepare('UPDATE chore_schedules SET crontab = ?, visible = 1 WHERE id = ?').run(nextCrontab, parentSchedule.id);
+          await knex('chore_schedules').where('id', parentSchedule.id).update({ crontab: nextCrontab, visible: 1 });
         } else {
           console.warn(`Could not reschedule once-completed parent schedule ${parentSchedule.id}; invalid interval: ${parentSchedule.interval}`);
         }
@@ -1782,26 +1762,16 @@ fastify.post('/api/chores/complete', async (request, reply) => {
     }
 
     const today = getTodayLocalDateString();
-    const allUserSchedules = db.prepare(`
-      SELECT cs.*,
-       c.clam_value,
-       EXISTS (
-           SELECT 1
-           FROM chore_history ch
-           WHERE ch.chore_schedule_id = cs.id
-             AND ch.user_id = cs.user_id
-             AND ch.date = ?
-       ) AS completed_today
-      FROM chore_schedules cs
-      JOIN chores c
-        ON cs.chore_id = c.id
-      WHERE cs.user_id = ?
-        AND cs.visible = 1
-        AND NOT (
-          cs.crontab IS NOT NULL
-          AND cs.duration IN ('until-completed', 'once-completed')
-        )
-    `).all(today, user_id);
+    const allUserSchedules = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.clam_value')
+      .select(knex.raw(
+        'EXISTS (SELECT 1 FROM chore_history ch WHERE ch.chore_schedule_id = cs.id AND ch.user_id = cs.user_id AND ch.date = ?) AS completed_today',
+        [today]
+      ))
+      .where('cs.user_id', user_id)
+      .where('cs.visible', 1)
+      .whereRaw("NOT (cs.crontab IS NOT NULL AND cs.duration IN ('until-completed', 'once-completed'))");
 
     const regularChores = allUserSchedules.filter(s => s.clam_value === 0);
 
@@ -1830,26 +1800,21 @@ fastify.post('/api/chores/complete', async (request, reply) => {
 
     const uncompletedRegularChores = todaysChores.filter(cs => cs.completed_today == 0);
     if (todaysChores.length && !uncompletedRegularChores.length) {
-      const dailyRewardSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('daily_completion_clam_reward');
+      const dailyRewardSetting = await Setting.query().findById('daily_completion_clam_reward');
       const dailyReward = dailyRewardSetting ? parseInt(dailyRewardSetting.value, 10) : 2;
 
-      const bonusAlreadyAwarded = db.prepare(`
-          SELECT id FROM chore_history
-          WHERE user_id = ?
-          AND date = ?
-          AND chore_schedule_id IS NULL
-          AND clam_value = ?
-          AND title = ?
-        `).get(user_id, date, dailyReward, 'Regular chores');
+      const bonusAlreadyAwarded = await knex('chore_history')
+        .where({ user_id, date, chore_schedule_id: null, clam_value: dailyReward, title: 'Regular chores' })
+        .first();
 
       if (!bonusAlreadyAwarded) {
-        db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title) VALUES (?, NULL, ?, ?, ?)').run(user_id, date, dailyReward, 'Regular chores');
+        await ChoreHistory.query().insert({ user_id, chore_schedule_id: null, date, clam_value: dailyReward, title: 'Regular chores' });
       }
     }
 
-    const totalResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(user_id);
+    const total = await getUserClamTotal(user_id);
 
-    return { success: true, clam_total: totalResult.total };
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error completing chore:', error);
     reply.status(500).send({ error: 'Failed to complete chore' });
@@ -1863,35 +1828,33 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
       return reply.status(400).send({ error: 'chore_schedule_id, user_id, and date are required' });
     }
 
-    const history = db.prepare('SELECT id, clam_value FROM chore_history WHERE chore_schedule_id = ? AND user_id = ? AND date = ?').get(chore_schedule_id, user_id, date);
+    const history = await knex('chore_history')
+      .select('id', 'clam_value')
+      .where({ chore_schedule_id, user_id, date })
+      .first();
     if (!history) {
       return reply.status(404).send({ error: 'Completion record not found' });
     }
 
-    db.prepare('DELETE FROM chore_history WHERE id = ?').run(history.id);
+    await knex('chore_history').where('id', history.id).del();
 
     // if the uncompleted chore was a bonus chore (has clam value), don't remove the daily bonus when uncompleting
     if (!history.clam_value) {
-      const dailyRewardSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('daily_completion_clam_reward');
+      const dailyRewardSetting = await Setting.query().findById('daily_completion_clam_reward');
       const dailyReward = dailyRewardSetting ? parseInt(dailyRewardSetting.value, 10) : 2;
 
-      const bonusEntry = db.prepare(`
-      SELECT id FROM chore_history
-      WHERE user_id = ?
-      AND date = ?
-      AND chore_schedule_id IS NULL
-      AND clam_value = ?
-      AND title = ?
-    `).get(user_id, date, dailyReward, 'Regular chores');
+      const bonusEntry = await knex('chore_history')
+        .where({ user_id, date, chore_schedule_id: null, clam_value: dailyReward, title: 'Regular chores' })
+        .first();
 
       if (bonusEntry) {
-        db.prepare('DELETE FROM chore_history WHERE id = ?').run(bonusEntry.id);
+        await knex('chore_history').where('id', bonusEntry.id).del();
       }
     }
 
-    const totalResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(user_id);
+    const total = await getUserClamTotal(user_id);
 
-    return { success: true, clam_total: totalResult.total };
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error uncompleting chore:', error);
     reply.status(500).send({ error: 'Failed to uncomplete chore' });
