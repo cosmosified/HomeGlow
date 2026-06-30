@@ -14,4 +14,7 @@ module.exports = {
     CalendarSource: require('./CalendarSource'),
     CalendarEventsCache: require('./CalendarEventsCache'),
     CalendarSyncStatus: require('./CalendarSyncStatus'),
+    PhotoSource: require('./PhotoSource'),
+    GooglePickedMedia: require('./GooglePickedMedia'),
+    HomeglowPhoto: require('./HomeglowPhoto'),
 };
