@@ -17,4 +17,6 @@ module.exports = {
     PhotoSource: require('./PhotoSource'),
     GooglePickedMedia: require('./GooglePickedMedia'),
     HomeglowPhoto: require('./HomeglowPhoto'),
+    Device: require('./Device'),
+    Tab: require('./Tab'),
 };
