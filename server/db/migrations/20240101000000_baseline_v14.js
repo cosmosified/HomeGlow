@@ -249,6 +249,12 @@ exports.up = async function up(knex) {
     await knex.raw(
         "INSERT OR IGNORE INTO users (id, username, email, profile_picture) VALUES (0, 'bonus', 'bonus@example.com', '')"
     );
+    // Back-compat: keep the legacy schema-version marker so any tooling that reads
+    // it still sees the baseline level. Knex's knex_migrations ledger is the real
+    // source of truth going forward.
+    await knex.raw(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('SYSTEM_SCHEMA_ID', '14')"
+    );
 };
 
 exports.down = async function down(knex) {

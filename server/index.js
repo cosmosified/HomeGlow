@@ -43,6 +43,9 @@ const migrateChoreHistoryTitle = require('./migrations/migrateChoreHistoryTitle'
 const migrateToDurationField = require('./migrations/migrateToDurationField');
 
 const SYSTEM_SCHEMA_ID_KEY = 'SYSTEM_SCHEMA_ID';
+// Schema level encoded by the Knex baseline migration. Existing DBs below this are
+// lifted to it by the legacy chain before Knex takes over (Option A).
+const BASELINE_SCHEMA_VERSION = 14;
 
 const schemaMigrations = [
   { schemaId: 6, migrationPath: './migrations/migrateDeviceSchemaV6', },
@@ -4184,18 +4187,20 @@ const start = async () => {
     // still use `db` for now; domains are migrated onto Objection task by task.
     knex = createKnex();
     Model.knex(knex);
-    if (!doesTableExist('settings')) {
-      console.log('settings table not found; running initial bootstrap migrations');
-      await runLegacyMigrations();
-    }
-    const currentSchemaId = getCurrentSchemaVersion();
-    await applySchemaMigrations(currentSchemaId);
 
-    // Baseline adoption: the legacy chain above has brought any existing DB up to
-    // schema 14 (and built a fresh DB to 14). Now hand schema authority to Knex —
-    // stamp the v14 baseline as already-applied for legacy DBs (no destructive
-    // re-run) and apply any migrations newer than the baseline.
-    await adoptOrMigrate(knex);
+    // Schema management: Knex (knex_migrations) is the source of truth.
+    //  * Existing install (settings table present): lift any pre-baseline DB to
+    //    v14 with the legacy schema migrations (Option A), then Knex adopts it.
+    //  * Fresh install: the Knex baseline migration builds v14 directly.
+    if (doesTableExist('settings')) {
+      const currentSchemaId = getCurrentSchemaVersion();
+      if (currentSchemaId < BASELINE_SCHEMA_VERSION) {
+        console.log(`Existing DB at schema ${currentSchemaId}; lifting to baseline v${BASELINE_SCHEMA_VERSION} via legacy migrations`);
+        await applySchemaMigrations(currentSchemaId);
+      }
+    }
+    const migrationResult = await adoptOrMigrate(knex);
+    console.log(`Knex migrations: adopted=${migrationResult.adopted}, applied=[${migrationResult.applied.join(', ')}]`);
 
     if (process.env.HOMEGLOW_DISABLE_BACKGROUND_JOBS !== '1') {
       startNightlyCronJob(); // Start the nightly chore pruning job

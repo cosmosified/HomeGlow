@@ -71,6 +71,26 @@ test('baseline migration builds a complete schema-14 database on a fresh DB', as
     }
 });
 
+test('knex.migrate.rollback runs the baseline down() and drops the schema', async () => {
+    const file = tmpDb('rollback');
+    const knex = createKnex({ engine: 'sqlite', filename: file });
+    try {
+        await adoptOrMigrate(knex);
+        assert.equal(await knex.schema.hasTable('users'), true, 'schema built before rollback');
+
+        const [, rolledBack] = await knex.migrate.rollback();
+        assert.ok(rolledBack.some((m) => m.endsWith('_baseline_v14.js')), 'baseline rolled back');
+
+        // down() dropped all baseline tables.
+        for (const t of SCHEMA_TABLES) {
+            assert.equal(await knex.schema.hasTable(t), false, `table ${t} dropped by down()`);
+        }
+    } finally {
+        await knex.destroy();
+        cleanup(file);
+    }
+});
+
 test('baseline ADOPTION stamps an existing schema-14 DB without re-running DDL or losing data', async () => {
     const file = tmpDb('adopt');
 
@@ -82,7 +102,7 @@ test('baseline ADOPTION stamps an existing schema-14 DB without re-running DDL o
         await setup.schema.dropTableIfExists('knex_migrations');
         await setup.schema.dropTableIfExists('knex_migrations_lock');
         await setup('users').insert({ username: 'sentinel', email: 's@example.com', profile_picture: '' });
-        await setup('settings').insert({ key: 'SYSTEM_SCHEMA_ID', value: '14' });
+        // SYSTEM_SCHEMA_ID=14 is already seeded by the baseline migration.
     } finally {
         await setup.destroy();
     }
