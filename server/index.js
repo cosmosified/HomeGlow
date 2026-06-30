@@ -6,6 +6,8 @@ process.env.TZ = APP_TIMEZONE;
 
 const fastify = require('fastify')({ logger: true });
 const Database = require('better-sqlite3');
+const { Model } = require('objection');
+const { createKnex } = require('./db/knex');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -737,6 +739,7 @@ const dbPath = process.env.DB_PATH
   : path.resolve(__dirname, 'data', 'tasks.db');
 console.log('Database path:', dbPath);
 let db; // Declare db variable outside to hold the single instance
+let knex; // Knex/Objection instance, wired alongside the legacy `db` during the ORM migration
 
 async function ConnectOrCreateDb() {
   try {
@@ -4176,6 +4179,10 @@ fastify.get('/api/system/backgroundTasks', async (request, reply) => {
 const start = async () => {
   try {
     db = await ConnectOrCreateDb();
+    // Wire Knex + Objection alongside the legacy better-sqlite3 connection. Routes
+    // still use `db` for now; domains are migrated onto Objection task by task.
+    knex = createKnex();
+    Model.knex(knex);
     if (!doesTableExist('settings')) {
       console.log('settings table not found; running initial bootstrap migrations');
       await runLegacyMigrations();

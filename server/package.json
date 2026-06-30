@@ -23,7 +23,9 @@
     "fastify": "^5.8.5",
     "ical-generator": "^10.2.0",
     "ical.js": "^2.2.1",
+    "knex": "^3.3.0",
     "node-cron": "^4.2.1",
-    "node-ical": "^0.26.0"
+    "node-ical": "^0.26.0",
+    "objection": "^3.1.5"
   }
 }
