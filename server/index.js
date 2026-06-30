@@ -9,6 +9,7 @@ const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
 const { adoptOrMigrate } = require('./db/migrate');
+const { Setting, AdminPin } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -2164,15 +2165,12 @@ function deserializeSettingValue(value) {
 // NEW: API Endpoints for Settings (including API keys)
 fastify.get('/api/settings', async (request, reply) => {
   try {
-    console.log('=== FETCHING SETTINGS ===');
-    const rows = db.prepare('SELECT key, value FROM settings').all();
-    console.log('Raw settings from database:', rows);
+    const rows = await Setting.query().select('key', 'value');
     // Convert array of {key, value} objects to a single object {key: value}
     const settings = rows.reduce((acc, row) => {
       acc[row.key] = deserializeSettingValue(row.value);
       return acc;
     }, {});
-    console.log('Processed settings object:', settings);
     return settings;
   } catch (error) {
     console.error('Error fetching settings:', error);
@@ -2182,25 +2180,22 @@ fastify.get('/api/settings', async (request, reply) => {
 
 fastify.post('/api/settings/search', async (request, reply) => {
   try {
-    console.log('=== SEARCHING SETTINGS ===');
     // coerce the request body to array of strings to search the settings database by key:
     const keys = Array.isArray(request.body) ? request.body : [request.body];
 
-    // use parameters to filter settings by key if provided, otherwise return all settings
-    // accept simple wildcards for partial match via * (e.g. WEATHER_* to match all weather related settings)
-    let query = 'SELECT key, value FROM settings';
+    // accept simple wildcards for partial match via * (e.g. WEATHER_* to match all
+    // weather related settings)
+    const query = Setting.query().select('key', 'value');
     if (keys.length) {
-      const conditions = keys.map(() => 'key LIKE ?').join(' OR ');
-      query += ' WHERE ' + conditions;
+      query.where((builder) => {
+        keys.forEach((key) => builder.orWhere('key', 'like', String(key).replaceAll('*', '%')));
+      });
     }
-    const rows = db.prepare(query).all(...keys.map(key => key.replaceAll('*', '%')));
-    console.log('Raw settings from database:', rows);
-    // Convert array of {key, value} objects to a single object {key: value}
+    const rows = await query;
     const settings = rows.reduce((acc, row) => {
       acc[row.key] = deserializeSettingValue(row.value);
       return acc;
     }, {});
-    console.log('Processed settings object:', settings);
     return settings;
   } catch (error) {
     console.error('Error fetching settings:', error);
@@ -2210,30 +2205,14 @@ fastify.post('/api/settings/search', async (request, reply) => {
 
 fastify.post('/api/settings', async (request, reply) => {
   const { key, value } = request.body;
-  // single log message showing the details of the save:
-  console.log(`=== SAVING SETTING === Key: ${key} - Value: ${value} Value type: ${typeof value} Value length: ${value ? value.length : 'null/undefined'}`);
 
   if (!key || value === undefined) {
-    console.log('ERROR: Missing key or value');
     return reply.status(400).send({ error: 'Key and value are required.' });
   }
   try {
-    // Use INSERT OR REPLACE to either insert a new setting or update an existing one
-    const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const result = stmt.run(key, value);
-    console.log('Database insert result:', result);
-
-    // Verify the setting was saved
-    const verification = db.prepare('SELECT key, value FROM settings WHERE key = ?').get(key);
-    console.log('Verification query result:', verification);
-
-    // Special verification for weather API key
-    if (key === 'WEATHER_API_KEY') {
-      console.log('=== WEATHER API KEY VERIFICATION ===');
-      console.log('Saved value in DB:', verification ? verification.value : 'NOT FOUND');
-      console.log('Value matches input?', verification && verification.value === value);
-    }
-
+    // Upsert: insert a new setting or replace the value of an existing one
+    // (equivalent to the previous INSERT OR REPLACE).
+    await Setting.query().insert({ key, value }).onConflict('key').merge();
     return { success: true, message: `Setting '${key}' saved successfully.` };
   } catch (error) {
     console.error(`Error saving setting '${key}':`, error);
@@ -4091,7 +4070,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
 // Admin PIN routes
 fastify.get('/api/admin-pin/exists', async (request, reply) => {
   try {
-    const pin = db.prepare('SELECT id FROM admin_pin WHERE id = 1').get();
+    const pin = await AdminPin.query().findById(1);
     return { exists: !!pin };
   } catch (error) {
     console.error('Error checking PIN existence:', error);
@@ -4116,14 +4095,14 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 
   try {
     const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
-    const existingPin = db.prepare('SELECT id FROM admin_pin WHERE id = 1').get();
+    const existingPin = await AdminPin.query().findById(1);
 
     if (existingPin) {
-      const stmt = db.prepare('UPDATE admin_pin SET pin_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1');
-      stmt.run(pinHash);
+      await AdminPin.query()
+        .findById(1)
+        .patch({ pin_hash: pinHash, updated_at: knex.raw('CURRENT_TIMESTAMP') });
     } else {
-      const stmt = db.prepare('INSERT INTO admin_pin (id, pin_hash) VALUES (1, ?)');
-      stmt.run(pinHash);
+      await AdminPin.query().insert({ id: 1, pin_hash: pinHash });
     }
 
     return { success: true, message: 'PIN set successfully' };
@@ -4135,7 +4114,7 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 
 fastify.delete('/api/admin-pin', async (request, reply) => {
   try {
-    db.prepare('DELETE FROM admin_pin WHERE id = 1').run();
+    await AdminPin.query().deleteById(1);
     return { success: true, message: 'PIN cleared successfully' };
   } catch (error) {
     console.error('Error clearing PIN:', error);
@@ -4151,7 +4130,7 @@ fastify.post('/api/admin-pin/verify', async (request, reply) => {
   }
 
   try {
-    const storedPin = db.prepare('SELECT pin_hash FROM admin_pin WHERE id = 1').get();
+    const storedPin = await AdminPin.query().findById(1);
 
     if (!storedPin) {
       return reply.status(404).send({ error: 'No PIN configured' });
