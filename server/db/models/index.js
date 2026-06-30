@@ -6,4 +6,5 @@ module.exports = {
     User: require('./User'),
     Setting: require('./Setting'),
     AdminPin: require('./AdminPin'),
+    Prize: require('./Prize'),
 };

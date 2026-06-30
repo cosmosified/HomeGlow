@@ -9,7 +9,7 @@ const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
 const { adoptOrMigrate } = require('./db/migrate');
-const { Setting, AdminPin } = require('./db/models');
+const { Setting, AdminPin, Prize } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -2875,7 +2875,7 @@ fastify.get('/api/proxy', async (request, reply) => {
 // Prize routes
 fastify.get('/api/prizes', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM prizes').all();
+    const rows = await Prize.query();
     return rows;
   } catch (error) {
     console.error('Error fetching prizes:', error);
@@ -2889,9 +2889,8 @@ fastify.post('/api/prizes', async (request, reply) => {
     return reply.status(400).send({ error: 'Prize name and a positive clam cost are required.' });
   }
   try {
-    const stmt = db.prepare('INSERT INTO prizes (name, clam_cost) VALUES (?, ?)');
-    const info = stmt.run(name, clam_cost);
-    return { id: info.lastInsertRowid };
+    const inserted = await Prize.query().insert({ name, clam_cost });
+    return { id: inserted.id };
   } catch (error) {
     console.error('Error adding prize:', error);
     reply.status(500).send({ error: 'Failed to add prize' });
@@ -2905,9 +2904,8 @@ fastify.patch('/api/prizes/:id', async (request, reply) => {
     return reply.status(400).send({ error: 'Prize name and a positive clam cost are required.' });
   }
   try {
-    const stmt = db.prepare('UPDATE prizes SET name = ?, clam_cost = ? WHERE id = ?');
-    const info = stmt.run(name, clam_cost, id);
-    if (info.changes === 0) {
+    const updated = await Prize.query().patch({ name, clam_cost }).where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
     return { success: true, message: 'Prize updated successfully' };
@@ -2920,9 +2918,8 @@ fastify.patch('/api/prizes/:id', async (request, reply) => {
 fastify.delete('/api/prizes/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM prizes WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await Prize.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
     return { success: true, message: 'Prize deleted successfully' };
