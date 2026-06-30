@@ -9,7 +9,7 @@ const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
 const { adoptOrMigrate } = require('./db/migrate');
-const { Setting, AdminPin, Prize, User, Chore, ChoreSchedule, ChoreHistory } = require('./db/models');
+const { Setting, AdminPin, Prize, User, Chore, ChoreSchedule, ChoreHistory, Event, CalendarSource, CalendarEventsCache, CalendarSyncStatus } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -2072,7 +2072,7 @@ fastify.delete('/api/users/:id', async (request, reply) => {
 // Calendar routes (existing)
 fastify.get('/api/calendar', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM events').all();
+    const rows = await Event.query();
     return rows;
   } catch (error) {
     console.error('Error fetching events:', error);
@@ -2083,9 +2083,8 @@ fastify.get('/api/calendar', async (request, reply) => {
 fastify.post('/api/calendar', async (request, reply) => {
   const { user_id, summary, start, end, description } = request.body;
   try {
-    const stmt = db.prepare('INSERT INTO events (user_id, summary, start, end, description) VALUES (?, ?, ?, ?, ?)');
-    const info = stmt.run(user_id, summary, start, end, description);
-    return { id: info.lastInsertRowid };
+    const inserted = await Event.query().insert({ user_id, summary, start, end, description });
+    return { id: inserted.id };
   } catch (error) {
     console.error('Error adding event:', error);
     reply.status(500).send({ error: 'Failed to add event' });
@@ -2094,7 +2093,7 @@ fastify.post('/api/calendar', async (request, reply) => {
 
 fastify.get('/api/calendar/ics', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM events').all();
+    const rows = await Event.query();
     const calendar = ical({ name: 'HomeGlow Calendar' });
     rows.forEach((event) => {
       calendar.createEvent({
@@ -3040,7 +3039,7 @@ fastify.get('/api/connections/google/calendars', async (request, reply) => {
 fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
   try {
     const { id } = request.params;
-    const source = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const source = await CalendarSource.query().findById(id);
     if (!source) return reply.status(404).send({ error: 'Calendar source not found' });
     if (source.type !== 'Google') {
       return reply.status(400).send({ error: 'This calendar type is read-only.' });
@@ -3060,7 +3059,7 @@ fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
 fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply) => {
   try {
     const { id, eventId } = request.params;
-    const source = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const source = await CalendarSource.query().findById(id);
     if (!source) return reply.status(404).send({ error: 'Calendar source not found' });
     if (source.type !== 'Google') {
       return reply.status(400).send({ error: 'This calendar type is read-only.' });
@@ -3080,7 +3079,7 @@ fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply
 fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, reply) => {
   try {
     const { id, eventId } = request.params;
-    const source = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const source = await CalendarSource.query().findById(id);
     if (!source) return reply.status(404).send({ error: 'Calendar source not found' });
     if (source.type !== 'Google') {
       return reply.status(400).send({ error: 'This calendar type is read-only.' });
@@ -3129,7 +3128,9 @@ fastify.post('/api/connections/apple/calendars', async (request, reply) => {
 // Calendar sources routes
 fastify.get('/api/calendar-sources', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT id, name, type, url, username, color, enabled, sort_order, created_at FROM calendar_sources ORDER BY sort_order, id').all();
+    const rows = await CalendarSource.query()
+      .select('id', 'name', 'type', 'url', 'username', 'color', 'enabled', 'sort_order', 'created_at')
+      .orderBy([{ column: 'sort_order' }, { column: 'id' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching calendar sources:', error);
@@ -3153,20 +3154,25 @@ fastify.post('/api/calendar-sources', async (request, reply) => {
   }
   try {
     const encryptedPassword = password ? encryptPassword(password) : null;
-    const maxOrder = db.prepare('SELECT MAX(sort_order) as max FROM calendar_sources').get();
-    const nextOrder = (maxOrder.max || 0) + 1;
+    const maxRow = await knex('calendar_sources').max({ max: 'sort_order' }).first();
+    const nextOrder = ((maxRow && maxRow.max) || 0) + 1;
 
-    const stmt = db.prepare(`
-      INSERT INTO calendar_sources (name, type, url, username, password, color, enabled, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(name, type, url, username || null, encryptedPassword, color || '#6e44ff', 1, nextOrder);
+    const inserted = await CalendarSource.query().insert({
+      name,
+      type,
+      url,
+      username: username || null,
+      password: encryptedPassword,
+      color: color || '#6e44ff',
+      enabled: 1,
+      sort_order: nextOrder,
+    });
 
     if (calendarSyncService) {
-      calendarSyncService.onSourceCreated(info.lastInsertRowid);
+      calendarSyncService.onSourceCreated(inserted.id);
     }
 
-    return { id: info.lastInsertRowid, success: true };
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding calendar source:', error);
     reply.status(500).send({ error: 'Failed to add calendar source' });
@@ -3178,41 +3184,35 @@ fastify.patch('/api/calendar-sources/:id', async (request, reply) => {
   const { name, type, url, username, password, color, enabled } = request.body;
 
   try {
-    const existing = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const existing = await CalendarSource.query().findById(id);
     if (!existing) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
 
-    const updateFields = [];
-    const updateValues = [];
+    const patch = {};
 
-    if (name !== undefined) { updateFields.push('name = ?'); updateValues.push(name); }
+    if (name !== undefined) { patch.name = name; }
     if (type !== undefined) {
       if (!['ICS', 'CalDAV', 'Apple'].includes(type)) {
         return reply.status(400).send({ error: 'Type must be ICS, CalDAV, or Apple.' });
       }
-      updateFields.push('type = ?');
-      updateValues.push(type);
+      patch.type = type;
     }
-    if (url !== undefined) { updateFields.push('url = ?'); updateValues.push(url); }
-    if (username !== undefined) { updateFields.push('username = ?'); updateValues.push(username || null); }
+    if (url !== undefined) { patch.url = url; }
+    if (username !== undefined) { patch.username = username || null; }
     if (password !== undefined && password !== '') {
-      const encryptedPassword = encryptPassword(password);
-      updateFields.push('password = ?');
-      updateValues.push(encryptedPassword);
+      patch.password = encryptPassword(password);
     }
-    if (color !== undefined) { updateFields.push('color = ?'); updateValues.push(color); }
-    if (enabled !== undefined) { updateFields.push('enabled = ?'); updateValues.push(enabled ? 1 : 0); }
+    if (color !== undefined) { patch.color = color; }
+    if (enabled !== undefined) { patch.enabled = enabled ? 1 : 0; }
 
-    if (updateFields.length === 0) {
+    if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
     }
 
-    updateValues.push(id);
-    const stmt = db.prepare(`UPDATE calendar_sources SET ${updateFields.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...updateValues);
+    const updated = await CalendarSource.query().patch(patch).where({ id });
 
-    if (info.changes === 0) {
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
 
@@ -3238,9 +3238,8 @@ fastify.delete('/api/calendar-sources/:id', async (request, reply) => {
       calendarSyncService.onSourceDeleted(parseInt(id));
     }
 
-    const stmt = db.prepare('DELETE FROM calendar_sources WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await CalendarSource.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
     return { success: true, message: 'Calendar source deleted successfully' };
@@ -3253,7 +3252,7 @@ fastify.delete('/api/calendar-sources/:id', async (request, reply) => {
 fastify.post('/api/calendar-sources/:id/test', async (request, reply) => {
   const { id } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const source = await CalendarSource.query().findById(id);
     if (!source) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }

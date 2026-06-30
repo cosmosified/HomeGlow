@@ -10,4 +10,8 @@ module.exports = {
     Chore: require('./Chore'),
     ChoreSchedule: require('./ChoreSchedule'),
     ChoreHistory: require('./ChoreHistory'),
+    Event: require('./Event'),
+    CalendarSource: require('./CalendarSource'),
+    CalendarEventsCache: require('./CalendarEventsCache'),
+    CalendarSyncStatus: require('./CalendarSyncStatus'),
 };
