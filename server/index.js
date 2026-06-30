@@ -8,6 +8,7 @@ const fastify = require('fastify')({ logger: true });
 const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
+const { adoptOrMigrate } = require('./db/migrate');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -4189,6 +4190,12 @@ const start = async () => {
     }
     const currentSchemaId = getCurrentSchemaVersion();
     await applySchemaMigrations(currentSchemaId);
+
+    // Baseline adoption: the legacy chain above has brought any existing DB up to
+    // schema 14 (and built a fresh DB to 14). Now hand schema authority to Knex —
+    // stamp the v14 baseline as already-applied for legacy DBs (no destructive
+    // re-run) and apply any migrations newer than the baseline.
+    await adoptOrMigrate(knex);
 
     if (process.env.HOMEGLOW_DISABLE_BACKGROUND_JOBS !== '1') {
       startNightlyCronJob(); // Start the nightly chore pruning job
