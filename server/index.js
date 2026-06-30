@@ -9,7 +9,7 @@ const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
 const { adoptOrMigrate } = require('./db/migrate');
-const { Setting, AdminPin, Prize } = require('./db/models');
+const { Setting, AdminPin, Prize, User } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -1902,8 +1902,8 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
 fastify.get('/api/users/:id/clams', async (request, reply) => {
   const { id } = request.params;
   try {
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    return { user_id: parseInt(id), clam_total: result.total };
+    const total = await getUserClamTotal(id);
+    return { user_id: parseInt(id), clam_total: total };
   } catch (error) {
     console.error('Error getting user clams:', error);
     reply.status(500).send({ error: 'Failed to get user clams' });
@@ -1919,10 +1919,16 @@ fastify.post('/api/users/:id/clams/add', async (request, reply) => {
     }
 
     const useDate = date || getTodayLocalDateString();
-    db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title) VALUES (?, NULL, ?, ?, ?)').run(id, useDate, amount, 'Adjustment');
+    await knex('chore_history').insert({
+      user_id: id,
+      chore_schedule_id: null,
+      date: useDate,
+      clam_value: amount,
+      title: 'Adjustment',
+    });
 
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    return { success: true, clam_total: result.total };
+    const total = await getUserClamTotal(id);
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error adding clams:', error);
     reply.status(500).send({ error: 'Failed to add clams' });
@@ -1937,28 +1943,31 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
       return reply.status(400).send({ error: 'Valid positive amount is required' });
     }
 
-    const currentResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    if (currentResult.total < amount) {
+    const currentTotal = await getUserClamTotal(id);
+    if (currentTotal < amount) {
       return reply.status(400).send({ error: 'Insufficient clams' });
     }
 
     let remaining = amount;
-    const entries = db.prepare('SELECT * FROM chore_history WHERE user_id = ? AND clam_value > 0 ORDER BY created_at ASC').all(id);
+    const entries = await knex('chore_history')
+      .where('user_id', id)
+      .where('clam_value', '>', 0)
+      .orderBy('created_at', 'asc');
 
     for (const entry of entries) {
       if (remaining <= 0) break;
 
       if (entry.clam_value <= remaining) {
-        db.prepare('DELETE FROM chore_history WHERE id = ?').run(entry.id);
+        await knex('chore_history').where('id', entry.id).del();
         remaining -= entry.clam_value;
       } else {
-        db.prepare('UPDATE chore_history SET clam_value = ? WHERE id = ?').run(entry.clam_value - remaining, entry.id);
+        await knex('chore_history').where('id', entry.id).update({ clam_value: entry.clam_value - remaining });
         remaining = 0;
       }
     }
 
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    return { success: true, clam_total: result.total };
+    const total = await getUserClamTotal(id);
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error reducing clams:', error);
     reply.status(500).send({ error: 'Failed to reduce clams' });
@@ -1967,17 +1976,25 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
 
 
 // User routes (updated to calculate clam_total from history)
+// Clam balances are derived from chore_history (not stored on the user).
+async function getUserClamTotal(userId) {
+  const row = await knex('chore_history').where('user_id', userId).sum({ total: 'clam_value' }).first();
+  return Number(row && row.total != null ? row.total : 0);
+}
+
 fastify.get('/api/users', async (request, reply) => {
   try {
-    const users = db.prepare('SELECT id, username, email, profile_picture FROM users').all();
+    const users = await User.query().select('id', 'username', 'email', 'profile_picture');
 
-    const usersWithClams = users.map(user => {
-      const clamResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(user.id);
-      return {
-        ...user,
-        clam_total: clamResult.total
-      };
-    });
+    const usersWithClams = await Promise.all(
+      users.map(async (user) => ({
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        profile_picture: user.profile_picture,
+        clam_total: await getUserClamTotal(user.id),
+      }))
+    );
 
     return usersWithClams;
   } catch (error) {
@@ -1989,9 +2006,8 @@ fastify.get('/api/users', async (request, reply) => {
 fastify.post('/api/users', async (request, reply) => {
   const { username, email, profile_picture } = request.body;
   try {
-    const stmt = db.prepare('INSERT INTO users (username, email, profile_picture) VALUES (?, ?, ?)');
-    const info = stmt.run(username, email, profile_picture);
-    return { id: info.lastInsertRowid };
+    const inserted = await User.query().insert({ username, email, profile_picture });
+    return { id: inserted.id };
   } catch (error) {
     console.error('Error adding user:', error);
     reply.status(500).send({ error: 'Failed to add user' });
@@ -2003,9 +2019,8 @@ fastify.patch('/api/users/:id', async (request, reply) => {
   const { id } = request.params;
   const { username, email, profile_picture } = request.body;
   try {
-    const stmt = db.prepare('UPDATE users SET username = ?, email = ?, profile_picture = ? WHERE id = ?');
-    const info = stmt.run(username, email, profile_picture, id);
-    if (info.changes === 0) {
+    const updated = await User.query().patch({ username, email, profile_picture }).where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'User not found' });
     }
     return { success: true, message: 'User updated successfully' };
@@ -2053,12 +2068,9 @@ fastify.post('/api/users/:id/upload-picture', async (request, reply) => {
     console.log('File saved successfully');
 
     // Update user record
-    const stmt = db.prepare('UPDATE users SET profile_picture = ? WHERE id = ?');
-    const info = stmt.run(filename, id);
+    const updated = await User.query().findById(id).patch({ profile_picture: filename });
 
-    console.log('Database update:', info);
-
-    if (info.changes === 0) {
+    if (updated === 0) {
       // Clean up uploaded file if user doesn't exist
       await fs.unlink(filepath);
       console.log('User not found, file deleted');
@@ -2082,11 +2094,8 @@ fastify.post('/api/users/:id/upload-picture', async (request, reply) => {
 fastify.delete('/api/users/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    // Optional: Delete associated chores first if desired, or set user_id to NULL
-    // db.prepare('DELETE FROM chores WHERE user_id = ?').run(id);\
-    const stmt = db.prepare('DELETE FROM users WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await User.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'User not found' });
     }
     return { success: true, message: 'User deleted successfully' };
