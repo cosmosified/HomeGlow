@@ -19,8 +19,8 @@ function sourceDir(sourceId) {
     return dir;
 }
 
-async function pickerFetch(db, accountId, method, pathAndQuery, body) {
-    const accessToken = await googleConnection.getValidAccessToken(db, accountId);
+async function pickerFetch(accountId, method, pathAndQuery, body) {
+    const accessToken = await googleConnection.getValidAccessToken(accountId);
     const url = pathAndQuery.startsWith('http') ? pathAndQuery : `${API_BASE}${pathAndQuery}`;
     const init = {
         method,
@@ -50,36 +50,36 @@ async function pickerFetch(db, accountId, method, pathAndQuery, body) {
     return parsed || {};
 }
 
-async function createSession(db, accountId) {
-    return await pickerFetch(db, accountId, 'POST', '/sessions', {});
+async function createSession(accountId) {
+    return await pickerFetch(accountId, 'POST', '/sessions', {});
 }
 
-async function getSession(db, accountId, sessionId) {
-    return await pickerFetch(db, accountId, 'GET', `/sessions/${encodeURIComponent(sessionId)}`);
+async function getSession(accountId, sessionId) {
+    return await pickerFetch(accountId, 'GET', `/sessions/${encodeURIComponent(sessionId)}`);
 }
 
-async function deleteSession(db, accountId, sessionId) {
-    return await pickerFetch(db, accountId, 'DELETE', `/sessions/${encodeURIComponent(sessionId)}`);
+async function deleteSession(accountId, sessionId) {
+    return await pickerFetch(accountId, 'DELETE', `/sessions/${encodeURIComponent(sessionId)}`);
 }
 
-async function listPickedMediaItems(db, accountId, sessionId) {
+async function listPickedMediaItems(accountId, sessionId) {
     const items = [];
     let pageToken;
     do {
         const params = new URLSearchParams({ sessionId, pageSize: '100' });
         if (pageToken) params.set('pageToken', pageToken);
-        const data = await pickerFetch(db, accountId, 'GET', `/mediaItems?${params.toString()}`);
+        const data = await pickerFetch(accountId, 'GET', `/mediaItems?${params.toString()}`);
         if (Array.isArray(data.mediaItems)) items.push(...data.mediaItems);
         pageToken = data.nextPageToken;
     } while (pageToken);
     return items;
 }
 
-async function downloadMedia(db, accountId, sourceId, pickedItem) {
+async function downloadMedia(accountId, sourceId, pickedItem) {
     const mediaFile = pickedItem.mediaFile || {};
     if (!mediaFile.baseUrl) throw new Error('Picked media missing baseUrl');
 
-    const accessToken = await googleConnection.getValidAccessToken(db, accountId);
+    const accessToken = await googleConnection.getValidAccessToken(accountId);
     const fullUrl = `${mediaFile.baseUrl}=d`;
     const res = await fetch(fullUrl, {
         headers: { Authorization: `Bearer ${accessToken}` },

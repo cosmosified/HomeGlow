@@ -19,4 +19,6 @@ module.exports = {
     HomeglowPhoto: require('./HomeglowPhoto'),
     Device: require('./Device'),
     Tab: require('./Tab'),
+    GoogleAccount: require('./GoogleAccount'),
+    GoogleOauthState: require('./GoogleOauthState'),
 };

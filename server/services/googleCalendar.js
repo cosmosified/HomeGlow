@@ -2,8 +2,8 @@ const googleConnection = require('./googleConnection');
 
 const API_BASE = 'https://www.googleapis.com/calendar/v3';
 
-async function googleFetch(db, accountId, method, pathAndQuery, body) {
-    const accessToken = await googleConnection.getValidAccessToken(db, accountId);
+async function googleFetch(accountId, method, pathAndQuery, body) {
+    const accessToken = await googleConnection.getValidAccessToken(accountId);
     const url = pathAndQuery.startsWith('http') ? pathAndQuery : `${API_BASE}${pathAndQuery}`;
     const init = {
         method,
@@ -33,12 +33,12 @@ async function googleFetch(db, accountId, method, pathAndQuery, body) {
     return parsed;
 }
 
-async function listCalendars(db, accountId) {
+async function listCalendars(accountId) {
     const items = [];
     let pageToken;
     do {
         const qs = pageToken ? `?pageToken=${encodeURIComponent(pageToken)}` : '';
-        const data = await googleFetch(db, accountId, 'GET', `/users/me/calendarList${qs}`);
+        const data = await googleFetch(accountId, 'GET', `/users/me/calendarList${qs}`);
         if (data && Array.isArray(data.items)) items.push(...data.items);
         pageToken = data && data.nextPageToken;
     } while (pageToken);
@@ -66,7 +66,7 @@ function parseEventDate(dt) {
     return null;
 }
 
-async function listEvents(db, accountId, calendarId, { timeMin, timeMax } = {}) {
+async function listEvents(accountId, calendarId, { timeMin, timeMax } = {}) {
     const out = [];
     let pageToken;
     const base = `/calendars/${encodeURIComponent(calendarId)}/events`;
@@ -79,7 +79,7 @@ async function listEvents(db, accountId, calendarId, { timeMin, timeMax } = {}) 
         if (timeMin) params.set('timeMin', new Date(timeMin).toISOString());
         if (timeMax) params.set('timeMax', new Date(timeMax).toISOString());
         if (pageToken) params.set('pageToken', pageToken);
-        const data = await googleFetch(db, accountId, 'GET', `${base}?${params.toString()}`);
+        const data = await googleFetch(accountId, 'GET', `${base}?${params.toString()}`);
         if (data && Array.isArray(data.items)) out.push(...data.items);
         pageToken = data && data.nextPageToken;
     } while (pageToken);
@@ -106,15 +106,14 @@ function eventToBody({ title, description, location, start, end, allDay, timeZon
     return body;
 }
 
-async function createEvent(db, accountId, calendarId, event) {
+async function createEvent(accountId, calendarId, event) {
     const body = eventToBody(event);
-    return await googleFetch(db, accountId, 'POST', `/calendars/${encodeURIComponent(calendarId)}/events`, body);
+    return await googleFetch(accountId, 'POST', `/calendars/${encodeURIComponent(calendarId)}/events`, body);
 }
 
-async function updateEvent(db, accountId, calendarId, eventId, event) {
+async function updateEvent(accountId, calendarId, eventId, event) {
     const body = eventToBody(event);
     return await googleFetch(
-        db,
         accountId,
         'PATCH',
         `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
@@ -122,9 +121,8 @@ async function updateEvent(db, accountId, calendarId, eventId, event) {
     );
 }
 
-async function deleteEvent(db, accountId, calendarId, eventId) {
+async function deleteEvent(accountId, calendarId, eventId) {
     return await googleFetch(
-        db,
         accountId,
         'DELETE',
         `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
