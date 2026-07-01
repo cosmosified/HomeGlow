@@ -7,7 +7,11 @@
     "start": "node index.js",
     "test": "node tests/runServerTests.js",
     "test-debug": "node tests/runServerTests.js --debug",
-    "test:coverage": "c8 --reporter=text-summary --reporter=html --reporter=lcov node tests/runServerTests.js"
+    "test:coverage": "c8 --reporter=text-summary --reporter=html --reporter=lcov node tests/runServerTests.js",
+    "migrate": "knex migrate:latest --knexfile knexfile.js",
+    "migrate:make": "knex migrate:make --knexfile knexfile.js",
+    "migrate:rollback": "knex migrate:rollback --knexfile knexfile.js",
+    "migrate:status": "knex migrate:status --knexfile knexfile.js"
   },
   "devDependencies": {
     "c8": "^11.0.0"

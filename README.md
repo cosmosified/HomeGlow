@@ -126,7 +126,25 @@ DISCLAIMER: This project uses AI in its development process. While you are right
 
 **Backup**: Copy `./homeglow/data/` (SQLite database) and `./homeglow/uploads/` (photos)
 
-**Database**: SQLite with tables for users, chores, calendars, settings, prizes, and menus
+**Database**: SQLite (via the Objection.js ORM on Knex) with tables for users, chores,
+calendars, settings, prizes, and menus. Override the DB file location with `DB_PATH`.
+
+**Migrations**: Schema changes are Knex migrations in `server/db/migrations/` tracked
+in the `knex_migrations` ledger. The app applies pending migrations automatically on
+startup. Existing installs are *baseline-adopted*: a database already at the current
+schema is stamped as up-to-date without re-running DDL, and older databases are lifted
+to the baseline first, so upgrades are non-destructive. Developer commands (run in
+`server/`):
+
+```bash
+npm run migrate            # apply pending migrations (knex migrate:latest)
+npm run migrate:make <name> # scaffold a new migration
+npm run migrate:status     # list applied/pending migrations
+npm run migrate:rollback   # roll back the last batch
+```
+
+> A `DB_ENGINE=postgres` (`DATABASE_URL`) path is wired for the future but is not yet
+> shipped or validated — SQLite is the only supported engine today.
 
 ## 🛠️ Troubleshooting
 
