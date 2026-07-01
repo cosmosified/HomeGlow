@@ -746,12 +746,17 @@ console.log('Database path:', dbPath);
 let db; // Declare db variable outside to hold the single instance
 let knex; // Knex/Objection instance, wired alongside the legacy `db` during the ORM migration
 
+// === BEGIN LEGACY SCHEMA UPGRADE (Option A: retained ONLY to lift pre-v14 SQLite
+// databases up to the v14 baseline before Knex adopts them; not used at runtime.
+// Raw better-sqlite3 usage is permitted ONLY within this delimited block. The
+// grep-guard test (tests/db/noRawDb.test.js) enforces that no raw db.prepare/
+// db.exec/db.transaction/new Database usage exists OUTSIDE these markers.) ===
 async function ConnectOrCreateDb() {
   try {
     await fs.mkdir(path.dirname(dbPath), { recursive: true });
     await fs.chmod(path.dirname(dbPath), 0o777);
 
-    const newDb = new Database(dbPath, { verbose: console.log });
+    const newDb = new Database(dbPath);
     newDb.pragma('foreign_keys = ON');
     return newDb;
   } catch (error) {
@@ -810,6 +815,7 @@ async function applySchemaMigrations(currentSchemaId) {
     runSchemaMigrationModule(migration);
   }
 }
+// === END LEGACY SCHEMA UPGRADE ===
 
 async function dailyBackgroundProcessing() {
   try {
@@ -818,23 +824,18 @@ async function dailyBackgroundProcessing() {
     const today = getTodayLocalDateString();
 
     // We want to delete schedules that are completed and will never run again to avoid clutter
-    const schedulesToPrune = db.prepare(`
-      SELECT cs.id, cs.chore_id, cs.user_id, c.title
-      FROM chore_schedules cs
-      JOIN chores c ON cs.chore_id = c.id
-      WHERE cs.crontab IS NULL
-        AND cs.visible = 1
-        AND EXISTS (
-          SELECT 1 FROM chore_history ch
-          WHERE ch.chore_schedule_id = cs.id
-        )
-    `).all();
+    const schedulesToPrune = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.id', 'cs.chore_id', 'cs.user_id', 'c.title')
+      .whereNull('cs.crontab')
+      .where('cs.visible', 1)
+      .whereRaw('EXISTS (SELECT 1 FROM chore_history ch WHERE ch.chore_schedule_id = cs.id)');
     console.log(`Found ${schedulesToPrune.length} completed one-time chores to prune`);
 
     let prunedScheduleCount = 0;
     for (const schedule of schedulesToPrune) {
 
-      db.prepare('DELETE FROM chore_schedules WHERE id = ?').run(schedule.id);
+      await knex('chore_schedules').where('id', schedule.id).del();
       console.log(`Pruned schedule ID ${schedule.id}: "${schedule.title}" (user_id: ${schedule.user_id})`);
       prunedScheduleCount++;
     }
@@ -845,20 +846,14 @@ async function dailyBackgroundProcessing() {
     }
 
     // We should also delete chores that have no schedules to avoid clutter
-    const choresToPrune = db.prepare(`
-      SELECT c.id, c.title
-      FROM chores c
-      WHERE NOT EXISTS (
-          SELECT 1
-          FROM chore_schedules cs
-          WHERE cs.chore_id = c.id
-      );
-    `).all();
+    const choresToPrune = await knex('chores as c')
+      .select('c.id', 'c.title')
+      .whereRaw('NOT EXISTS (SELECT 1 FROM chore_schedules cs WHERE cs.chore_id = c.id)');
     console.log(`Found ${choresToPrune.length} orphaned chores to prune`);
 
     let prunedChoreCount = 0;
     for (const chore of choresToPrune) {
-      db.prepare('DELETE FROM chores WHERE id = ?').run(chore.id);
+      await knex('chores').where('id', chore.id).del();
       console.log(`Pruned chore ID ${chore.id}: "${chore.title}"`);
       prunedChoreCount++;
     }
@@ -869,21 +864,17 @@ async function dailyBackgroundProcessing() {
     }
 
     // bonus chores that persist from day to day should reset to unassigned
-    const choresToReset = db.prepare(`
-      SELECT cs.id,
-        cs.user_id,
-        c.title
-      FROM chore_schedules cs
-      JOIN chores c ON cs.chore_id = c.id
-      WHERE cs.crontab IS NULL
-        AND cs.visible = 1
-        AND cs.user_id IS NOT NULL
-        AND c.clam_value > 0;
-    `).all();
+    const choresToReset = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.id', 'cs.user_id', 'c.title')
+      .whereNull('cs.crontab')
+      .where('cs.visible', 1)
+      .whereNotNull('cs.user_id')
+      .where('c.clam_value', '>', 0);
     console.log(`Found ${choresToReset.length} bonus chores to reset`);
     let resetScheduleCount = 0;
     for (const schedule of choresToReset) {
-      db.prepare('UPDATE chore_schedules set user_id = NULL WHERE id = ?').run(schedule.id);
+      await knex('chore_schedules').where('id', schedule.id).update({ user_id: null });
       console.log(`Reset schedule ID ${schedule.id}: "${schedule.title}" (user_id: ${schedule.user_id})`);
       resetScheduleCount++;
     }
@@ -895,13 +886,12 @@ async function dailyBackgroundProcessing() {
 
 
     // Handle sticky schedules: create one-time children for until-completed and once-completed parents that trigger today.
-    const stickyParentSchedules = db.prepare(`
-      SELECT cs.id, cs.chore_id, cs.user_id, cs.crontab, cs.duration, cs.interval
-      FROM chore_schedules cs
-      WHERE cs.crontab IS NOT NULL
-        AND cs.duration IN ('until-completed', 'once-completed')
-        AND cs.visible = 1
-        AND NOT EXISTS (
+    const stickyParentSchedules = await knex('chore_schedules as cs')
+      .select('cs.id', 'cs.chore_id', 'cs.user_id', 'cs.crontab', 'cs.duration', 'cs.interval')
+      .whereNotNull('cs.crontab')
+      .whereIn('cs.duration', ['until-completed', 'once-completed'])
+      .where('cs.visible', 1)
+      .whereRaw(`NOT EXISTS (
           SELECT 1 FROM chore_schedules child
           WHERE child.crontab IS NULL
             AND child.visible = 1
@@ -916,8 +906,7 @@ async function dailyBackgroundProcessing() {
                 )
               )
             )
-        )
-    `).all();
+        )`);
     console.log(`Found ${stickyParentSchedules.length} sticky schedules to check`);
 
     const startOfToday = new Date();
@@ -940,11 +929,15 @@ async function dailyBackgroundProcessing() {
       }
 
       if (today === next) {
-        const scheduleResult = db.prepare(`
-          INSERT INTO chore_schedules (chore_id, user_id, crontab, duration, visible, parent_schedule_id)
-          VALUES (?, ?, NULL, 'day-of', 1, ?)
-          RETURNING *
-        `).get(schedule.chore_id, schedule.user_id, schedule.id);
+        const insertedSticky = await ChoreSchedule.query().insert({
+          chore_id: schedule.chore_id,
+          user_id: schedule.user_id,
+          crontab: null,
+          duration: 'day-of',
+          visible: 1,
+          parent_schedule_id: schedule.id,
+        });
+        const scheduleResult = await ChoreSchedule.query().findById(insertedSticky.id);
 
         triggeredSchedules.push(scheduleResult);
         stickySchedulesCreated++;
@@ -2650,13 +2643,11 @@ fastify.post('/api/test-api-key', async (request, reply) => {
   console.log('API key length:', apiKey ? apiKey.length : 'null/undefined');
 
   try {
-    // Test direct database insertion
-    const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const result = stmt.run('WEATHER_API_KEY', apiKey);
-    console.log('Direct insert result:', result);
+    // Test insertion via the ORM
+    await Setting.query().insert({ key: 'WEATHER_API_KEY', value: apiKey }).onConflict('key').merge();
 
     // Verify it was saved
-    const verification = db.prepare('SELECT key, value FROM settings WHERE key = ?').get('WEATHER_API_KEY');
+    const verification = await Setting.query().findById('WEATHER_API_KEY');
     console.log('Verification result:', verification);
 
     return {
@@ -2688,7 +2679,7 @@ fastify.get('/api/proxy', async (request, reply) => {
   let whitelist = [];
   try {
     // Fetch whitelist from DB. It should be a comma-separated string of hostnames.
-    const whitelistSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('PROXY_WHITELIST');
+    const whitelistSetting = await Setting.query().select('value').findById('PROXY_WHITELIST');
     if (whitelistSetting && whitelistSetting.value) {
       whitelist = whitelistSetting.value.split(',').map(domain => domain.trim());
     }
