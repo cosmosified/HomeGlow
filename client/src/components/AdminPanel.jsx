@@ -36,7 +36,6 @@ import {
   TableHead,
   TableRow,
   Paper,
-  Backdrop,
   RadioGroup,
   Radio,
   Autocomplete,
@@ -58,11 +57,14 @@ import {
   Timer,
   Lock,
   Nightlight,
+  BeachAccess,
   Tab as TabIcon,
   DragIndicator,
   PhotoLibrary,
   Info,
-  OpenInNew
+  OpenInNew,
+  ArrowUpward,
+  ArrowDownward
 } from '@mui/icons-material';
 import ColorPickerPopover from './ColorPickerPopover';
 import axios from 'axios';
@@ -72,92 +74,48 @@ import PinModal from './PinModal';
 import ChoreSchedulesTab from './ChoreSchedulesTab';
 import ChoreHistoryTab from './ChoreHistoryTab';
 import TabIconModal from './TabIconModal';
+import DeleteConfirmationDialog from './DeleteConfirmationDialog';
+import AdminFormSection from './AdminFormSection';
+import VersionInfoCard from './VersionInfoCard';
+import LoadingBackdrop from './LoadingBackdrop';
+import RefreshIntervalSelect from './RefreshIntervalSelect';
+import ScreensaverIntervalSlider from './ScreensaverIntervalSlider';
 import GoogleAccountConnection from './GoogleAccountConnection';
+import ClamValueModal from './ClamValueModal';
+import SoundPicker from './SoundPicker';
+import useFetchTabs from '../hooks/useFetchTabs.js';
+import useIsMobile from '../hooks/useIsMobile.js';
+import { syncWidgetAssignments } from '../utils/assignmentSync.js';
+import { normalizeWidgetSettings as normalizeSharedWidgetSettings } from '../utils/widgetSettings.js';
+import { stackableTableSx } from '../utils/responsiveTable.js';
+import {
+  INTERFACE_COLORS_STORAGE_KEY,
+  SCREENSAVER_SETTINGS_STORAGE_KEY,
+  AUTO_DARK_MODE_SETTINGS_STORAGE_KEY,
+  VACATION_MODE_STORAGE_KEY,
+  DEFAULT_INTERFACE_COLORS,
+  normalizeInterfaceColors,
+  normalizeScreensaverSettings,
+  normalizeVacationModeSettings,
+  readLocalInterfaceColors,
+  readLocalScreensaverSettings,
+  readLocalAutoDarkModeSettings,
+  readLocalVacationModeSettings,
+} from '../utils/interfaceSettings.js';
+import { useTranslation } from 'react-i18next';
+import { changeLanguage, SUPPORTED_LANGUAGES } from '../i18n/index.js';
 
 const USERS_UPDATED_EVENT = 'homeglow:users-updated';
 const DEVICE_SETTINGS_UPDATED_EVENT = 'homeglow:device-settings-updated';
 const INTERFACE_SETTINGS_UPDATED_EVENT = 'homeglow:interface-settings-updated';
-const INTERFACE_COLORS_STORAGE_KEY = 'interfaceColors';
-const INTERFACE_SCREENSAVER_STORAGE_KEY = 'screensaverSettings';
-const INTERFACE_AUTO_DARK_MODE_STORAGE_KEY = 'autoDarkModeSettings';
-const DEFAULT_AUTO_DARK_MODE_SETTINGS = {
-  enabled: false,
-  locationQuery: '',
-  lat: null,
-  lon: null,
-  resolvedName: '',
-};
-
 const DEFAULT_WIDGET_SETTINGS = {
-  chores: { enabled: false, transparent: false, refreshInterval: 0 },
-  calendar: { enabled: false, transparent: false, refreshInterval: 0 },
-  photos: { enabled: false, transparent: false, refreshInterval: 0 },
-  weather: { enabled: false, transparent: false, refreshInterval: 0 },
+  chores: { enabled: false, refreshInterval: 0 },
+  calendar: { enabled: false, refreshInterval: 0 },
+  photos: { enabled: false, refreshInterval: 0 },
+  weather: { enabled: false, refreshInterval: 0 },
 };
 
-const DEFAULT_INTERFACE_COLORS = {
-  primary: '#f5f5f5',
-  secondary: '#38bdf8',
-  accent: '#f472b6',
-};
-
-const DEFAULT_SCREENSAVER_SETTINGS = {
-  enabled: false,
-  mode: 'tabs',
-  timeout: 5,
-  slideshowInterval: 10
-};
-
-const normalizeWidgetSettings = (raw) => ({
-  ...DEFAULT_WIDGET_SETTINGS,
-  chores: { ...DEFAULT_WIDGET_SETTINGS.chores, ...(raw?.chores || {}) },
-  calendar: { ...DEFAULT_WIDGET_SETTINGS.calendar, ...(raw?.calendar || {}) },
-  photos: { ...DEFAULT_WIDGET_SETTINGS.photos, ...(raw?.photos || {}) },
-  weather: { ...DEFAULT_WIDGET_SETTINGS.weather, ...(raw?.weather || {}) },
-});
-
-const normalizeScreensaverSettings = (raw) => ({
-  ...DEFAULT_SCREENSAVER_SETTINGS,
-  ...(raw && typeof raw === 'object' ? raw : {}),
-});
-
-const normalizeInterfaceColors = (raw) => ({
-  ...DEFAULT_INTERFACE_COLORS,
-  ...(raw && typeof raw === 'object' ? raw : {}),
-});
-
-const readLocalInterfaceColors = () => {
-  try {
-    const raw = localStorage.getItem(INTERFACE_COLORS_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_INTERFACE_COLORS };
-    return normalizeInterfaceColors(JSON.parse(raw));
-  } catch {
-    return { ...DEFAULT_INTERFACE_COLORS };
-  }
-};
-
-const readLocalScreensaverSettings = () => {
-  try {
-    const raw = localStorage.getItem(INTERFACE_SCREENSAVER_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_SCREENSAVER_SETTINGS };
-    return normalizeScreensaverSettings(JSON.parse(raw));
-  } catch {
-    return { ...DEFAULT_SCREENSAVER_SETTINGS };
-  }
-};
-
-const readLocalAutoDarkModeSettings = () => {
-  try {
-    const raw = localStorage.getItem(INTERFACE_AUTO_DARK_MODE_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_AUTO_DARK_MODE_SETTINGS };
-    return {
-      ...DEFAULT_AUTO_DARK_MODE_SETTINGS,
-      ...JSON.parse(raw),
-    };
-  } catch {
-    return { ...DEFAULT_AUTO_DARK_MODE_SETTINGS };
-  }
-};
+const normalizeWidgetSettings = (raw) => normalizeSharedWidgetSettings(raw, DEFAULT_WIDGET_SETTINGS);
 
 const DEFAULT_HOMEGLOW_REPOSITORY = 'jherforth/HomeGlow';
 const FRONTEND_VERSION = (import.meta.env.VITE_APP_VERSION || 'dev').trim();
@@ -199,9 +157,10 @@ const buildTagUrl = (repository, tagName) => {
   return `https://github.com/${repository}/releases/tag/${encodeURIComponent(tagName)}`;
 };
 
-const toShortCommit = (commitSha) => (commitSha ? commitSha.slice(0, 7) : 'Unknown');
 
 const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
+  const { t, i18n } = useTranslation(['admin', 'common']);
+  const isMobile = useIsMobile();
   const [currentDeviceName, setCurrentDeviceName] = useState(() => getDeviceName());
   const API_DEVICE_URL = getDeviceApiBase(API_BASE_URL);
   const CORE_WIDGET_DEFAULT_SIZES = {
@@ -214,10 +173,25 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   const [choresSubTab, setChoresSubTab] = useState(0);
   const [widgetsSubTab, setWidgetsSubTab] = useState(0);
   const [settings, setSettings] = useState({
+    // Write-only: the server redacts this from GET /api/settings, so the field
+    // starts blank and an empty save leaves the stored key untouched.
     WEATHER_API_KEY: '',
+    WEATHER_PROVIDER: 'openweathermap',
     PROXY_WHITELIST: '',
-    daily_completion_clam_reward: '2'
+    daily_completion_clam_reward: '2',
+    CHORE_CELEBRATION_ENABLED: 'true',
+    CHORE_SOUND_ENABLED: 'false',
+    CHORE_SOUND_DEFAULT: '',
+    CHORE_SOUND_VOLUME: '100'
   });
+  // Home Assistant connection (issue #57). Like the Google client secret, the
+  // token is never sent back to the browser — only whether one is stored.
+  const [weatherProviderStatus, setWeatherProviderStatus] = useState(null);
+  const [homeAssistantStatus, setHomeAssistantStatus] = useState(null);
+  const [homeAssistantDraft, setHomeAssistantDraft] = useState({ url: '', token: '', weather_entity: '' });
+  const [homeAssistantEntities, setHomeAssistantEntities] = useState([]);
+  const [homeAssistantTestResult, setHomeAssistantTestResult] = useState(null);
+  const [isTestingHomeAssistant, setIsTestingHomeAssistant] = useState(false);
   const [widgetSettings, setLocalWidgetSettings] = useState({
     ...DEFAULT_WIDGET_SETTINGS
   });
@@ -226,9 +200,15 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   const [chores, setChores] = useState([]);
   const [prizes, setPrizes] = useState([]);
   const [editingUser, setEditingUser] = useState(null);
+  const [clamModalUser, setClamModalUser] = useState(null);
   const [editingPrize, setEditingPrize] = useState(null);
   const [newUser, setNewUser] = useState({ username: '', email: '', profile_picture: '' });
-  const [newPrize, setNewPrize] = useState({ name: '', clam_cost: 0 });
+  // Default avatar bank (issue #132): picker targets an existing user row, or
+  // the add-user form when userId is null.
+  const [defaultAvatars, setDefaultAvatars] = useState([]);
+  const [avatarPicker, setAvatarPicker] = useState({ open: false, userId: null });
+  const [newPrize, setNewPrize] = useState({ name: '', clam_cost: 0, repeatable: false });
+  const [prizeOffers, setPrizeOffers] = useState([]);
   const [uploadedWidgets, setUploadedWidgets] = useState([]);
   const [githubWidgets, setGithubWidgets] = useState([]);
   const [loadingGithub, setLoadingGithub] = useState(false);
@@ -241,12 +221,21 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   const [pinModal, setPinModal] = useState({ open: false, mode: 'verify', title: '' });
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [checkingPin, setCheckingPin] = useState(true);
-  const [tabs, setTabs] = useState([]);
+  const { tabs, fetchTabs } = useFetchTabs(API_DEVICE_URL);
   const [widgetAssignments, setWidgetAssignments] = useState({});
   const [pluginSettings, setPluginSettings] = useState({});
   const [pluginAssignments, setPluginAssignments] = useState({});
+  // Values for settings a plugin declared in its manifest (issue #105 Phase 2),
+  // keyed by pluginId. Saved via /api/plugin/v1/settings, not the device blob.
+  const [pluginDeclaredValues, setPluginDeclaredValues] = useState({});
+  // Which declared-setting keys the user actually edited. Only dirty keys are
+  // PUT on save, so untouched manifest defaults are never materialized into
+  // stored values (a stored default would pin the household against future
+  // manifest default changes).
+  const [pluginDeclaredDirty, setPluginDeclaredDirty] = useState({});
   const [photoSources, setPhotoSources] = useState([]);
   const [screensaverSettings, setScreensaverSettings] = useState(readLocalScreensaverSettings);
+  const [vacationModeSettings, setVacationModeSettings] = useState(readLocalVacationModeSettings);
   const [autoDarkModeSettings, setAutoDarkModeSettings] = useState(readLocalAutoDarkModeSettings);
   const [isSavingAutoDarkMode, setIsSavingAutoDarkMode] = useState(false);
   const [autoDarkModeSunTimes, setAutoDarkModeSunTimes] = useState({
@@ -264,6 +253,19 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   });
   const [deleteTabDialog, setDeleteTabDialog] = useState({ open: false, tab: null });
   const [draggingTabNumber, setDraggingTabNumber] = useState(null);
+  // User display order (issue #134): drag on desktop, arrows everywhere.
+  const [draggingUserId, setDraggingUserId] = useState(null);
+  const handleLanguageChange = async (code) => {
+    try {
+      await changeLanguage(code);
+      setSaveMessage({ show: true, type: 'success', text: t('admin:language.saved') });
+    } catch (error) {
+      console.error('Error switching language:', error);
+      setSaveMessage({ show: true, type: 'error', text: t('admin:language.switchFailed') });
+    }
+    setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+  };
+
   const [devices, setDevices] = useState([]);
   const [copyDeviceDialog, setCopyDeviceDialog] = useState({ open: false, device: null });
   const [deleteDeviceDialog, setDeleteDeviceDialog] = useState({ open: false, device: null });
@@ -282,15 +284,15 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
   // Refresh interval options in milliseconds
   const refreshIntervalOptions = [
-    { label: 'Disabled', value: 0 },
-    { label: '5 minutes', value: 5 * 60 * 1000 },
-    { label: '15 minutes', value: 15 * 60 * 1000 },
-    { label: '30 minutes', value: 30 * 60 * 1000 },
-    { label: '1 hour', value: 60 * 60 * 1000 },
-    { label: '2 hours', value: 2 * 60 * 60 * 1000 },
-    { label: '6 hours', value: 6 * 60 * 60 * 1000 },
-    { label: '12 hours', value: 12 * 60 * 60 * 1000 },
-    { label: '24 hours', value: 24 * 60 * 60 * 1000 }
+    { label: t('admin:refresh.disabled'), value: 0 },
+    { label: t('admin:refresh.min5'), value: 5 * 60 * 1000 },
+    { label: t('admin:refresh.min15'), value: 15 * 60 * 1000 },
+    { label: t('admin:refresh.min30'), value: 30 * 60 * 1000 },
+    { label: t('admin:refresh.hour1'), value: 60 * 60 * 1000 },
+    { label: t('admin:refresh.hour2'), value: 2 * 60 * 60 * 1000 },
+    { label: t('admin:refresh.hour6'), value: 6 * 60 * 60 * 1000 },
+    { label: t('admin:refresh.hour12'), value: 12 * 60 * 60 * 1000 },
+    { label: t('admin:refresh.hour24'), value: 24 * 60 * 60 * 1000 }
   ];
 
   useEffect(() => {
@@ -301,12 +303,15 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     if (isAuthenticated) {
       setInterfaceColors(readLocalInterfaceColors());
       setScreensaverSettings(readLocalScreensaverSettings());
+      setVacationModeSettings(readLocalVacationModeSettings());
       setAutoDarkModeSettings(readLocalAutoDarkModeSettings());
       fetchSettings();
+      fetchWeatherConnectionStatus();
       fetchDeviceSettings();
       fetchUsers();
       fetchChores();
       fetchPrizes();
+      fetchDefaultAvatars();
       fetchUploadedWidgets();
       fetchTabs();
       fetchWidgetAssignments();
@@ -353,7 +358,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       setPinExists(response.data.exists);
 
       if (response.data.exists) {
-        setPinModal({ open: true, mode: 'verify', title: 'Enter Admin PIN' });
+        setPinModal({ open: true, mode: 'verify', title: t('admin:pin.enter') });
       } else {
         setIsAuthenticated(true);
       }
@@ -425,26 +430,68 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       console.error('Error fetching prizes:', error);
       setPrizes([]);
     }
+    try {
+      const offersResponse = await axios.get(`${API_BASE_URL}/api/prize-offers`);
+      setPrizeOffers(Array.isArray(offersResponse.data) ? offersResponse.data : []);
+    } catch (error) {
+      console.error('Error fetching prize offers:', error);
+      setPrizeOffers([]);
+    }
+  };
+
+  // Prize store: place a ledger prize in the store as a one-time redeemable
+  // offer (kids request it on the kiosk; a parent approves there).
+  const addPrizeToStore = async (prizeId) => {
+    try {
+      await axios.post(`${API_BASE_URL}/api/prize-offers`, { prize_id: prizeId });
+      await fetchPrizes();
+    } catch (error) {
+      console.error('Error adding prize to store:', error);
+      alert(t('admin:messages.prizeAddToStoreFailed'));
+    }
+  };
+
+  const removePrizeOffer = async (offerId) => {
+    try {
+      await axios.delete(`${API_BASE_URL}/api/prize-offers/${offerId}`);
+      await fetchPrizes();
+    } catch (error) {
+      console.error('Error removing prize offer:', error);
+      alert(t('admin:messages.prizeRemoveOfferFailed'));
+    }
   };
 
   const fetchUploadedWidgets = async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/api/widgets`);
-      setUploadedWidgets(Array.isArray(response.data) ? response.data : []);
+      const widgets = Array.isArray(response.data) ? response.data : [];
+      setUploadedWidgets(widgets);
+      await fetchPluginDeclaredValues(widgets);
     } catch (error) {
       console.error('Error fetching uploaded widgets:', error);
       setUploadedWidgets([]);
     }
   };
 
-  const fetchTabs = async () => {
-    try {
-      const response = await axios.get(`${API_DEVICE_URL}/tabs`);
-      setTabs(Array.isArray(response.data) ? response.data : []);
-    } catch (error) {
-      console.error('Error fetching tabs:', error);
-      setTabs([]);
-    }
+  // Load effective values for each manifest plugin's declared settings.
+  const fetchPluginDeclaredValues = async (widgets) => {
+    const manifestPlugins = (widgets || []).filter(
+      (widget) => widget.pluginId && Array.isArray(widget.manifest?.settings) && widget.manifest.settings.length > 0
+    );
+    const entries = await Promise.all(manifestPlugins.map(async (widget) => {
+      try {
+        const response = await axios.get(
+          `${API_BASE_URL}/api/plugin/v1/settings/${widget.pluginId}?device=${encodeURIComponent(currentDeviceName)}`
+        );
+        return [widget.pluginId, response.data && typeof response.data === 'object' ? response.data : {}];
+      } catch (error) {
+        console.error(`Error fetching settings for plugin ${widget.pluginId}:`, error);
+        return [widget.pluginId, {}];
+      }
+    }));
+    setPluginDeclaredValues(Object.fromEntries(entries));
+    // Freshly loaded server values are clean by definition.
+    setPluginDeclaredDirty({});
   };
 
   const fetchWidgetAssignments = async () => {
@@ -553,34 +600,138 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       await axios.post(`${API_BASE_URL}/api/settings`, { key, value });
       setSettings(prev => ({ ...prev, [key]: value }));
       if (showMessage) {
-        setSaveMessage({ show: true, type: 'success', text: 'Setting saved successfully!' });
+        setSaveMessage({ show: true, type: 'success', text: t('admin:messages.settingSaved') });
         setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
       }
     } catch (error) {
       console.error(`Error saving ${key}:`, error);
       if (showMessage) {
-        setSaveMessage({ show: true, type: 'error', text: 'Failed to save setting. Please try again.' });
+        setSaveMessage({ show: true, type: 'error', text: t('admin:messages.settingSaveFailed') });
         setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
       }
       throw error;
     }
   };
 
+  // The celebration fires at exactly the moment the daily reward is earned, so
+  // the two save together rather than needing their own button (issue #140).
   const saveDailyClamReward = async () => {
     setIsLoading(true);
     try {
-      await axios.post(`${API_BASE_URL}/api/settings`, {
-        key: 'daily_completion_clam_reward',
-        value: settings.daily_completion_clam_reward || '2',
-      });
-      setSaveMessage({ show: true, type: 'success', text: 'Daily completion clam reward saved.' });
+      await Promise.all([
+        axios.post(`${API_BASE_URL}/api/settings`, {
+          key: 'daily_completion_clam_reward',
+          value: settings.daily_completion_clam_reward || '2',
+        }),
+        axios.post(`${API_BASE_URL}/api/settings`, {
+          key: 'CHORE_CELEBRATION_ENABLED',
+          value: settings.CHORE_CELEBRATION_ENABLED === false || settings.CHORE_CELEBRATION_ENABLED === 'false'
+            ? 'false'
+            : 'true',
+        }),
+      ]);
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.clamRewardSaved') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error saving clam reward:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save clam reward. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.clamRewardFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const saveChoreSoundSettings = async () => {
+    setIsLoading(true);
+    try {
+      await Promise.all([
+        axios.post(`${API_BASE_URL}/api/settings`, { key: 'CHORE_SOUND_ENABLED', value: settings.CHORE_SOUND_ENABLED || 'false' }),
+        axios.post(`${API_BASE_URL}/api/settings`, { key: 'CHORE_SOUND_DEFAULT', value: settings.CHORE_SOUND_DEFAULT || '' }),
+        axios.post(`${API_BASE_URL}/api/settings`, { key: 'CHORE_SOUND_VOLUME', value: String(settings.CHORE_SOUND_VOLUME ?? '100') }),
+      ]);
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.choreSoundsSaved') });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+    } catch (error) {
+      console.error('Error saving chore sound settings:', error);
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.choreSoundsFailed') });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchWeatherConnectionStatus = async () => {
+    try {
+      const [provider, ha] = await Promise.all([
+        axios.get(`${API_BASE_URL}/api/connections/weather/status`),
+        axios.get(`${API_BASE_URL}/api/connections/homeassistant/status`),
+      ]);
+      setWeatherProviderStatus(provider.data);
+      setHomeAssistantStatus(ha.data);
+      setHomeAssistantDraft((prev) => ({
+        ...prev,
+        url: ha.data?.url || '',
+        weather_entity: ha.data?.weather_entity || '',
+      }));
+      // Bind to the stored setting, not the effective provider: in demo mode
+      // the effective one is "demo", which is not a selectable option.
+      setSettings((prev) => ({
+        ...prev,
+        WEATHER_PROVIDER: provider.data?.configured_provider || 'openweathermap',
+      }));
+    } catch (error) {
+      console.error('Error fetching weather connection status:', error);
+    }
+  };
+
+  const saveHomeAssistantConnection = async () => {
+    setIsLoading(true);
+    try {
+      const response = await axios.put(`${API_BASE_URL}/api/connections/homeassistant`, {
+        url: homeAssistantDraft.url,
+        // An empty token means "keep the stored one" — the field is blank on
+        // load because the server never sends the token back.
+        ...(homeAssistantDraft.token ? { token: homeAssistantDraft.token } : {}),
+        weather_entity: homeAssistantDraft.weather_entity,
+      });
+      setHomeAssistantStatus(response.data?.status || null);
+      setHomeAssistantDraft((prev) => ({ ...prev, token: '' }));
+      await fetchWeatherConnectionStatus();
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.homeAssistantSaved') });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+    } catch (error) {
+      console.error('Error saving Home Assistant connection:', error);
+      const text = error?.response?.data?.error || t('admin:messages.homeAssistantFailed');
+      setSaveMessage({ show: true, type: 'error', text });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 4000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const testHomeAssistantConnection = async () => {
+    setIsTestingHomeAssistant(true);
+    setHomeAssistantTestResult(null);
+    try {
+      const response = await axios.post(`${API_BASE_URL}/api/connections/homeassistant/test`);
+      setHomeAssistantTestResult(response.data);
+
+      // A working connection is the moment to offer the entity picker.
+      if (response.data?.ok) {
+        try {
+          const entities = await axios.get(`${API_BASE_URL}/api/connections/homeassistant/weather-entities`);
+          setHomeAssistantEntities(entities.data?.entities || []);
+        } catch {
+          setHomeAssistantEntities([]);
+        }
+      }
+    } catch (error) {
+      setHomeAssistantTestResult({
+        ok: false,
+        message: error?.response?.data?.error || t('admin:messages.homeAssistantFailed'),
+      });
+    } finally {
+      setIsTestingHomeAssistant(false);
     }
   };
 
@@ -589,13 +740,17 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     try {
       await Promise.all([
         axios.post(`${API_BASE_URL}/api/settings`, { key: 'WEATHER_API_KEY', value: settings.WEATHER_API_KEY || '' }),
+        axios.post(`${API_BASE_URL}/api/settings`, { key: 'WEATHER_PROVIDER', value: settings.WEATHER_PROVIDER || 'openweathermap' }),
         axios.post(`${API_BASE_URL}/api/settings`, { key: 'PROXY_WHITELIST', value: settings.PROXY_WHITELIST || '' })
       ]);
-      setSaveMessage({ show: true, type: 'success', text: 'All settings saved successfully!' });
+      // Clear the write-only field and re-read what the server now holds.
+      setSettings((prev) => ({ ...prev, WEATHER_API_KEY: '' }));
+      await fetchWeatherConnectionStatus();
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.allSettingsSaved') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error saving API settings:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save some settings. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.someSettingsFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -637,7 +792,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   const saveWidgetSettings = async () => {
     const missingEnabledWidgets = getMissingEnabledCoreWidgetAssignments(widgetSettings, widgetAssignments);
     if (missingEnabledWidgets.length > 0) {
-      setSaveMessage({ show: true, type: 'error', text: 'Each enabled widget must have at least one tab selected.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.widgetNeedsTab') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 4000);
       return;
     }
@@ -652,34 +807,17 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       const currentResponse = await axios.get(`${API_DEVICE_URL}/widget-assignments`);
       const currentAssignments = Array.isArray(currentResponse.data) ? currentResponse.data : [];
 
-      for (const [widgetName, desiredTabNumbers] of Object.entries(widgetAssignments)) {
-        const existing = currentAssignments.filter(a => a.widget_name === widgetName);
-        const existingTabNumbers = existing.map(a => a.tab_number);
-
-        const toRemove = existing.filter(a => !desiredTabNumbers.includes(a.tab_number));
-        const toAdd = desiredTabNumbers.filter(number => !existingTabNumbers.includes(number));
-
-        for (const assignment of toRemove) {
-          await axios.delete(`${API_DEVICE_URL}/widget-assignments/${assignment.id}`);
-        }
-
-        for (const tabNumber of toAdd) {
-          await axios.post(`${API_DEVICE_URL}/widget-assignments`, {
-            widget_name: widgetName,
-            tabNumber: tabNumber,
-          });
-        }
-      }
+      await syncWidgetAssignments(API_DEVICE_URL, widgetAssignments, currentAssignments);
 
       if (onTabsChanged) {
         await onTabsChanged();
       }
 
-      setSaveMessage({ show: true, type: 'success', text: 'Widget settings saved successfully.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.widgetSettingsSaved') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error saving widget settings:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save widget settings. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.widgetSettingsFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -689,7 +827,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   const savePluginSettings = async () => {
     const missingEnabledPlugins = getMissingEnabledPluginAssignments(pluginSettings, pluginAssignments, uploadedWidgets);
     if (missingEnabledPlugins.length > 0) {
-      setSaveMessage({ show: true, type: 'error', text: 'Each enabled plugin must have at least one tab selected.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.pluginNeedsTab') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 4000);
       return;
     }
@@ -698,38 +836,64 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     try {
       await patchDeviceSettings({ pluginSettings });
 
+      // Save declared (manifest) settings through the plugin platform API so
+      // household-scoped values are shared across displays. Only keys the
+      // user actually edited are written, failures are collected instead of
+      // aborting the rest of the save, and the server's specific validation
+      // message is surfaced.
+      const manifestPlugins = uploadedWidgets.filter(
+        (widget) => widget.pluginId && Array.isArray(widget.manifest?.settings) && widget.manifest.settings.length > 0
+      );
+      const declaredSettingsErrors = [];
+      await Promise.all(manifestPlugins.map(async (widget) => {
+        const dirtyKeys = pluginDeclaredDirty[widget.pluginId] || {};
+        const declaredByKey = new Map(widget.manifest.settings.map((setting) => [setting.key, setting]));
+        const values = Object.fromEntries(
+          Object.entries(pluginDeclaredValues[widget.pluginId] || {}).filter(([key, value]) => {
+            if (!dirtyKeys[key]) return false;
+            if (value === null || value === undefined) return false;
+            // A cleared number/select field means "no change"; an empty
+            // string is a legitimate value for string settings.
+            if (value === '' && declaredByKey.get(key)?.type !== 'string') return false;
+            return true;
+          })
+        );
+        if (Object.keys(values).length === 0) return;
+        try {
+          await axios.put(
+            `${API_BASE_URL}/api/plugin/v1/settings/${widget.pluginId}?device=${encodeURIComponent(currentDeviceName)}`,
+            values
+          );
+        } catch (error) {
+          declaredSettingsErrors.push(`${widget.name}: ${error.response?.data?.error || error.message}`);
+        }
+      }));
+
       const currentResponse = await axios.get(`${API_DEVICE_URL}/widget-assignments`);
       const currentAssignments = Array.isArray(currentResponse.data) ? currentResponse.data : [];
 
-      for (const [pluginWidgetName, desiredTabNumbers] of Object.entries(pluginAssignments)) {
-        const existing = currentAssignments.filter(a => a.widget_name === pluginWidgetName);
-        const existingTabNumbers = existing.map(a => a.tab_number);
-
-        const toRemove = existing.filter(a => !desiredTabNumbers.includes(a.tab_number));
-        const toAdd = desiredTabNumbers.filter(number => !existingTabNumbers.includes(number));
-
-        for (const assignment of toRemove) {
-          await axios.delete(`${API_DEVICE_URL}/widget-assignments/${assignment.id}`);
-        }
-
-        for (const tabNumber of toAdd) {
-          await axios.post(`${API_DEVICE_URL}/widget-assignments`, {
-            widget_name: pluginWidgetName,
-            tabNumber: tabNumber,
-          });
-        }
-      }
+      await syncWidgetAssignments(API_DEVICE_URL, pluginAssignments, currentAssignments);
 
       if (onTabsChanged) {
         await onTabsChanged();
       }
 
       if (onPluginsChanged) onPluginsChanged();
-      setSaveMessage({ show: true, type: 'success', text: 'Plugin settings saved successfully.' });
-      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+      if (declaredSettingsErrors.length > 0) {
+        setSaveMessage({
+          show: true,
+          type: 'error',
+          text: t('admin:messages.pluginOptionsRejected', { errors: declaredSettingsErrors.join('; ') }),
+        });
+        setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 6000);
+      } else {
+        setPluginDeclaredDirty({});
+        setSaveMessage({ show: true, type: 'success', text: t('admin:messages.pluginSettingsSaved') });
+        setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+      }
     } catch (error) {
       console.error('Error saving plugin settings:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save plugin settings. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.pluginSettingsFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -772,7 +936,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   const saveTabDefinition = async (tabData) => {
     const trimmedLabel = (tabData.label || '').trim();
     if (!trimmedLabel) {
-      setSaveMessage({ show: true, type: 'error', text: 'Tab label is required.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.tabLabelRequired') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
       return;
     }
@@ -798,11 +962,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       if (onTabsChanged) {
         await onTabsChanged();
       }
-      setSaveMessage({ show: true, type: 'success', text: `Tab ${tabIconModalState.mode === 'edit' ? 'updated' : 'created'} successfully.` });
+      setSaveMessage({ show: true, type: 'success', text: tabIconModalState.mode === 'edit' ? t('admin:messages.tabUpdated') : t('admin:messages.tabCreated') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error saving tab:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save tab. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.tabSaveFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -827,11 +991,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       if (onTabsChanged) {
         await onTabsChanged();
       }
-      setSaveMessage({ show: true, type: 'success', text: 'Tab deleted successfully.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.tabDeleted') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error deleting tab:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to delete tab. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.tabDeleteFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -849,7 +1013,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       }
     } catch (error) {
       console.error('Error reordering tabs:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to reorder tabs. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.tabReorderFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -870,15 +1034,87 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         await onTabsChanged();
       }
 
-      setSaveMessage({ show: true, type: 'success', text: 'Tab label visibility updated.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.tabLabelVisibilityUpdated') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error updating tab label visibility:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to update tab label visibility.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.tabLabelVisibilityFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // --- User display order (issue #134) ---
+  // The bonus pseudo-user (id 0) is pinned and never reorderable, mirroring
+  // how the Home tab is excluded from tab dragging.
+  const reorderableUsers = users.filter((user) => user.id !== 0);
+
+  const saveUserOrder = async (orderedUserIds) => {
+    try {
+      setIsLoading(true);
+      await axios.patch(`${API_BASE_URL}/api/users/reorder`, { orderedUserIds });
+      await fetchUsers();
+      // The dashboard renders users in API order, so it needs to refetch too.
+      window.dispatchEvent(new Event(USERS_UPDATED_EVENT));
+    } catch (error) {
+      console.error('Error reordering users:', error);
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.userReorderFailed') });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Touch-friendly alternative to dragging: HTML5 drag events never fire on
+  // phones or the wall tablet, so the arrows are the primary control there.
+  const moveUser = async (userId, delta) => {
+    const ids = reorderableUsers.map((user) => user.id);
+    const from = ids.indexOf(userId);
+    const to = from + delta;
+    if (from === -1 || to < 0 || to >= ids.length) return;
+    const next = [...ids];
+    [next[from], next[to]] = [next[to], next[from]];
+    await saveUserOrder(next);
+  };
+
+  const handleUserDragStart = (userId) => {
+    setDraggingUserId(userId);
+  };
+
+  const handleUserDrop = async (targetUserId) => {
+    if (draggingUserId == null || draggingUserId === targetUserId) {
+      setDraggingUserId(null);
+      return;
+    }
+    const ids = reorderableUsers.map((user) => user.id);
+    const fromIndex = ids.indexOf(draggingUserId);
+    const toIndex = ids.indexOf(targetUserId);
+    setDraggingUserId(null);
+    if (fromIndex === -1 || toIndex === -1) return;
+
+    const next = [...ids];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
+    await saveUserOrder(next);
+  };
+
+  // Tabs are ordered by their number; tab 1 (Home) is fixed, so only the rest
+  // participate. Same touch caveat as the user list — see moveTab below.
+  const draggableTabsInOrder = () => tabs
+    .filter((tab) => tab.number !== 1)
+    .sort((a, b) => a.number - b.number);
+
+  // Touch-friendly counterpart to dragging: HTML5 drag events never fire on
+  // phones or the wall tablet, where this table is a stack of cards.
+  const moveTab = async (tabNumber, delta) => {
+    const numbers = draggableTabsInOrder().map((tab) => tab.number);
+    const from = numbers.indexOf(tabNumber);
+    const to = from + delta;
+    if (from === -1 || to < 0 || to >= numbers.length) return;
+    const next = [...numbers];
+    [next[from], next[to]] = [next[to], next[from]];
+    await saveTabOrder(next);
   };
 
   const handleTabDragStart = (tabNumber) => {
@@ -891,9 +1127,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       return;
     }
 
-    const draggableTabs = tabs
-      .filter(tab => tab.number !== 1)
-      .sort((a, b) => a.number - b.number);
+    const draggableTabs = draggableTabsInOrder();
 
     const fromIndex = draggableTabs.findIndex(tab => tab.number === draggingTabNumber);
     const toIndex = draggableTabs.findIndex(tab => tab.number === targetTabNumber);
@@ -934,11 +1168,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         await onTabsChanged();
       }
 
-      setSaveMessage({ show: true, type: 'success', text: 'Device tabs and widget settings copied successfully.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.deviceCopied') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error copying device settings:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to copy device settings. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.deviceCopyFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -980,7 +1214,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       setCurrentDeviceName(nextName);
       setRenameDeviceDialog({ open: false, currentName: '', newName: '', error: '' });
       await fetchDevices();
-      setSaveMessage({ show: true, type: 'success', text: 'Device Name updated. Reloading to apply changes.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.deviceRenamed') });
       setTimeout(() => {
         window.location.reload();
       }, 400);
@@ -1000,7 +1234,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     }
 
     if (deviceName === currentDeviceName) {
-      setSaveMessage({ show: true, type: 'error', text: 'You cannot delete the current device.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.cannotDeleteCurrentDevice') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
       setDeleteDeviceDialog({ open: false, device: null });
       return;
@@ -1011,11 +1245,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       await axios.delete(`${API_BASE_URL}/api/devices/${encodeURIComponent(deviceName)}`);
       setDeleteDeviceDialog({ open: false, device: null });
       await fetchDevices();
-      setSaveMessage({ show: true, type: 'success', text: 'Device deleted successfully.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.deviceDeleted') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error deleting device:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to delete device. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.deviceDeleteFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -1032,11 +1266,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       applyAccentColors();
       window.dispatchEvent(new Event(INTERFACE_SETTINGS_UPDATED_EVENT));
 
-      setSaveMessage({ show: true, type: 'success', text: 'Accent colors saved for this display.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.colorsSaved') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error saving accent colors:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save accent colors. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.colorsFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -1058,7 +1292,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
   const resetToDefaults = () => {
     setInterfaceColors({ ...DEFAULT_INTERFACE_COLORS });
-    setSaveMessage({ show: true, type: 'info', text: 'Reset to default colors. Click Save to apply.' });
+    setSaveMessage({ show: true, type: 'info', text: t('admin:messages.colorsReset') });
     setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
   };
 
@@ -1066,72 +1300,63 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     try {
       setIsLoading(true);
       const normalizedScreensaver = normalizeScreensaverSettings(screensaverSettings);
-      localStorage.setItem(INTERFACE_SCREENSAVER_STORAGE_KEY, JSON.stringify(normalizedScreensaver));
+      localStorage.setItem(SCREENSAVER_SETTINGS_STORAGE_KEY, JSON.stringify(normalizedScreensaver));
       window.dispatchEvent(new Event(INTERFACE_SETTINGS_UPDATED_EVENT));
-      setSaveMessage({ show: true, type: 'success', text: 'Screensaver settings saved for this display.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.screensaverSaved') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } catch (error) {
       console.error('Error saving screensaver settings:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to save screensaver settings. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.screensaverFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
     }
   };
 
+  const saveVacationModeSettings = async () => {
+    try {
+      setIsLoading(true);
+      const normalizedVacationMode = normalizeVacationModeSettings(vacationModeSettings);
+      localStorage.setItem(VACATION_MODE_STORAGE_KEY, JSON.stringify(normalizedVacationMode));
+      window.dispatchEvent(new Event(INTERFACE_SETTINGS_UPDATED_EVENT));
+      // Household-wide vacation state (issues #121/#72): the server pauses
+      // missed-chore logging while active, and the metrics plugin bridges
+      // streaks across vacation days. Display behavior (chime mute,
+      // screensaver) stays per-display via localStorage above.
+      try {
+        await axios.post(`${API_BASE_URL}/api/settings`, {
+          key: 'vacation_mode',
+          value: JSON.stringify(normalizedVacationMode),
+        });
+      } catch (serverError) {
+        console.warn('Vacation mode saved for this display, but the household setting could not be updated:', serverError);
+      }
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.vacationSaved') });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+    } catch (error) {
+      console.error('Error saving vacation mode settings:', error);
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.vacationFailed') });
+      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Geocoding runs on the server, which holds the API key. Passing no query
+  // asks the server for the provider's own location, which is how a Home
+  // Assistant household gets coordinates without an OpenWeatherMap key at all.
   const resolveAutoDarkModeLocation = async (locationQuery) => {
-    const apiKey = settings.WEATHER_API_KEY?.trim();
-    if (!apiKey) {
-      throw new Error('Please save an OpenWeather API key in the Connections tab first.');
+    const normalized = (locationQuery || '').trim();
+    const response = await axios.get(`${API_BASE_URL}/api/weather/geocode`, {
+      params: normalized ? { q: normalized } : {},
+    });
+
+    const { lat, lon, resolvedName } = response.data || {};
+    if (typeof lat !== 'number' || typeof lon !== 'number') {
+      throw new Error('Location not found. Try a city, city/state, city/country, or ZIP code.');
     }
 
-    const normalized = locationQuery.trim();
-    const directCandidates = [normalized];
-    if (!normalized.includes(',') && /[a-zA-Z]/.test(normalized)) {
-      directCandidates.push(`${normalized},US`);
-    }
-
-    for (const candidate of directCandidates) {
-      const response = await axios.get('https://api.openweathermap.org/geo/1.0/direct', {
-        params: {
-          q: candidate,
-          limit: 1,
-          appid: apiKey,
-        },
-      });
-
-      const first = Array.isArray(response.data) ? response.data[0] : null;
-      if (first && typeof first.lat === 'number' && typeof first.lon === 'number') {
-        const nameParts = [first.name, first.state, first.country].filter(Boolean);
-        return {
-          lat: first.lat,
-          lon: first.lon,
-          resolvedName: nameParts.join(', '),
-        };
-      }
-    }
-
-    const zipPattern = /^[0-9]{3,10}(,[a-zA-Z]{2})?$/;
-    if (zipPattern.test(normalized)) {
-      const zipValue = normalized.includes(',') ? normalized : `${normalized},US`;
-      const response = await axios.get('https://api.openweathermap.org/geo/1.0/zip', {
-        params: {
-          zip: zipValue,
-          appid: apiKey,
-        },
-      });
-
-      if (typeof response?.data?.lat === 'number' && typeof response?.data?.lon === 'number') {
-        const nameParts = [response.data.name, response.data.country].filter(Boolean);
-        return {
-          lat: response.data.lat,
-          lon: response.data.lon,
-          resolvedName: nameParts.join(', '),
-        };
-      }
-    }
-
-    throw new Error('Location not found. Try a city, city/state, city/country, or ZIP code.');
+    return { lat, lon, resolvedName: resolvedName || normalized };
   };
 
   const saveAutoDarkModeSettings = async () => {
@@ -1142,21 +1367,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         ...autoDarkModeSettings,
         locationQuery: trimmedLocation,
       };
-      localStorage.setItem(INTERFACE_AUTO_DARK_MODE_STORAGE_KEY, JSON.stringify(nextSettings));
+      localStorage.setItem(AUTO_DARK_MODE_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
       window.dispatchEvent(new Event(INTERFACE_SETTINGS_UPDATED_EVENT));
       setAutoDarkModeSettings(nextSettings);
-      setSaveMessage({ show: true, type: 'success', text: 'Auto dark mode disabled for this display.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.autoDarkDisabled') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
-      return;
-    }
-
-    if (!settings.WEATHER_API_KEY?.trim()) {
-      setSaveMessage({
-        show: true,
-        type: 'error',
-        text: 'Add and save your OpenWeather API key in Connections before enabling auto dark mode.',
-      });
-      setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3500);
       return;
     }
 
@@ -1164,7 +1379,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       setSaveMessage({
         show: true,
         type: 'error',
-        text: 'Enter a location before enabling auto dark mode.',
+        text: t('admin:messages.autoDarkNeedsLocation'),
       });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
       return;
@@ -1182,13 +1397,13 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         resolvedName: resolved.resolvedName,
       };
 
-      localStorage.setItem(INTERFACE_AUTO_DARK_MODE_STORAGE_KEY, JSON.stringify(nextSettings));
+      localStorage.setItem(AUTO_DARK_MODE_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
       window.dispatchEvent(new Event(INTERFACE_SETTINGS_UPDATED_EVENT));
       setAutoDarkModeSettings(nextSettings);
       setSaveMessage({
         show: true,
         type: 'success',
-        text: 'Auto dark mode saved for this display. Use the bottom-bar theme button until the half sun/half moon icon appears.',
+        text: t('admin:messages.autoDarkSaved'),
       });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 4500);
     } catch (error) {
@@ -1203,9 +1418,9 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
   useEffect(() => {
     const hasCoordinates = typeof autoDarkModeSettings.lat === 'number' && typeof autoDarkModeSettings.lon === 'number';
-    const apiKey = settings.WEATHER_API_KEY?.trim();
 
-    if (!autoDarkModeSettings.resolvedName || !hasCoordinates || !apiKey) {
+    // No API key needed any more — the server computes these from coordinates.
+    if (!autoDarkModeSettings.resolvedName || !hasCoordinates) {
       setAutoDarkModeSunTimes({ sunrise: null, sunset: null, timezoneOffset: 0 });
       setAutoDarkModeSunTimesError('');
       setAutoDarkModeSunTimesLoading(false);
@@ -1218,34 +1433,31 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       setAutoDarkModeSunTimesError('');
 
       try {
-        const response = await axios.get('https://api.openweathermap.org/data/2.5/weather', {
+        const response = await axios.get(`${API_BASE_URL}/api/sun`, {
           params: {
             lat: autoDarkModeSettings.lat,
             lon: autoDarkModeSettings.lon,
-            appid: apiKey,
           },
         });
 
-        const sunrise = response?.data?.sys?.sunrise;
-        const sunset = response?.data?.sys?.sunset;
-        const timezoneOffset = response?.data?.timezone;
+        const { sunrise, sunset, alwaysUp, alwaysDown } = response?.data || {};
 
         if (typeof sunrise !== 'number' || typeof sunset !== 'number') {
-          throw new Error('Sunrise and sunset are unavailable for this location.');
+          throw new Error(alwaysUp || alwaysDown
+            ? 'The sun does not rise or set at this location today.'
+            : 'Sunrise and sunset are unavailable for this location.');
         }
 
         if (!isCancelled) {
-          setAutoDarkModeSunTimes({
-            sunrise,
-            sunset,
-            timezoneOffset: typeof timezoneOffset === 'number' ? timezoneOffset : 0,
-          });
+          // The times come back as unix seconds; the preview renders them in
+          // the browser's own zone, which is the display the user is looking at.
+          setAutoDarkModeSunTimes({ sunrise, sunset, timezoneOffset: 0 });
         }
       } catch (error) {
         if (!isCancelled) {
           console.error('Error fetching auto dark mode sunrise/sunset:', error);
           setAutoDarkModeSunTimes({ sunrise: null, sunset: null, timezoneOffset: 0 });
-          setAutoDarkModeSunTimesError('Unable to load today\'s sunrise and sunset.');
+          setAutoDarkModeSunTimesError(error.message || 'Unable to load today\'s sunrise and sunset.');
         }
       } finally {
         if (!isCancelled) {
@@ -1259,7 +1471,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     return () => {
       isCancelled = true;
     };
-  }, [autoDarkModeSettings.resolvedName, autoDarkModeSettings.lat, autoDarkModeSettings.lon, settings.WEATHER_API_KEY]);
+  }, [autoDarkModeSettings.resolvedName, autoDarkModeSettings.lat, autoDarkModeSettings.lon]);
 
   const formatAutoDarkModeLocationTime = (unixSeconds, timezoneOffsetSeconds = 0) => {
     if (typeof unixSeconds !== 'number') {
@@ -1349,7 +1561,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       setDeleteUserDialog({ open: false, user: null });
     } catch (error) {
       console.error('Error deleting user:', error);
-      alert('Failed to delete user. Please try again.');
+      alert(t('admin:messages.userDeleteFailed'));
     } finally {
       setIsLoading(false);
     }
@@ -1379,14 +1591,21 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     }
   };
 
+  const handleClamSave = async (newTotal) => {
+    if (!clamModalUser) return;
+    await updateUserClams(clamModalUser.id, newTotal);
+    setClamModalUser(null);
+  };
+
   const savePrize = async () => {
     try {
       setIsLoading(true);
       if (editingPrize) {
-        await axios.patch(`${API_BASE_URL}/api/prizes/${editingPrize.id}`, editingPrize);
+        // repeatable is stored as 0/1; the API expects a boolean.
+        await axios.patch(`${API_BASE_URL}/api/prizes/${editingPrize.id}`, { ...editingPrize, repeatable: !!editingPrize.repeatable });
       } else {
-        await axios.post(`${API_BASE_URL}/api/prizes`, newPrize);
-        setNewPrize({ name: '', clam_cost: 0 });
+        await axios.post(`${API_BASE_URL}/api/prizes`, { ...newPrize, repeatable: !!newPrize.repeatable });
+        setNewPrize({ name: '', clam_cost: 0, repeatable: false });
       }
       setEditingPrize(null);
       fetchPrizes();
@@ -1398,7 +1617,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   };
 
   const deletePrize = async (prizeId) => {
-    if (window.confirm('Are you sure you want to delete this prize?')) {
+    if (window.confirm(t('admin:confirm.deletePrize'))) {
       try {
         setIsLoading(true);
         await axios.delete(`${API_BASE_URL}/api/prizes/${prizeId}`);
@@ -1427,17 +1646,24 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       if (onPluginsChanged) onPluginsChanged();
     } catch (error) {
       console.error('Error uploading widget:', error);
-      alert('Failed to upload widget. Please try again.');
+      alert(t('admin:messages.widgetUploadFailed'));
     } finally {
       setIsLoading(false);
     }
   };
 
   const deleteWidget = async (filename) => {
-    if (window.confirm('Are you sure you want to delete this widget?')) {
+    if (window.confirm(t('admin:confirm.deleteWidget'))) {
+      // Platform plugins own server-side storage/settings. Keeping them lets a
+      // reinstall of the SAME plugin resume; purging prevents a different
+      // plugin that claims the same id from inheriting the data.
+      const widgetEntry = uploadedWidgets.find((widget) => widget.filename === filename);
+      const purgeData = Boolean(widgetEntry?.pluginId) && window.confirm(
+        t('admin:confirm.purgePluginData')
+      );
       try {
         setIsLoading(true);
-        await axios.delete(`${API_BASE_URL}/api/widgets/${filename}`);
+        await axios.delete(`${API_BASE_URL}/api/widgets/${filename}${purgeData ? '?purgeData=true' : ''}`);
         const pluginWidgetName = `plugin:${filename}`;
         await axios.delete(`${API_DEVICE_URL}/widget-assignments/widget/${encodeURIComponent(pluginWidgetName)}`).catch(() => { });
         let nextPluginSettings = {};
@@ -1473,10 +1699,10 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       });
       fetchUploadedWidgets();
       if (onPluginsChanged) onPluginsChanged();
-      alert(`Widget "${widget.name}" installed successfully!`);
+      alert(t('admin:messages.widgetInstalled', { name: widget.name }));
     } catch (error) {
       console.error('Error installing GitHub widget:', error);
-      alert('Failed to install widget. Please try again.');
+      alert(t('admin:messages.widgetInstallFailed'));
     } finally {
       setIsLoading(false);
     }
@@ -1492,7 +1718,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   };
 
   const deleteChore = async (scheduleId) => {
-    if (window.confirm('Are you sure you want to remove this chore schedule?')) {
+    if (window.confirm(t('admin:confirm.deleteSchedule'))) {
       try {
         setIsLoading(true);
         await axios.delete(`${API_BASE_URL}/api/chore-schedules/${scheduleId}`);
@@ -1505,7 +1731,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         }
       } catch (error) {
         console.error('Error deleting chore schedule:', error);
-        alert('Failed to delete chore schedule. Please try again.');
+        alert(t('admin:messages.scheduleDeleteFailed'));
       } finally {
         setIsLoading(false);
       }
@@ -1526,7 +1752,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
     try {
       setIsLoading(true);
-      console.log(`Uploading picture for user ${userId}...`);
+      console.log(t('admin:messages.uploadingPicture'));
 
       const response = await axios.post(
         `${API_BASE_URL}/api/users/${userId}/upload-picture`,
@@ -1541,10 +1767,37 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
     } catch (error) {
       console.error('Error uploading profile picture:', error);
       console.error('Error details:', error.response?.data);
-      alert('Failed to upload profile picture. Please try again.');
+      alert(t('admin:messages.pictureUploadFailed'));
     } finally {
       setIsLoading(false);
       event.target.value = '';
+    }
+  };
+
+  const fetchDefaultAvatars = async () => {
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/avatars/defaults`);
+      setDefaultAvatars(Array.isArray(response.data) ? response.data : []);
+    } catch (error) {
+      console.error('Error fetching default avatars:', error);
+      setDefaultAvatars([]);
+    }
+  };
+
+  const chooseDefaultAvatar = async (filename) => {
+    if (avatarPicker.userId === null) {
+      // Add-user form: carried in the create payload.
+      setNewUser((prev) => ({ ...prev, profile_picture: filename }));
+      setAvatarPicker({ open: false, userId: null });
+      return;
+    }
+    try {
+      await axios.post(`${API_BASE_URL}/api/users/${avatarPicker.userId}/avatar`, { filename });
+      setAvatarPicker({ open: false, userId: null });
+      await fetchUsers();
+    } catch (error) {
+      console.error('Error setting default avatar:', error);
+      alert(error?.response?.data?.error || 'Failed to set the avatar.');
     }
   };
 
@@ -1598,7 +1851,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         setPinExists(true);
         setIsAuthenticated(true);
         setPinModal({ open: false, mode: 'verify', title: '' });
-        setSaveMessage({ show: true, type: 'success', text: 'Admin PIN set successfully!' });
+        setSaveMessage({ show: true, type: 'success', text: t('admin:messages.pinSet') });
         setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
       } else {
         const response = await axios.post(`${API_BASE_URL}/api/admin-pin/verify`, { pin });
@@ -1625,22 +1878,22 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
   };
 
   const handleUpdatePin = () => {
-    setPinModal({ open: true, mode: 'set', title: 'Update Admin PIN' });
+    setPinModal({ open: true, mode: 'set', title: t('admin:pin.update') });
   };
 
   const handleClearPin = async () => {
-    if (!window.confirm('Are you sure you want to remove the admin PIN? Anyone will be able to access the admin panel without a PIN.')) {
+    if (!window.confirm(t('admin:confirm.removePin'))) {
       return;
     }
     try {
       setIsLoading(true);
       await axios.delete(`${API_BASE_URL}/api/admin-pin`);
       setPinExists(false);
-      setSaveMessage({ show: true, type: 'success', text: 'Admin PIN removed. Admin panel is now unprotected.' });
+      setSaveMessage({ show: true, type: 'success', text: t('admin:messages.pinRemoved') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 4000);
     } catch (error) {
       console.error('Error clearing PIN:', error);
-      setSaveMessage({ show: true, type: 'error', text: 'Failed to remove PIN. Please try again.' });
+      setSaveMessage({ show: true, type: 'error', text: t('admin:messages.pinRemoveFailed') });
       setTimeout(() => setSaveMessage({ show: false, type: '', text: '' }), 3000);
     } finally {
       setIsLoading(false);
@@ -1695,7 +1948,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
   const getRefreshIntervalLabel = (interval) => {
     const option = refreshIntervalOptions.find(opt => opt.value === interval);
-    return option ? option.label : 'Disabled';
+    return option ? option.label : t('admin:refresh.disabled');
   };
 
   const adminTabs = [
@@ -1744,11 +1997,18 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
   return (
     <Box sx={{ width: '100%', maxWidth: 1200, mx: 'auto' }}>
-      <Typography variant="h4" gutterBottom>
+      <Typography variant="h4" gutterBottom sx={{ pr: { xs: 5, sm: 0 } }}>
         ⚙️ Admin Panel
       </Typography>
 
-      <Tabs value={activeTab} onChange={(e, newValue) => setActiveTab(newValue)} sx={{ mb: 3 }}>
+      <Tabs
+        value={activeTab}
+        onChange={(e, newValue) => setActiveTab(newValue)}
+        variant="scrollable"
+        scrollButtons="auto"
+        allowScrollButtonsMobile
+        sx={{ mb: 3 }}
+      >
         {adminTabs.map((tab, index) => (
           <Tab key={tab} label={tab} />
         ))}
@@ -1759,11 +2019,18 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         <Card>
           <CardContent>
             <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 3 }}>
-              <Tabs value={widgetsSubTab} onChange={(_, v) => setWidgetsSubTab(v)} size="small">
-                <Tab label="Widgets" />
-                <Tab label="Plugins" />
-                <Tab label="Tabs" />
-                <Tab label="Devices" />
+              <Tabs
+                value={widgetsSubTab}
+                onChange={(_, v) => setWidgetsSubTab(v)}
+                size="small"
+                variant="scrollable"
+                scrollButtons="auto"
+                allowScrollButtonsMobile
+              >
+                <Tab label={t('admin:subTabs.widgets')} />
+                <Tab label={t('admin:subTabs.plugins')} />
+                <Tab label={t('admin:subTabs.tabs')} />
+                <Tab label={t('admin:subTabs.devices')} />
               </Tabs>
             </Box>
 
@@ -1783,7 +2050,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 }}
               >
                 <Alert severity="info" sx={{ mb: 2 }}>
-                  Enable widgets to show them on the dashboard. Click to select a widget, then drag to move or resize from corners.
+                  {t('admin:widgets.help')}
                 </Alert>
 
                 {Object.entries(widgetSettings).filter(([key]) =>
@@ -1806,41 +2073,17 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               onChange={() => handleWidgetToggle(widget, 'enabled')}
                             />
                           }
-                          label="Enabled"
-                        />
-                        <FormControlLabel
-                          control={
-                            <Switch
-                              checked={config.transparent}
-                              onChange={() => handleWidgetToggle(widget, 'transparent')}
-                            />
-                          }
-                          label="Transparent Background"
-                          sx={{ ml: 2 }}
+                          label={t('common:labels.enabled')}
                         />
                       </Grid>
 
                       <Grid size={{ xs: 12, sm: 6 }}>
-                        <FormControl fullWidth size="small">
-                          <InputLabel id={`${widget}-refresh-label`}>
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                              <Timer fontSize="small" />
-                              Auto-Refresh Interval
-                            </Box>
-                          </InputLabel>
-                          <Select
-                            labelId={`${widget}-refresh-label`}
-                            value={config.refreshInterval || 0}
-                            onChange={(e) => handleRefreshIntervalChange(widget, e.target.value)}
-                            label="Auto-Refresh Interval"
-                          >
-                            {refreshIntervalOptions.map((option) => (
-                              <MenuItem key={option.value} value={option.value}>
-                                {option.label}
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
+                        <RefreshIntervalSelect
+                          labelId={`${widget}-refresh-label`}
+                          value={config.refreshInterval}
+                          onChange={(value) => handleRefreshIntervalChange(widget, value)}
+                          options={refreshIntervalOptions}
+                        />
                       </Grid>
                     </Grid>
 
@@ -1856,10 +2099,10 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                         renderInput={(params) => (
                           <TextField
                             {...params}
-                            label="Show on Tabs"
+                            label={t('admin:widgets.showOnTabs')}
                             required={Boolean(config.enabled)}
                             error={hasRequiredTabsError}
-                            placeholder="Select tabs..."
+                            placeholder={t('admin:widgets.selectTabs')}
                             helperText={
                               hasRequiredTabsError
                                 ? 'Required: select at least one tab when this widget is enabled.'
@@ -1881,7 +2124,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
                 <Box sx={{ mb: 3, p: 2, border: '2px solid var(--accent)', borderRadius: 1, backgroundColor: 'rgba(158, 127, 255, 0.05)' }}>
                   <Typography variant="subtitle1" sx={{ mb: 2, fontWeight: 'bold' }}>
-                    Weather Widget
+                    {t('admin:widgets.weatherWidget')}
                   </Typography>
 
                   <Grid container spacing={2} sx={{ alignItems: 'center' }}>
@@ -1893,41 +2136,17 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                             onChange={() => handleWidgetToggle('weather', 'enabled')}
                           />
                         }
-                        label="Enabled"
-                      />
-                      <FormControlLabel
-                        control={
-                          <Switch
-                            checked={widgetSettings.weather?.transparent || false}
-                            onChange={() => handleWidgetToggle('weather', 'transparent')}
-                          />
-                        }
-                        label="Transparent Background"
-                        sx={{ ml: 2 }}
+                        label={t('common:labels.enabled')}
                       />
                     </Grid>
 
                     <Grid size={{ xs: 12, sm: 6 }}>
-                      <FormControl fullWidth size="small">
-                        <InputLabel id="weather-refresh-label">
-                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <Timer fontSize="small" />
-                            Auto-Refresh Interval
-                          </Box>
-                        </InputLabel>
-                        <Select
-                          labelId="weather-refresh-label"
-                          value={widgetSettings.weather?.refreshInterval || 0}
-                          onChange={(e) => handleRefreshIntervalChange('weather', e.target.value)}
-                          label="Auto-Refresh Interval"
-                        >
-                          {refreshIntervalOptions.map((option) => (
-                            <MenuItem key={option.value} value={option.value}>
-                              {option.label}
-                            </MenuItem>
-                          ))}
-                        </Select>
-                      </FormControl>
+                      <RefreshIntervalSelect
+                        labelId="weather-refresh-label"
+                        value={widgetSettings.weather?.refreshInterval}
+                        onChange={(value) => handleRefreshIntervalChange('weather', value)}
+                        options={refreshIntervalOptions}
+                      />
                     </Grid>
                   </Grid>
 
@@ -1943,10 +2162,10 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                       renderInput={(params) => (
                         <TextField
                           {...params}
-                          label="Show on Tabs"
+                          label={t('admin:widgets.showOnTabs')}
                           required={Boolean(widgetSettings.weather?.enabled)}
                           error={weatherHasRequiredTabsError}
-                          placeholder="Select tabs..."
+                          placeholder={t('admin:widgets.selectTabs')}
                           helperText={
                             weatherHasRequiredTabsError
                               ? 'Required: select at least one tab when this widget is enabled.'
@@ -1965,7 +2184,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 </Box>
 
                 <Button type="submit" variant="contained" sx={{ mt: 2 }} startIcon={<Save />}>
-                  Save Widget Settings
+                  {t('admin:widgets.saveSettings')}
                 </Button>
               </Box>
             )}
@@ -1974,7 +2193,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
               <>
                 <Grid container spacing={3}>
                   <Grid size={{ xs: 12, md: 6 }}>
-                    <Typography variant="subtitle1" gutterBottom>Upload Custom Widget</Typography>
+                    <Typography variant="subtitle1" gutterBottom>{t('admin:widgets.uploadCustom')}</Typography>
                     <Button
                       variant="contained"
                       component="label"
@@ -1982,7 +2201,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                       fullWidth
                       sx={{ mb: 2 }}
                     >
-                      Upload HTML Widget
+                      {t('admin:widgets.uploadHtml')}
                       <input
                         type="file"
                         hidden
@@ -1991,13 +2210,13 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                       />
                     </Button>
 
-                    <Typography variant="subtitle1" gutterBottom>Uploaded Widgets</Typography>
+                    <Typography variant="subtitle1" gutterBottom>{t('admin:widgets.uploaded')}</Typography>
                     <List>
                       {uploadedWidgets.map((widget) => (
                         <ListItem key={widget.filename} sx={{ border: '1px solid var(--card-border)', borderRadius: 1, mb: 1 }}>
                           <ListItemText
                             primary={widget.name}
-                            secondary={`File: ${widget.filename}`}
+                            secondary={t('admin:widgets.fileName', { filename: widget.filename })}
                           />
                           <ListItemSecondaryAction>
                             <IconButton onClick={() => deleteWidget(widget.filename)} color="error">
@@ -2011,15 +2230,36 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
                   <Grid size={{ xs: 12, md: 6 }}>
                     <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                      <Typography variant="subtitle1">GitHub Widget Repository</Typography>
+                      <Typography variant="subtitle1">{t('admin:widgets.githubRepo')}</Typography>
                       <Button
                         onClick={fetchGithubWidgets}
                         startIcon={loadingGithub ? <CircularProgress size={16} /> : <Refresh />}
                         disabled={loadingGithub}
+                        variant="contained"
+                        color="primary"
                       >
-                        Refresh
+                        {t('admin:widgets.refreshAvailable')}
                       </Button>
                     </Box>
+
+                    <Alert severity="info" sx={{ mb: 2 }}>
+                      Browse and contribute plugins at{' '}
+                      <a
+                        href="https://github.com/jherforth/HomeGlowPlugins"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ fontWeight: 'bold' }}
+                      >
+                        github.com/jherforth/HomeGlowPlugins
+                        <OpenInNew sx={{ fontSize: '0.875rem', ml: 0.25, verticalAlign: 'middle' }} />
+                      </a>
+                    </Alert>
+
+                    {githubWidgets.length === 0 && !loadingGithub && (
+                      <Alert severity="info" sx={{ mb: 2 }} icon={<Refresh />}>
+                        {t('admin:widgets.clickThe')} <strong>{t('admin:widgets.refreshAvailable')}</strong> {t('admin:widgets.buttonAboveToLoad')}
+                      </Alert>
+                    )}
 
                     <List sx={{ maxHeight: 400, overflowY: 'auto' }}>
                       {githubWidgets.map((widget) => (
@@ -2035,7 +2275,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               size="small"
                               variant="outlined"
                             >
-                              Install
+                              {t('admin:widgets.install')}
                             </Button>
                           </ListItemSecondaryAction>
                         </ListItem>
@@ -2054,9 +2294,9 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     }}
                   >
                     <Divider sx={{ my: 3 }} />
-                    <Typography variant="h6" gutterBottom>Plugin Settings</Typography>
+                    <Typography variant="h6" gutterBottom>{t('admin:plugins.settings')}</Typography>
                     <Alert severity="info" sx={{ mb: 2 }}>
-                      Configure each installed plugin below. Enable them, set transparency, refresh intervals, and assign to tabs just like core widgets.
+                      {t('admin:plugins.settingsHelp')}
                     </Alert>
 
                     {uploadedWidgets.map((plugin) => {
@@ -2093,7 +2333,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                                     }}
                                   />
                                 }
-                                label="Enabled"
+                                label={t('common:labels.enabled')}
                               />
                               <FormControlLabel
                                 control={
@@ -2107,39 +2347,104 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                                     }}
                                   />
                                 }
-                                label="Transparent Background"
+                                label={t('admin:plugins.transparentBackground')}
                                 sx={{ ml: 2 }}
                               />
                             </Grid>
 
                             <Grid size={{ xs: 12, sm: 6 }}>
-                              <FormControl fullWidth size="small">
-                                <InputLabel id={`plugin-${plugin.filename}-refresh-label`}>
-                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                    <Timer fontSize="small" />
-                                    Auto-Refresh Interval
-                                  </Box>
-                                </InputLabel>
-                                <Select
-                                  labelId={`plugin-${plugin.filename}-refresh-label`}
-                                  value={pSettings.refreshInterval || 0}
-                                  onChange={(e) => {
-                                    setPluginSettings(prev => ({
-                                      ...prev,
-                                      [plugin.filename]: { ...prev[plugin.filename], refreshInterval: e.target.value }
-                                    }));
-                                  }}
-                                  label="Auto-Refresh Interval"
-                                >
-                                  {refreshIntervalOptions.map((option) => (
-                                    <MenuItem key={option.value} value={option.value}>
-                                      {option.label}
-                                    </MenuItem>
-                                  ))}
-                                </Select>
-                              </FormControl>
+                              <RefreshIntervalSelect
+                                labelId={`plugin-${plugin.filename}-refresh-label`}
+                                value={pSettings.refreshInterval}
+                                onChange={(value) => {
+                                  setPluginSettings(prev => ({
+                                    ...prev,
+                                    [plugin.filename]: { ...prev[plugin.filename], refreshInterval: value }
+                                  }));
+                                }}
+                                options={refreshIntervalOptions}
+                              />
                             </Grid>
                           </Grid>
+
+                          {plugin.pluginId && Array.isArray(plugin.manifest?.settings) && plugin.manifest.settings.length > 0 && (
+                            <Box sx={{ mt: 2 }}>
+                              <Typography variant="subtitle2" sx={{ mb: 1 }}>{t('admin:plugins.options')}</Typography>
+                              <Grid container spacing={2}>
+                                {plugin.manifest.settings.map((setting) => {
+                                  const declaredValues = pluginDeclaredValues[plugin.pluginId] || {};
+                                  const value = declaredValues[setting.key];
+                                  const setValue = (next) => {
+                                    setPluginDeclaredValues((prev) => ({
+                                      ...prev,
+                                      [plugin.pluginId]: { ...prev[plugin.pluginId], [setting.key]: next },
+                                    }));
+                                    setPluginDeclaredDirty((prev) => ({
+                                      ...prev,
+                                      [plugin.pluginId]: { ...prev[plugin.pluginId], [setting.key]: true },
+                                    }));
+                                  };
+                                  const label = setting.label || setting.key;
+                                  const controlId = `plugin-${plugin.pluginId}-${setting.key}`;
+                                  return (
+                                    <Grid size={{ xs: 12, sm: 6 }} key={setting.key}>
+                                      {setting.type === 'boolean' ? (
+                                        <FormControlLabel
+                                          control={
+                                            <Switch
+                                              checked={Boolean(value)}
+                                              onChange={() => setValue(!value)}
+                                            />
+                                          }
+                                          label={label}
+                                        />
+                                      ) : setting.type === 'select' ? (
+                                        <FormControl fullWidth size="small">
+                                          <InputLabel id={`${controlId}-label`}>{label}</InputLabel>
+                                          <Select
+                                            labelId={`${controlId}-label`}
+                                            label={label}
+                                            value={value ?? ''}
+                                            onChange={(event) => setValue(event.target.value)}
+                                          >
+                                            {(setting.options || []).map((option) => (
+                                              <MenuItem key={option} value={option}>{option}</MenuItem>
+                                            ))}
+                                          </Select>
+                                        </FormControl>
+                                      ) : setting.type === 'number' ? (
+                                        <TextField
+                                          fullWidth
+                                          size="small"
+                                          type="number"
+                                          label={label}
+                                          value={value ?? ''}
+                                          inputProps={{ min: setting.min, max: setting.max }}
+                                          onChange={(event) => {
+                                            const parsed = Number(event.target.value);
+                                            setValue(event.target.value === '' || Number.isNaN(parsed) ? '' : parsed);
+                                          }}
+                                        />
+                                      ) : (
+                                        <TextField
+                                          fullWidth
+                                          size="small"
+                                          label={label}
+                                          value={value ?? ''}
+                                          onChange={(event) => setValue(event.target.value)}
+                                        />
+                                      )}
+                                      {setting.scope === 'device' && (
+                                        <Typography variant="caption" color="text.secondary">
+                                          {t('admin:plugins.perDevice')}
+                                        </Typography>
+                                      )}
+                                    </Grid>
+                                  );
+                                })}
+                              </Grid>
+                            </Box>
+                          )}
 
                           <Box sx={{ mt: 2 }}>
                             <Autocomplete
@@ -2156,10 +2461,10 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               renderInput={(params) => (
                                 <TextField
                                   {...params}
-                                  label="Show on Tabs"
+                                  label={t('admin:widgets.showOnTabs')}
                                   required={Boolean(pSettings.enabled)}
                                   error={hasRequiredTabsError}
-                                  placeholder="Select tabs..."
+                                  placeholder={t('admin:widgets.selectTabs')}
                                   helperText={
                                     hasRequiredTabsError
                                       ? 'Required: select at least one tab when this plugin is enabled.'
@@ -2174,7 +2479,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     })}
 
                     <Button type="submit" variant="contained" sx={{ mt: 2 }} startIcon={<Save />}>
-                      Save Plugin Settings
+                      {t('admin:plugins.saveSettings')}
                     </Button>
                   </Box>
                 )}
@@ -2185,27 +2490,29 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
               <>
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
                   <Alert severity="info" sx={{ mb: 0, flex: 1, mr: 2 }}>
-                    Manage dashboard tabs. Drag rows to reorder tabs. Home tab cannot be edited or deleted.
+                    {t('admin:tabs.manageHelp')}
                   </Alert>
                   <Button variant="contained" startIcon={<Add />} onClick={openCreateTabDialog}>
-                    Add Tab
+                    {t('admin:tabs.addTab')}
                   </Button>
                 </Box>
 
                 <TableContainer component={Paper}>
-                  <Table>
+                  <Table sx={stackableTableSx}>
                     <TableHead>
                       <TableRow>
-                        <TableCell width={60}>Order</TableCell>
-                        <TableCell>Label</TableCell>
-                        <TableCell>Icon</TableCell>
-                        <TableCell>Show Label</TableCell>
-                        <TableCell width={120}>Actions</TableCell>
+                        <TableCell width={150}>{t('admin:tabs.order')}</TableCell>
+                        <TableCell>{t('admin:tabs.label')}</TableCell>
+                        <TableCell>{t('admin:tabs.icon')}</TableCell>
+                        <TableCell>{t('admin:tabs.showLabel')}</TableCell>
+                        <TableCell width={120}>{t('common:labels.actions')}</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
                       {[...tabs].sort((a, b) => a.number - b.number).map((tab) => {
                         const isHome = tab.number === 1;
+                        const orderIndex = draggableTabsInOrder().findIndex((t) => t.number === tab.number);
+                        const lastOrderIndex = draggableTabsInOrder().length - 1;
                         return (
                           <TableRow
                             key={tab.id}
@@ -2226,28 +2533,58 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               opacity: draggingTabNumber === tab.number ? 0.65 : 1,
                             }}
                           >
-                            <TableCell>
-                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                {!isHome && <DragIndicator fontSize="small" />}
-                                <Chip label={tab.number} size="small" />
+                            <TableCell data-label={t('admin:tabs.order')}>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                {!isHome && (
+                                  <DragIndicator fontSize="small" sx={{ opacity: 0.5, display: { xs: 'none', sm: 'block' } }} />
+                                )}
+                                <Chip label={tab.number} size="small" sx={{ mr: 0.5 }} />
+                                {!isHome && (
+                                  <>
+                                    <Tooltip title={t('admin:tabs.moveUpNamed', { name: tab.label || t('admin:tabs.label') })}>
+                                      <span>
+                                        <IconButton
+                                          size="small"
+                                          aria-label={t('admin:tabs.moveTabUp')}
+                                          disabled={orderIndex <= 0}
+                                          onClick={() => moveTab(tab.number, -1)}
+                                        >
+                                          <ArrowUpward fontSize="small" />
+                                        </IconButton>
+                                      </span>
+                                    </Tooltip>
+                                    <Tooltip title={t('admin:tabs.moveDownNamed', { name: tab.label || t('admin:tabs.label') })}>
+                                      <span>
+                                        <IconButton
+                                          size="small"
+                                          aria-label={t('admin:tabs.moveTabDown')}
+                                          disabled={orderIndex === -1 || orderIndex >= lastOrderIndex}
+                                          onClick={() => moveTab(tab.number, 1)}
+                                        >
+                                          <ArrowDownward fontSize="small" />
+                                        </IconButton>
+                                      </span>
+                                    </Tooltip>
+                                  </>
+                                )}
                               </Box>
                             </TableCell>
-                            <TableCell>
+                            <TableCell data-label={t('admin:tabs.label')}>
                               {tab.label}
                               {isHome && (
-                                <Chip size="small" label="Home" color="primary" sx={{ ml: 1 }} />
+                                <Chip size="small" label={t('admin:tabs.home')} color="primary" sx={{ ml: 1 }} />
                               )}
                             </TableCell>
-                            <TableCell>
+                            <TableCell data-label={t('admin:tabs.icon')}>
                               <Chip size="small" label={tab.icon} />
                             </TableCell>
-                            <TableCell>
+                            <TableCell data-label={t('admin:tabs.showLabel')}>
                               <Switch
                                 checked={Boolean(tab.show_label)}
                                 onClick={(e) => e.stopPropagation()}
                                 onChange={() => toggleTabShowLabel(tab)}
                                 disabled={isLoading}
-                                slotProps={{ input: { 'aria-label': `Toggle show label for ${tab.label}` } }}
+                                slotProps={{ input: { 'aria-label': t('admin:tabs.toggleShowLabel', { name: tab.label }) } }}
                               />
                             </TableCell>
                             <TableCell>
@@ -2280,15 +2617,15 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
             {widgetsSubTab === 3 && (
               <>
                 <Alert severity="info" sx={{ mb: 2 }}>
-                  Manage devices and copy tabs/widget settings between them. Copying will overwrite the current device tabs and widget assignments.
+                  {t('admin:devices.manageHelp')}
                 </Alert>
 
                 <Box sx={{ mb: 2, p: 2, border: '1px solid var(--card-border)', borderRadius: 1 }}>
                   <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 0.5 }}>
-                    Current Device Name
+                    {t('admin:devices.currentName')}
                   </Typography>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-                    <Chip label="Current" color="primary" size="small" />
+                    <Chip label={t('admin:devices.current')} color="primary" size="small" />
                     <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
                       {currentDeviceName}
                     </Typography>
@@ -2296,13 +2633,13 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 </Box>
 
                 <TableContainer component={Paper}>
-                  <Table>
+                  <Table sx={stackableTableSx}>
                     <TableHead>
                       <TableRow>
-                        <TableCell>Name</TableCell>
-                        <TableCell>Last Updated</TableCell>
-                        <TableCell>Widgets</TableCell>
-                        <TableCell width={120}>Actions</TableCell>
+                        <TableCell>{t('common:labels.name')}</TableCell>
+                        <TableCell>{t('admin:devices.lastUpdated')}</TableCell>
+                        <TableCell>{t('admin:subTabs.widgets')}</TableCell>
+                        <TableCell width={120}>{t('common:labels.actions')}</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
@@ -2310,18 +2647,18 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                         const isCurrent = device.name === currentDeviceName;
                         return (
                           <TableRow key={device.name}>
-                            <TableCell>
+                            <TableCell data-label={t('common:labels.name')}>
                               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-                                {isCurrent && <Chip label="Current" color="primary" size="small" />}
+                                {isCurrent && <Chip label={t('admin:devices.current')} color="primary" size="small" />}
                                 <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
                                   {device.name}
                                 </Typography>
                               </Box>
                             </TableCell>
-                            <TableCell>
+                            <TableCell data-label={t('admin:devices.lastUpdated')}>
                               {device.updateTime ? new Date(device.updateTime).toLocaleString() : 'Unknown'}
                             </TableCell>
-                            <TableCell>
+                            <TableCell data-label={t('admin:subTabs.widgets')}>
                               <Chip label={Number(device.widgets) || 0} size="small" />
                             </TableCell>
                             <TableCell>
@@ -2330,7 +2667,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                                   onClick={openRenameDeviceDialog}
                                   color="primary"
                                   size="small"
-                                  title="Rename current device"
+                                  title={t('admin:devices.renameCurrent')}
                                 >
                                   <Edit />
                                 </IconButton>
@@ -2339,7 +2676,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                                   onClick={() => openCopyDeviceDialog(device)}
                                   color="primary"
                                   size="small"
-                                  title="Copy this device to current"
+                                  title={t('admin:devices.copyToCurrent')}
                                 >
                                   <ContentCopy />
                                 </IconButton>
@@ -2348,7 +2685,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                                 onClick={() => openDeleteDeviceDialog(device)}
                                 color="error"
                                 size="small"
-                                title="Delete device"
+                                title={t('admin:devices.deleteDevice')}
                                 disabled={isCurrent}
                               >
                                 <Delete />
@@ -2370,15 +2707,46 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       {activeTab === 1 && (
         <Card>
           <CardContent>
+            {/* Language (issue #137), per display like the other interface
+                settings. Week start deliberately lives in the calendar
+                widget's own settings, which has had per-tab week/month start
+                controls since #127 — a second global control would fight it. */}
+            <AdminFormSection
+              title={t('admin:interface.languageSection')}
+              subtitle={t('admin:interface.languageSubtitle')}
+            >
+              <Grid container spacing={2}>
+                <Grid size={{ xs: 12, sm: 6 }}>
+                  <FormControl fullWidth>
+                    <InputLabel>{t('common:language.label')}</InputLabel>
+                    <Select
+                      value={i18n.language?.split('-')[0] || 'en'}
+                      label={t('common:language.label')}
+                      onChange={(e) => handleLanguageChange(e.target.value)}
+                    >
+                      {SUPPORTED_LANGUAGES.map((lang) => (
+                        <MenuItem key={lang.code} value={lang.code}>
+                          {lang.endonym}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                    <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
+                      {t('common:language.helper')}
+                    </Typography>
+                  </FormControl>
+                </Grid>
+              </Grid>
+            </AdminFormSection>
+
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
-              <Typography variant="h6">Accent Colors</Typography>
+              <Typography variant="h6">{t('admin:colors.heading')}</Typography>
               <Button
                 variant="outlined"
                 startIcon={<RestartAlt />}
                 onClick={resetToDefaults}
                 size="small"
               >
-                Reset to Defaults
+                {t('admin:colors.resetDefaults')}
               </Button>
             </Box>
 
@@ -2389,7 +2757,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
             )}
 
             <Alert severity="info" sx={{ mb: 3 }}>
-              Background color applies to light mode only. Accent color is used throughout the dashboard for highlights and interactive elements.
+              {t('admin:colors.help')}
             </Alert>
 
             <Box sx={{ maxWidth: 600, mx: 'auto' }}>
@@ -2405,7 +2773,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 startIcon={<Save />}
                 size="large"
               >
-                Save Accent Colors
+                {t('admin:colors.save')}
               </Button>
               <Button
                 variant="outlined"
@@ -2413,7 +2781,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 startIcon={<Refresh />}
                 size="large"
               >
-                Refresh Page
+                {t('admin:colors.refreshPage')}
               </Button>
             </Box>
 
@@ -2421,11 +2789,11 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 3 }}>
               <Nightlight />
-              <Typography variant="h6">Screensaver</Typography>
+              <Typography variant="h6">{t('admin:screensaver.heading')}</Typography>
             </Box>
 
             <Alert severity="info" sx={{ mb: 3 }}>
-              The screensaver activates after a period of inactivity, cycling through tabs or displaying a photo slideshow.
+              {t('admin:screensaver.help')}
             </Alert>
 
             <Box sx={{ maxWidth: 600, mx: 'auto' }}>
@@ -2436,12 +2804,12 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     onChange={(e) => setScreensaverSettings(prev => ({ ...prev, enabled: e.target.checked }))}
                   />
                 }
-                label="Enable Screensaver"
+                label={t('admin:screensaver.enable')}
                 sx={{ mb: 3 }}
               />
 
               <Typography variant="subtitle2" sx={{ mb: 2, fontWeight: 'bold' }}>
-                Screensaver Mode
+                {t('admin:screensaver.mode')}
               </Typography>
 
               <RadioGroup
@@ -2467,19 +2835,19 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               color: !hasTabsCreated ? 'text.disabled' : 'inherit'
                             }}
                           >
-                            Cycle Through Tabs
+                            {t('admin:screensaver.cycleTabs')}
                           </Typography>
                           <Typography
                             variant="caption"
                             color={!hasTabsCreated ? 'text.disabled' : 'text.secondary'}
                           >
                             {hasTabsCreated
-                              ? `Automatically switch between ${tabs.length} tab${tabs.length !== 1 ? 's' : ''}`
+                              ? t('admin:screensaver.cycleTabsHelp', { count: tabs.length })
                               : 'No tabs created yet'}
                           </Typography>
                         </Box>
                         {!hasTabsCreated && (
-                          <Tooltip title="Create tabs in the Tab Bar to enable this feature">
+                          <Tooltip title={t('admin:screensaver.cycleTabsDisabled')}>
                             <Info fontSize="small" color="disabled" />
                           </Tooltip>
                         )}
@@ -2507,7 +2875,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               color: !hasImmichConfigured ? 'text.disabled' : 'inherit'
                             }}
                           >
-                            Immich Photo Slideshow
+                            {t('admin:screensaver.immichSlideshow')}
                           </Typography>
                           <Typography
                             variant="caption"
@@ -2519,7 +2887,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                           </Typography>
                         </Box>
                         {!hasImmichConfigured && (
-                          <Tooltip title="Configure an Immich photo source in the Photos widget to enable this feature">
+                          <Tooltip title={t('admin:screensaver.immichDisabled')}>
                             <Info fontSize="small" color="disabled" />
                           </Tooltip>
                         )}
@@ -2549,45 +2917,35 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
               />
 
               {screensaverSettings.mode === 'photos' && (
-                <>
-                  <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 'bold' }}>
-                    Photo Slideshow Interval: {screensaverSettings.slideshowInterval} second{screensaverSettings.slideshowInterval !== 1 ? 's' : ''}
-                  </Typography>
-                  <Slider
-                    value={screensaverSettings.slideshowInterval}
-                    onChange={(e, value) => setScreensaverSettings(prev => ({ ...prev, slideshowInterval: value }))}
-                    min={3}
-                    max={60}
-                    marks={[
-                      { value: 3, label: '3s' },
-                      { value: 10, label: '10s' },
-                      { value: 30, label: '30s' },
-                      { value: 60, label: '60s' }
-                    ]}
-                    sx={{ mb: 4 }}
-                  />
-                </>
+                <ScreensaverIntervalSlider
+                  label={t('admin:screensaver.photoInterval')}
+                  value={screensaverSettings.slideshowInterval}
+                  onChange={(value) => setScreensaverSettings(prev => ({ ...prev, slideshowInterval: value }))}
+                  min={3}
+                  max={60}
+                  marks={[
+                    { value: 3, label: '3s' },
+                    { value: 10, label: '10s' },
+                    { value: 30, label: '30s' },
+                    { value: 60, label: '60s' }
+                  ]}
+                />
               )}
 
               {screensaverSettings.mode === 'tabs' && (
-                <>
-                  <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 'bold' }}>
-                    Tab Cycle Interval: {screensaverSettings.slideshowInterval} second{screensaverSettings.slideshowInterval !== 1 ? 's' : ''}
-                  </Typography>
-                  <Slider
-                    value={screensaverSettings.slideshowInterval}
-                    onChange={(e, value) => setScreensaverSettings(prev => ({ ...prev, slideshowInterval: value }))}
-                    min={5}
-                    max={120}
-                    marks={[
-                      { value: 5, label: '5s' },
-                      { value: 30, label: '30s' },
-                      { value: 60, label: '60s' },
-                      { value: 120, label: '2m' }
-                    ]}
-                    sx={{ mb: 4 }}
-                  />
-                </>
+                <ScreensaverIntervalSlider
+                  label={t('admin:screensaver.tabInterval')}
+                  value={screensaverSettings.slideshowInterval}
+                  onChange={(value) => setScreensaverSettings(prev => ({ ...prev, slideshowInterval: value }))}
+                  min={5}
+                  max={120}
+                  marks={[
+                    { value: 5, label: '5s' },
+                    { value: 30, label: '30s' },
+                    { value: 60, label: '60s' },
+                    { value: 120, label: '2m' }
+                  ]}
+                />
               )}
 
               <Button
@@ -2597,25 +2955,95 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 fullWidth
                 sx={{ mt: 2 }}
               >
-                Save Screensaver Settings
+                {t('admin:screensaver.save')}
+              </Button>
+
+              <Divider sx={{ my: 4 }} />
+
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
+                <BeachAccess />
+                <Typography variant="h6">{t('admin:vacation.heading')}</Typography>
+              </Box>
+
+              <Alert severity="info" sx={{ mb: 2 }}>
+                {t('admin:vacation.help')}
+                fun vacation animation. Settings apply to this display and persist until you turn
+                vacation mode off.
+              </Alert>
+
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={vacationModeSettings.enabled}
+                    onChange={(e) => setVacationModeSettings(prev => ({ ...prev, enabled: e.target.checked }))}
+                  />
+                }
+                label={t('admin:vacation.enable')}
+                sx={{ mb: 1, display: 'block' }}
+              />
+
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={vacationModeSettings.muteSounds}
+                    disabled={!vacationModeSettings.enabled}
+                    onChange={(e) => setVacationModeSettings(prev => ({ ...prev, muteSounds: e.target.checked }))}
+                  />
+                }
+                label={t('admin:vacation.muteSounds')}
+                sx={{ mb: 1, display: 'block' }}
+              />
+
+              {vacationModeSettings.enabled && (
+                <Box sx={{ display: 'flex', gap: 2, mt: 1 }}>
+                  <TextField
+                    size="small"
+                    type="date"
+                    label={t('admin:vacation.startDate')}
+                    value={vacationModeSettings.startDate || ''}
+                    onChange={(e) => setVacationModeSettings(prev => ({ ...prev, startDate: e.target.value }))}
+                    slotProps={{ inputLabel: { shrink: true } }}
+                    sx={{ flex: 1 }}
+                  />
+                  <TextField
+                    size="small"
+                    type="date"
+                    label={t('admin:vacation.endDate')}
+                    value={vacationModeSettings.endDate || ''}
+                    onChange={(e) => setVacationModeSettings(prev => ({ ...prev, endDate: e.target.value }))}
+                    slotProps={{ inputLabel: { shrink: true } }}
+                    sx={{ flex: 1 }}
+                  />
+                </Box>
+              )}
+              {vacationModeSettings.enabled && (
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                  {t('admin:vacation.dateHelp')}
+                  for those days, and streaks bridge across them permanently. Without dates, vacation
+                  stays on until you turn it off.
+                </Typography>
+              )}
+
+              <Button
+                variant="contained"
+                onClick={saveVacationModeSettings}
+                startIcon={<Save />}
+                fullWidth
+                sx={{ mt: 2 }}
+              >
+                {t('admin:vacation.save')}
               </Button>
 
               <Divider sx={{ my: 4 }} />
 
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
                 <Nightlight />
-                <Typography variant="h6">Daylight Auto Dark Mode</Typography>
+                <Typography variant="h6">{t('admin:autoDark.heading')}</Typography>
               </Box>
 
               <Alert severity="info" sx={{ mb: 2 }}>
-                To enable auto mode: save an OpenWeather API key in Connections, enter a location here, save this section, then press the bottom-bar theme button until the half sun/half moon icon appears.
+                {t('admin:autoDark.help')}
               </Alert>
-
-              {!settings.WEATHER_API_KEY?.trim() && (
-                <Alert severity="warning" sx={{ mb: 2 }}>
-                  OpenWeather API key is not set yet. Add it in the Connections tab first.
-                </Alert>
-              )}
 
               <FormControlLabel
                 control={
@@ -2629,13 +3057,13 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     }}
                   />
                 }
-                label="Enable Daylight Auto Dark Mode"
+                label={t('admin:autoDark.enable')}
                 sx={{ mb: 2 }}
               />
 
               <TextField
                 fullWidth
-                label="Location"
+                label={t('admin:autoDark.location')}
                 value={autoDarkModeSettings.locationQuery}
                 onChange={(e) => {
                   const nextValue = e.target.value;
@@ -2644,7 +3072,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     locationQuery: nextValue,
                   }));
                 }}
-                helperText="Examples: Dallas,TX,US, London,UK, or ZIP code like 76034"
+                helperText={t('admin:autoDark.locationHelp')}
                 sx={{ mb: 2 }}
               />
 
@@ -2656,7 +3084,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     </Typography>
                     {autoDarkModeSunTimesLoading && (
                       <Typography variant="body2" sx={{ mt: 0.5 }}>
-                        Loading today's sunrise and sunset...
+                        {t('admin:autoDark.loadingSun')}
                       </Typography>
                     )}
                     {!autoDarkModeSunTimesLoading && autoDarkModeSunTimes.sunrise && autoDarkModeSunTimes.sunset && (
@@ -2691,10 +3119,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       {activeTab === 2 && (
         <Card>
           <CardContent>
-            <Typography variant="h6" gutterBottom>User Management</Typography>
-
-            <Box sx={{ mb: 3, p: 2, border: '1px solid var(--card-border)', borderRadius: 1 }}>
-              <Typography variant="subtitle1" sx={{ mb: 2 }}>Add New User</Typography>
+            <AdminFormSection title={t('admin:users.management')} subtitle={t('admin:users.addNew')}>
               <Box
                 component="form"
                 onSubmit={(event) => {
@@ -2706,7 +3131,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   <Grid size={{ xs: 12, sm: 4 }}>
                     <TextField
                       fullWidth
-                      label="Username"
+                      label={t('admin:users.username')}
                       value={newUser.username}
                       onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
                     />
@@ -2714,7 +3139,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   <Grid size={{ xs: 12, sm: 4 }}>
                     <TextField
                       fullWidth
-                      label="Email"
+                      label={t('admin:users.email')}
                       type="email"
                       value={newUser.email}
                       onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
@@ -2728,28 +3153,105 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                       fullWidth
                       sx={{ height: '56px' }}
                     >
-                      Add User
+                      {t('admin:users.addUser')}
                     </Button>
+                  </Grid>
+                  <Grid size={12}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      {newUser.profile_picture ? (
+                        <img
+                          src={`${API_BASE_URL}/Uploads/users/${newUser.profile_picture}`}
+                          alt={t('admin:users.chosenAvatar')}
+                          style={{ width: 40, height: 40, borderRadius: '50%', border: '2px solid var(--accent)' }}
+                        />
+                      ) : (
+                        <Avatar sx={{ width: 40, height: 40, bgcolor: 'var(--card-border)' }}>?</Avatar>
+                      )}
+                      <Button size="small" variant="outlined" onClick={() => setAvatarPicker({ open: true, userId: null })}>
+                        {t('admin:users.chooseAvatar')}
+                      </Button>
+                      <Typography variant="caption" color="text.secondary">
+                        {t('admin:users.avatarHelp')}
+                      </Typography>
+                    </Box>
                   </Grid>
                 </Grid>
               </Box>
-            </Box>
+            </AdminFormSection>
 
             <TableContainer component={Paper}>
-              <Table>
+              <Table sx={stackableTableSx}>
                 <TableHead>
                   <TableRow>
-                    <TableCell>Avatar</TableCell>
-                    <TableCell>Username</TableCell>
-                    <TableCell>Email</TableCell>
-                    <TableCell>Clam Total</TableCell>
-                    <TableCell>Chores</TableCell>
-                    <TableCell>Actions</TableCell>
+                    <TableCell width={110}>{t('admin:tabs.order')}</TableCell>
+                    <TableCell>{t('admin:users.avatar')}</TableCell>
+                    <TableCell>{t('admin:users.username')}</TableCell>
+                    <TableCell>{t('admin:users.email')}</TableCell>
+                    <TableCell>{t('admin:users.clamTotal')}</TableCell>
+                    <TableCell>{t('admin:users.chores')}</TableCell>
+                    <TableCell>{t('common:labels.actions')}</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {users.map((user) => (
-                    <TableRow key={user.id}>
+                  {users.map((user) => {
+                    // Display order (issue #134). Drag works on desktop only —
+                    // HTML5 drag events never fire on touch — so the arrows
+                    // carry the feature on phones and the wall tablet.
+                    const isBonus = user.id === 0;
+                    const orderIndex = reorderableUsers.findIndex((u) => u.id === user.id);
+                    return (
+                    <TableRow
+                      key={user.id}
+                      draggable={!isBonus}
+                      onDragStart={() => handleUserDragStart(user.id)}
+                      onDragOver={(e) => {
+                        if (!isBonus) e.preventDefault();
+                      }}
+                      onDrop={() => {
+                        if (!isBonus) handleUserDrop(user.id);
+                      }}
+                      sx={{
+                        cursor: isBonus ? 'default' : 'grab',
+                        opacity: draggingUserId === user.id ? 0.65 : 1,
+                      }}
+                    >
+                      <TableCell data-label={t('admin:tabs.order')}>
+                        {isBonus ? (
+                          <Chip size="small" label={t('admin:users.pinned')} />
+                        ) : (
+                          <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                            <DragIndicator fontSize="small" sx={{ opacity: 0.5, display: { xs: 'none', sm: 'block' } }} />
+                            {/* The span is required so the tooltip still works
+                                on a disabled button; the aria-label has to go
+                                on the button itself, since the wrapper would
+                                otherwise swallow the accessible name. */}
+                            <Tooltip title={t('admin:users.moveUpNamed', { name: user.username })}>
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  aria-label={t('common:actions.moveUp')}
+                                  disabled={orderIndex <= 0}
+                                  onClick={() => moveUser(user.id, -1)}
+                                >
+                                  <ArrowUpward fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                            <Tooltip title={t('admin:users.moveDownNamed', { name: user.username })}>
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  aria-label={t('common:actions.moveDown')}
+                                  disabled={orderIndex === -1 || orderIndex >= reorderableUsers.length - 1}
+                                  onClick={() => moveUser(user.id, 1)}
+                                >
+                                  <ArrowDownward fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                          </Box>
+                        )}
+                      </TableCell>
                       <TableCell>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                           <UserAvatar key={`${user.id}-${user.profile_picture}`} user={user} />
@@ -2758,7 +3260,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                             size="small"
                             variant="outlined"
                           >
-                            Upload
+                            {t('common:actions.upload')}
                             <input
                               type="file"
                               hidden
@@ -2766,9 +3268,18 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                               onChange={(e) => handleProfilePictureUpload(user.id, e)}
                             />
                           </Button>
+                          <Tooltip title={t('admin:users.pickBuiltIn')}>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              onClick={() => setAvatarPicker({ open: true, userId: user.id })}
+                            >
+                              {t('common:actions.choose')}
+                            </Button>
+                          </Tooltip>
                         </Box>
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:users.username')}>
                         {editingUser?.id === user.id ? (
                           <TextField
                             value={editingUser.username}
@@ -2779,7 +3290,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                           user.username
                         )}
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:users.email')} sx={{ '@media (max-width:599.95px)': { wordBreak: 'break-all' } }}>
                         {editingUser?.id === user.id ? (
                           <TextField
                             value={editingUser.email}
@@ -2790,28 +3301,25 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                           user.email
                         )}
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:users.clamTotal')}>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                           <Chip
                             label={`${user.clam_total || 0} 🥟`}
                             color="primary"
                             size="small"
                           />
-                          <TextField
-                            type="number"
-                            size="small"
-                            sx={{ width: 80 }}
-                            defaultValue={user.clam_total || 0}
-                            onBlur={(e) => {
-                              const newTotal = parseInt(e.target.value) || 0;
-                              if (newTotal !== user.clam_total) {
-                                updateUserClams(user.id, newTotal);
-                              }
-                            }}
-                          />
+                          <Tooltip title={t('admin:users.editClams')}>
+                            <IconButton
+                              onClick={() => setClamModalUser(user)}
+                              color="primary"
+                              size="small"
+                            >
+                              <Edit />
+                            </IconButton>
+                          </Tooltip>
                         </Box>
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:users.chores')}>
                         <Button
                           variant="outlined"
                           size="small"
@@ -2853,7 +3361,8 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                         </Box>
                       </TableCell>
                     </TableRow>
-                  ))}
+                    );
+                  })}
                 </TableBody>
               </Table>
             </TableContainer>
@@ -2871,17 +3380,39 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
               </Alert>
             )}
 
+            <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 3 }}>
+              <Tabs
+                value={choresSubTab}
+                onChange={(_, v) => setChoresSubTab(v)}
+                size="small"
+                variant="scrollable"
+                scrollButtons="auto"
+                allowScrollButtonsMobile
+              >
+                <Tab label={t('admin:users.chores')} />
+                <Tab label={t('admin:chores.history')} />
+                <Tab label={t('admin:chores.settings')} />
+              </Tabs>
+            </Box>
+            {choresSubTab === 0 && (
+              <ChoreSchedulesTab saveMessage={saveMessage} setSaveMessage={setSaveMessage} />
+            )}
+            {choresSubTab === 1 && (
+              <ChoreHistoryTab />
+            )}
+            {choresSubTab === 2 && (
+              <>
             <Box sx={{ mb: 3, p: 2, border: '1px solid var(--card-border)', borderRadius: 1 }}>
               <Typography variant="subtitle1" sx={{ mb: 1.5, fontWeight: 600 }}>
-                Rewards
+                {t('admin:chores.rewards')}
               </Typography>
               <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 2, alignItems: { sm: 'flex-start' } }}>
                 <TextField
-                  label="Daily Completion Clam Reward"
+                  label={t('admin:chores.dailyReward')}
                   type="number"
                   value={settings.daily_completion_clam_reward || '2'}
                   onChange={(e) => setSettings(prev => ({ ...prev, daily_completion_clam_reward: e.target.value }))}
-                  helperText="Clams awarded when a user completes all their daily chores"
+                  helperText={t('admin:chores.dailyRewardHelp')}
                   slotProps={{ htmlInput: { min: 0, max: 100 } }}
                   sx={{ maxWidth: 340, flex: 1 }}
                 />
@@ -2892,22 +3423,80 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   startIcon={<Save />}
                   sx={{ alignSelf: { xs: 'stretch', sm: 'center' }, mt: { xs: 0, sm: 1 } }}
                 >
+                  {isLoading ? t('common:state.saving') : t('common:actions.save')}
+                </Button>
+              </Box>
+
+              <FormControlLabel
+                sx={{ mt: 1 }}
+                control={
+                  <Switch
+                    checked={settings.CHORE_CELEBRATION_ENABLED !== 'false' && settings.CHORE_CELEBRATION_ENABLED !== false}
+                    onChange={(e) => setSettings(prev => ({
+                      ...prev,
+                      CHORE_CELEBRATION_ENABLED: e.target.checked ? 'true' : 'false',
+                    }))}
+                  />
+                }
+                label={t('admin:chores.celebrationEnable')}
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                {t('admin:chores.celebrationHelp')}
+              </Typography>
+            </Box>
+
+            <Box sx={{ mb: 3, p: 2, border: '1px solid var(--card-border)', borderRadius: 1 }}>
+              <Typography variant="subtitle1" sx={{ mb: 1.5, fontWeight: 600 }}>
+                {t('admin:chores.soundsHeading')}
+              </Typography>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={settings.CHORE_SOUND_ENABLED === 'true' || settings.CHORE_SOUND_ENABLED === true}
+                    onChange={(e) => setSettings(prev => ({ ...prev, CHORE_SOUND_ENABLED: e.target.checked ? 'true' : 'false' }))}
+                  />
+                }
+                label={t('admin:chores.soundsEnable')}
+              />
+              <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 3, alignItems: { sm: 'flex-start' }, mt: 1 }}>
+                <Box sx={{ flex: 1, minWidth: 240 }}>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                    {t('admin:chores.defaultSoundHelp')}
+                  </Typography>
+                  <SoundPicker
+                    label={t('admin:chores.defaultSound')}
+                    value={settings.CHORE_SOUND_DEFAULT || ''}
+                    onChange={(sound) => setSettings(prev => ({ ...prev, CHORE_SOUND_DEFAULT: sound }))}
+                    volume={(Number(settings.CHORE_SOUND_VOLUME) || 100) / 100}
+                    includeNoneOption
+                    noneLabel="(none)"
+                    allowDelete
+                  />
+                </Box>
+                <Box sx={{ width: 200 }}>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                    Volume: {Number(settings.CHORE_SOUND_VOLUME) || 0}%
+                  </Typography>
+                  <Slider
+                    value={Number(settings.CHORE_SOUND_VOLUME) || 0}
+                    onChange={(_, v) => setSettings(prev => ({ ...prev, CHORE_SOUND_VOLUME: String(v) }))}
+                    min={0}
+                    max={100}
+                    valueLabelDisplay="auto"
+                  />
+                </Box>
+                <Button
+                  variant="contained"
+                  onClick={saveChoreSoundSettings}
+                  disabled={isLoading}
+                  startIcon={<Save />}
+                  sx={{ alignSelf: { xs: 'stretch', sm: 'center' } }}
+                >
                   {isLoading ? 'Saving...' : 'Save'}
                 </Button>
               </Box>
             </Box>
-
-            <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 3 }}>
-              <Tabs value={choresSubTab} onChange={(_, v) => setChoresSubTab(v)} size="small">
-                <Tab label="Chores" />
-                <Tab label="History" />
-              </Tabs>
-            </Box>
-            {choresSubTab === 0 && (
-              <ChoreSchedulesTab saveMessage={saveMessage} setSaveMessage={setSaveMessage} />
-            )}
-            {choresSubTab === 1 && (
-              <ChoreHistoryTab />
+              </>
             )}
           </CardContent>
         </Card>
@@ -2917,10 +3506,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       {activeTab === 4 && (
         <Card>
           <CardContent>
-            <Typography variant="h6" gutterBottom>Prize Management</Typography>
-
-            <Box sx={{ mb: 3, p: 2, border: '1px solid var(--card-border)', borderRadius: 1 }}>
-              <Typography variant="subtitle1" sx={{ mb: 2 }}>Add New Prize</Typography>
+            <AdminFormSection title={t('admin:prizes.management')} subtitle={t('admin:prizes.addNew')}>
               <Box
                 component="form"
                 onSubmit={(event) => {
@@ -2932,7 +3518,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   <Grid size={{ xs: 12, sm: 6 }}>
                     <TextField
                       fullWidth
-                      label="Prize Name"
+                      label={t('admin:prizes.name')}
                       value={newPrize.name}
                       onChange={(e) => setNewPrize({ ...newPrize, name: e.target.value })}
                     />
@@ -2940,7 +3526,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   <Grid size={{ xs: 12, sm: 3 }}>
                     <TextField
                       fullWidth
-                      label="Clam Cost"
+                      label={t('admin:prizes.cost')}
                       type="number"
                       value={newPrize.clam_cost}
                       onChange={(e) => setNewPrize({ ...newPrize, clam_cost: parseInt(e.target.value) || 0 })}
@@ -2954,31 +3540,56 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                       fullWidth
                       sx={{ height: '56px' }}
                     >
-                      Add Prize
+                      {t('admin:prizes.add')}
                     </Button>
+                  </Grid>
+                  <Grid size={12}>
+                    <Tooltip title={t('admin:prizes.repeatableTooltip')}>
+                      <FormControlLabel
+                        control={
+                          <Switch
+                            checked={!!newPrize.repeatable}
+                            onChange={(e) => setNewPrize({ ...newPrize, repeatable: e.target.checked })}
+                          />
+                        }
+                        label={t('admin:prizes.repeatableLabel')}
+                      />
+                    </Tooltip>
                   </Grid>
                 </Grid>
               </Box>
-            </Box>
+            </AdminFormSection>
 
             <List>
               {prizes.map((prize) => (
                 <ListItem key={prize.id} sx={{ border: '1px solid var(--card-border)', borderRadius: 1, mb: 1 }}>
                   {editingPrize?.id === prize.id ? (
-                    <Box sx={{ display: 'flex', gap: 2, width: '100%', alignItems: 'center' }}>
+                    <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, gap: 2, width: '100%', alignItems: { xs: 'stretch', sm: 'center' } }}>
                       <TextField
-                        label="Prize Name"
+                        label={t('admin:prizes.name')}
                         value={editingPrize.name}
                         onChange={(e) => setEditingPrize({ ...editingPrize, name: e.target.value })}
                         sx={{ flex: 1 }}
                       />
                       <TextField
-                        label="Clam Cost"
+                        label={t('admin:prizes.cost')}
                         type="number"
                         value={editingPrize.clam_cost}
                         onChange={(e) => setEditingPrize({ ...editingPrize, clam_cost: parseInt(e.target.value) || 0 })}
-                        sx={{ width: 120 }}
+                        sx={{ width: { xs: '100%', sm: 120 } }}
                       />
+                      <Tooltip title={t('admin:prizes.repeatableShortTooltip')}>
+                        <FormControlLabel
+                          control={
+                            <Switch
+                              checked={!!editingPrize.repeatable}
+                              onChange={(e) => setEditingPrize({ ...editingPrize, repeatable: e.target.checked })}
+                            />
+                          }
+                          label={t('admin:prizes.repeatableShort')}
+                          sx={{ mr: 0 }}
+                        />
+                      </Tooltip>
                       <IconButton onClick={savePrize} color="primary">
                         <Save />
                       </IconButton>
@@ -2990,9 +3601,16 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     <>
                       <ListItemText
                         primary={prize.name}
-                        secondary={`Cost: ${prize.clam_cost} 🥟`}
+                        secondary={prize.repeatable
+                          ? t('admin:prizes.costLineRepeatable', { cost: prize.clam_cost })
+                          : t('admin:prizes.costLine', { cost: prize.clam_cost })}
                       />
                       <ListItemSecondaryAction>
+                        <Tooltip title={prize.repeatable ? 'Add to store (stays on the shelf after each redemption)' : 'Add to store (one-time redeemable offer)'}>
+                          <IconButton onClick={() => addPrizeToStore(prize.id)} color="primary">
+                            <Add />
+                          </IconButton>
+                        </Tooltip>
                         <IconButton onClick={() => setEditingPrize({ ...prize })} color="primary">
                           <Edit />
                         </IconButton>
@@ -3005,6 +3623,39 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 </ListItem>
               ))}
             </List>
+
+            <AdminFormSection
+              title={t('admin:prizes.store')}
+              subtitle={t('admin:prizes.storeHelp')}
+            >
+              {prizeOffers.length === 0 ? (
+                <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
+                  {t('admin:prizes.storeEmpty')}
+                </Typography>
+              ) : (
+                <List>
+                  {prizeOffers.map((offer) => (
+                    <ListItem key={offer.id} sx={{ border: '1px solid var(--card-border)', borderRadius: 1, mb: 1 }}>
+                      <ListItemText
+                        primary={`${offer.name} — ${offer.clam_cost} 🥟${offer.repeatable ? ' · 🔁' : ''}`}
+                        secondary={
+                          offer.status === 'requested'
+                            ? t('admin:prizes.requestedBy', { name: offer.requested_by_name || t('common:state.none') })
+                            : 'On the shelf'
+                        }
+                      />
+                      <ListItemSecondaryAction>
+                        <Tooltip title={offer.status === 'requested' ? 'Decline request and remove from store' : 'Remove from store'}>
+                          <IconButton onClick={() => removePrizeOffer(offer.id)} color="error">
+                            <Delete />
+                          </IconButton>
+                        </Tooltip>
+                      </ListItemSecondaryAction>
+                    </ListItem>
+                  ))}
+                </List>
+              )}
+            </AdminFormSection>
           </CardContent>
         </Card>
       )}
@@ -3013,7 +3664,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       {activeTab === 5 && (
         <Card>
           <CardContent>
-            <Typography variant="h6" gutterBottom>Security Settings</Typography>
+            <Typography variant="h6" gutterBottom>{t('admin:security.heading')}</Typography>
 
             {saveMessage.show && (
               <Alert severity={saveMessage.type} sx={{ mb: 2 }}>
@@ -3022,13 +3673,13 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
             )}
 
             <Alert severity="info" sx={{ mb: 3 }}>
-              The admin PIN is required to access the admin panel. Keep your PIN secure and memorable.
+              {t('admin:security.help')}
             </Alert>
 
             <Box sx={{ p: 3, border: '2px solid var(--accent)', borderRadius: 2, backgroundColor: 'rgba(158, 127, 255, 0.05)' }}>
               <Typography variant="subtitle1" sx={{ mb: 2, fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: 1 }}>
                 <Lock />
-                Admin PIN Protection
+                {t('admin:security.pinProtection')}
               </Typography>
 
               <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
@@ -3041,7 +3692,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 <Grid size={{ xs: 12, sm: 6 }}>
                   <Paper elevation={0} sx={{ p: 2, backgroundColor: 'rgba(0, 0, 0, 0.1)' }}>
                     <Typography variant="body2" sx={{ mb: 1, fontWeight: 'bold' }}>
-                      PIN Requirements:
+                      {t('admin:security.requirements')}
                     </Typography>
                     <Typography variant="body2" color="text.secondary">
                       • 4-8 numeric digits
@@ -3058,7 +3709,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                 <Grid size={{ xs: 12, sm: 6 }}>
                   <Paper elevation={0} sx={{ p: 2, backgroundColor: 'rgba(0, 0, 0, 0.1)' }}>
                     <Typography variant="body2" sx={{ mb: 1, fontWeight: 'bold' }}>
-                      Current Status:
+                      {t('admin:security.currentStatus')}
                     </Typography>
                     <Chip
                       label={pinExists ? 'PIN Configured' : 'No PIN Set'}
@@ -3087,7 +3738,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     fontSize: '1rem'
                   }}
                 >
-                  {pinExists ? 'Update Admin PIN' : 'Set Admin PIN'}
+                  {pinExists ? t('admin:pin.update') : t('admin:pin.setPin')}
                 </Button>
                 {pinExists && (
                   <Button
@@ -3097,14 +3748,14 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                     fullWidth
                     sx={{ py: 1, fontWeight: 'bold' }}
                   >
-                    Remove PIN
+                    {t('admin:security.removePin')}
                   </Button>
                 )}
               </Box>
 
               {pinExists && (
                 <Alert severity="warning" sx={{ mt: 2 }}>
-                  Changing your PIN will require you to use the new PIN on your next admin panel access.
+                  {t('admin:security.changeNote')}
                 </Alert>
               )}
             </Box>
@@ -3116,7 +3767,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
       {activeTab === 6 && (
         <Card>
           <CardContent>
-            <Typography variant="h6" gutterBottom>Connections</Typography>
+            <Typography variant="h6" gutterBottom>{t('admin:connections.heading')}</Typography>
 
             {saveMessage.show && (
               <Alert severity={saveMessage.type} sx={{ mb: 2 }}>
@@ -3126,7 +3777,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
             <Box sx={{ maxWidth: 700 }}>
               <Typography variant="subtitle1" sx={{ mt: 1, mb: 1.5, fontWeight: 600 }}>
-                API Keys
+                {t('admin:connections.weatherHeading')}
               </Typography>
 
               <Box
@@ -3136,23 +3787,51 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   saveAllApiSettings();
                 }}
               >
-                <TextField
-                  fullWidth
-                  label="OpenWeatherMap API Key"
-                  type="password"
-                  value={settings.WEATHER_API_KEY || ''}
-                  onChange={(e) => setSettings(prev => ({ ...prev, WEATHER_API_KEY: e.target.value }))}
-                  sx={{ mb: 2 }}
-                  helperText="Get your free API key from openweathermap.org/api"
-                />
+                <FormControl fullWidth sx={{ mb: 2 }}>
+                  <InputLabel id="weather-provider-label">{t('admin:connections.weatherProvider')}</InputLabel>
+                  <Select
+                    labelId="weather-provider-label"
+                    label={t('admin:connections.weatherProvider')}
+                    value={settings.WEATHER_PROVIDER || 'openweathermap'}
+                    onChange={(e) => setSettings(prev => ({ ...prev, WEATHER_PROVIDER: e.target.value }))}
+                  >
+                    <MenuItem value="openweathermap">{t('admin:connections.providerOpenWeather')}</MenuItem>
+                    <MenuItem value="homeassistant">{t('admin:connections.providerHomeAssistant')}</MenuItem>
+                  </Select>
+                </FormControl>
+
+                {weatherProviderStatus && !weatherProviderStatus.configured && (
+                  <Alert severity="warning" sx={{ mb: 2 }}>
+                    {weatherProviderStatus.reason}
+                  </Alert>
+                )}
+
+                {/* The key field is write-only: the server redacts it, so this
+                    shows whether one is stored and accepts a replacement. */}
+                {settings.WEATHER_PROVIDER !== 'homeassistant' && (
+                  <TextField
+                    fullWidth
+                    label={t('admin:connections.openWeatherKey')}
+                    type="password"
+                    value={settings.WEATHER_API_KEY || ''}
+                    onChange={(e) => setSettings(prev => ({ ...prev, WEATHER_API_KEY: e.target.value }))}
+                    sx={{ mb: 2 }}
+                    placeholder={weatherProviderStatus?.has_api_key ? t('admin:connections.keyStored') : ''}
+                    helperText={
+                      weatherProviderStatus?.has_api_key
+                        ? t('admin:connections.openWeatherStoredHelp')
+                        : t('admin:connections.openWeatherHelp')
+                    }
+                  />
+                )}
 
                 <TextField
                   fullWidth
-                  label="Proxy Whitelist (comma-separated domains)"
+                  label={t('admin:connections.proxyWhitelist')}
                   value={settings.PROXY_WHITELIST || ''}
                   onChange={(e) => setSettings(prev => ({ ...prev, PROXY_WHITELIST: e.target.value }))}
                   sx={{ mb: 2 }}
-                  helperText="Domains allowed for proxy requests (e.g., api.example.com, another-api.com)"
+                  helperText={t('admin:connections.proxyHelp')}
                 />
 
                 <Button
@@ -3162,8 +3841,116 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                   startIcon={<Save />}
                   sx={{ mt: 1, mb: 4 }}
                 >
-                  {isLoading ? 'Saving...' : 'Save API Keys'}
+                  {isLoading ? t('common:state.saving') : t('admin:connections.saveApiKeys')}
                 </Button>
+              </Box>
+
+              <Divider sx={{ my: 2 }} />
+
+              {/* Home Assistant (issue #57) */}
+              <Typography variant="subtitle1" sx={{ mt: 2, mb: 1.5, fontWeight: 600 }}>
+                {t('admin:connections.homeAssistantHeading')}
+              </Typography>
+
+              <Alert severity="info" sx={{ mb: 2 }}>
+                {t('admin:connections.homeAssistantHelp')}
+              </Alert>
+
+              {homeAssistantStatus && !homeAssistantStatus.encryption?.configured && (
+                <Alert severity="warning" sx={{ mb: 2 }}>
+                  {t('admin:connections.encryptionRequired')}
+                </Alert>
+              )}
+
+              <Box
+                component="form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  saveHomeAssistantConnection();
+                }}
+              >
+                <TextField
+                  fullWidth
+                  label={t('admin:connections.homeAssistantUrl')}
+                  value={homeAssistantDraft.url}
+                  onChange={(e) => setHomeAssistantDraft(prev => ({ ...prev, url: e.target.value }))}
+                  sx={{ mb: 2 }}
+                  placeholder="http://homeassistant.local:8123"
+                  helperText={t('admin:connections.homeAssistantUrlHelp')}
+                />
+
+                <TextField
+                  fullWidth
+                  label={t('admin:connections.homeAssistantToken')}
+                  type="password"
+                  value={homeAssistantDraft.token}
+                  onChange={(e) => setHomeAssistantDraft(prev => ({ ...prev, token: e.target.value }))}
+                  sx={{ mb: 2 }}
+                  placeholder={homeAssistantStatus?.has_token ? t('admin:connections.tokenStored') : ''}
+                  helperText={
+                    homeAssistantStatus?.has_token
+                      ? t('admin:connections.homeAssistantTokenStoredHelp')
+                      : t('admin:connections.homeAssistantTokenHelp')
+                  }
+                />
+
+                {/* Populated by Test Connection, so the entity id can be picked
+                    rather than remembered. */}
+                {homeAssistantEntities.length > 0 ? (
+                  <FormControl fullWidth sx={{ mb: 2 }}>
+                    <InputLabel id="ha-weather-entity-label">{t('admin:connections.homeAssistantEntity')}</InputLabel>
+                    <Select
+                      labelId="ha-weather-entity-label"
+                      label={t('admin:connections.homeAssistantEntity')}
+                      value={homeAssistantDraft.weather_entity || ''}
+                      onChange={(e) => setHomeAssistantDraft(prev => ({ ...prev, weather_entity: e.target.value }))}
+                    >
+                      {homeAssistantEntities.map((entity) => (
+                        <MenuItem key={entity.entity_id} value={entity.entity_id}>
+                          {entity.name} ({entity.entity_id})
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                ) : (
+                  <TextField
+                    fullWidth
+                    label={t('admin:connections.homeAssistantEntity')}
+                    value={homeAssistantDraft.weather_entity}
+                    onChange={(e) => setHomeAssistantDraft(prev => ({ ...prev, weather_entity: e.target.value }))}
+                    sx={{ mb: 2 }}
+                    placeholder="weather.home"
+                    helperText={t('admin:connections.homeAssistantEntityHelp')}
+                  />
+                )}
+
+                {homeAssistantTestResult && (
+                  <Alert severity={homeAssistantTestResult.ok ? 'success' : 'error'} sx={{ mb: 2 }}>
+                    {homeAssistantTestResult.message}
+                    {homeAssistantTestResult.version ? ` (${homeAssistantTestResult.version})` : ''}
+                  </Alert>
+                )}
+
+                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mt: 1, mb: 2 }}>
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    disabled={isLoading}
+                    startIcon={<Save />}
+                  >
+                    {isLoading ? t('common:state.saving') : t('admin:connections.saveHomeAssistant')}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outlined"
+                    disabled={isTestingHomeAssistant || !homeAssistantStatus?.has_token}
+                    onClick={testHomeAssistantConnection}
+                  >
+                    {isTestingHomeAssistant
+                      ? t('admin:connections.testing')
+                      : t('admin:connections.testConnection')}
+                  </Button>
+                </Box>
               </Box>
 
               <Divider sx={{ my: 2 }} />
@@ -3184,7 +3971,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         <Card>
           <CardContent>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-              <Typography variant="h6">About</Typography>
+              <Typography variant="h6">{t('admin:about.heading')}</Typography>
               <Button
                 variant="outlined"
                 startIcon={<Refresh />}
@@ -3196,7 +3983,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
             </Box>
 
             <Alert severity="info" sx={{ mb: 2 }}>
-              This tab shows build metadata for the running client and server plus any Git tags that point to each commit.
+              {t('admin:about.help')}
             </Alert>
 
             {aboutError && (
@@ -3207,157 +3994,29 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
 
             <Grid container spacing={2}>
               <Grid size={{ xs: 12, md: 6 }}>
-                <Paper variant="outlined" sx={{ p: 2, height: '100%' }}>
-                  <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1 }}>
-                    Frontend
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Version
-                  </Typography>
-                  <Chip label={FRONTEND_VERSION || 'Unknown'} color="primary" size="small" sx={{ mb: 2 }} />
-
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Commit
-                  </Typography>
-                  {frontendCommitUrl ? (
-                    <Button
-                      component="a"
-                      href={frontendCommitUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      variant="text"
-                      size="small"
-                      endIcon={<OpenInNew fontSize="small" />}
-                      sx={{ p: 0, minWidth: 0, textTransform: 'none', mb: 2 }}
-                    >
-                      {toShortCommit(FRONTEND_GIT_COMMIT)}
-                    </Button>
-                  ) : (
-                    <Typography variant="body2" sx={{ mb: 2 }}>Unknown</Typography>
-                  )}
-
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Repository
-                  </Typography>
-                  <Button
-                    component="a"
-                    href={`https://github.com/${frontendRepository}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    variant="text"
-                    size="small"
-                    endIcon={<OpenInNew fontSize="small" />}
-                    sx={{ p: 0, minWidth: 0, textTransform: 'none', mb: 2 }}
-                  >
-                    {frontendRepository}
-                  </Button>
-
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Tags for this commit
-                  </Typography>
-                  {aboutTagsLoading ? (
-                    <CircularProgress size={16} />
-                  ) : frontendCommitTags.length > 0 ? (
-                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                      {frontendCommitTags.map((tagName) => {
-                        const tagUrl = buildTagUrl(frontendRepository, tagName);
-                        return tagUrl ? (
-                          <Chip
-                            key={`frontend-tag-${tagName}`}
-                            label={tagName}
-                            component="a"
-                            href={tagUrl}
-                            clickable
-                            target="_blank"
-                            rel="noreferrer"
-                            size="small"
-                          />
-                        ) : (
-                          <Chip key={`frontend-tag-${tagName}`} label={tagName} size="small" />
-                        );
-                      })}
-                    </Box>
-                  ) : (
-                    <Typography variant="body2" color="text.secondary">No tags found for this commit.</Typography>
-                  )}
-                </Paper>
+                <VersionInfoCard
+                  label={t('admin:about.frontend')}
+                  version={FRONTEND_VERSION}
+                  commitUrl={frontendCommitUrl}
+                  commitHash={FRONTEND_GIT_COMMIT}
+                  repository={frontendRepository}
+                  tags={frontendCommitTags}
+                  tagsLoading={aboutTagsLoading}
+                  buildTagUrl={buildTagUrl}
+                />
               </Grid>
 
               <Grid size={{ xs: 12, md: 6 }}>
-                <Paper variant="outlined" sx={{ p: 2, height: '100%' }}>
-                  <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1 }}>
-                    Backend
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Version
-                  </Typography>
-                  <Chip label={backendStats?.version || 'Unknown'} color="primary" size="small" sx={{ mb: 2 }} />
-
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Commit
-                  </Typography>
-                  {backendCommitUrl ? (
-                    <Button
-                      component="a"
-                      href={backendCommitUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      variant="text"
-                      size="small"
-                      endIcon={<OpenInNew fontSize="small" />}
-                      sx={{ p: 0, minWidth: 0, textTransform: 'none', mb: 2 }}
-                    >
-                      {toShortCommit(backendStats?.commit)}
-                    </Button>
-                  ) : (
-                    <Typography variant="body2" sx={{ mb: 2 }}>Unknown</Typography>
-                  )}
-
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Repository
-                  </Typography>
-                  <Button
-                    component="a"
-                    href={`https://github.com/${backendRepository}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    variant="text"
-                    size="small"
-                    endIcon={<OpenInNew fontSize="small" />}
-                    sx={{ p: 0, minWidth: 0, textTransform: 'none', mb: 2 }}
-                  >
-                    {backendRepository}
-                  </Button>
-
-                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                    Tags for this commit
-                  </Typography>
-                  {aboutTagsLoading ? (
-                    <CircularProgress size={16} />
-                  ) : backendCommitTags.length > 0 ? (
-                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                      {backendCommitTags.map((tagName) => {
-                        const tagUrl = buildTagUrl(backendRepository, tagName);
-                        return tagUrl ? (
-                          <Chip
-                            key={`backend-tag-${tagName}`}
-                            label={tagName}
-                            component="a"
-                            href={tagUrl}
-                            clickable
-                            target="_blank"
-                            rel="noreferrer"
-                            size="small"
-                          />
-                        ) : (
-                          <Chip key={`backend-tag-${tagName}`} label={tagName} size="small" />
-                        );
-                      })}
-                    </Box>
-                  ) : (
-                    <Typography variant="body2" color="text.secondary">No tags found for this commit.</Typography>
-                  )}
-                </Paper>
+                <VersionInfoCard
+                  label={t('admin:about.backend')}
+                  version={backendStats?.version}
+                  commitUrl={backendCommitUrl}
+                  commitHash={backendStats?.commit}
+                  repository={backendRepository}
+                  tags={backendCommitTags}
+                  tagsLoading={aboutTagsLoading}
+                  buildTagUrl={buildTagUrl}
+                />
               </Grid>
             </Grid>
           </CardContent>
@@ -3369,73 +4028,54 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         open={tabIconModalState.open}
         onClose={closeTabEditorDialog}
         onSave={saveTabDefinition}
-        title={tabIconModalState.mode === 'edit' ? 'Edit Tab' : 'Create New Tab'}
-        saveButtonText={tabIconModalState.mode === 'edit' ? 'Save Changes' : 'Create Tab'}
+        title={tabIconModalState.mode === 'edit' ? t('admin:tabs.editTitle') : t('admin:tabs.createTitle')}
+        saveButtonText={tabIconModalState.mode === 'edit' ? t('admin:tabs.saveChanges') : t('admin:tabs.createButton')}
         initialData={tabIconModalState.initialData}
       />
 
-      <Dialog
+      <DeleteConfirmationDialog
         open={deleteTabDialog.open}
         onClose={() => setDeleteTabDialog({ open: false, tab: null })}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Warning color="error" />
-            <Typography variant="h6">Delete Tab</Typography>
-          </Box>
-        </DialogTitle>
-        <DialogContent>
-          <Alert severity="warning" sx={{ mb: 2 }}>
-            Widgets assigned to this tab will be moved by the server rules for deleted tabs.
-          </Alert>
-          <Typography>
-            Are you sure you want to delete <strong>{deleteTabDialog.tab?.label}</strong>?
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDeleteTabDialog({ open: false, tab: null })} variant="outlined">
-            Cancel
-          </Button>
-          <Button onClick={confirmDeleteTab} variant="contained" color="error" startIcon={<Delete />}>
-            Delete Tab
-          </Button>
-        </DialogActions>
-      </Dialog>
+        onConfirm={confirmDeleteTab}
+        title={t('admin:tabs.deleteTab')}
+        itemName={deleteTabDialog.tab?.label}
+        itemLabel="Tab"
+        warningMessage="Widgets assigned to this tab will be moved by the server rules for deleted tabs."
+      />
 
       <Dialog
         open={copyDeviceDialog.open}
         onClose={() => setCopyDeviceDialog({ open: false, device: null })}
         maxWidth="sm"
         fullWidth
+        fullScreen={isMobile}
       >
         <DialogTitle>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
             <Warning color="warning" />
-            <Typography variant="h6">Copy Device Settings</Typography>
+            <Typography variant="h6">{t('admin:devices.copyTitle')}</Typography>
           </Box>
         </DialogTitle>
         <DialogContent>
           <Alert severity="warning" sx={{ mb: 2 }}>
-            This action will COPY all tabs and widget settings from the selected device to this current client.
+            {t('admin:devices.copyExplain')}
           </Alert>
           <Typography sx={{ mb: 2 }}>
-            This will overwrite all current tabs and widget assignments.
+            {t('admin:devices.copyWarning')}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Source device: <strong>{copyDeviceDialog.device?.name}</strong>
+            {t('admin:devices.sourceDevice')} <strong>{copyDeviceDialog.device?.name}</strong>
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Destination device: <strong>{currentDeviceName}</strong>
+            {t('admin:devices.destinationDevice')} <strong>{currentDeviceName}</strong>
           </Typography>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setCopyDeviceDialog({ open: false, device: null })} variant="outlined">
-            Cancel
+            {t('common:actions.cancel')}
           </Button>
           <Button onClick={confirmCopyDeviceToCurrent} variant="contained" color="warning" startIcon={<ContentCopy />}>
-            Confirm Copy
+            {t('admin:devices.confirmCopy')}
           </Button>
         </DialogActions>
       </Dialog>
@@ -3445,17 +4085,18 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         onClose={() => setRenameDeviceDialog({ open: false, currentName: '', newName: '', error: '' })}
         maxWidth="sm"
         fullWidth
+        fullScreen={isMobile}
       >
         <DialogTitle>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
             <Edit color="primary" />
-            <Typography variant="h6">Rename Current Device Name</Typography>
+            <Typography variant="h6">{t('admin:devices.renameTitle')}</Typography>
           </Box>
         </DialogTitle>
         <DialogContent>
           <TextField
             fullWidth
-            label="New Device Name"
+            label={t('admin:devices.newName')}
             value={renameDeviceDialog.newName}
             onChange={(e) => setRenameDeviceDialog(prev => ({ ...prev, newName: e.target.value, error: '' }))}
             error={Boolean(renameDeviceDialog.error)}
@@ -3466,85 +4107,39 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setRenameDeviceDialog({ open: false, currentName: '', newName: '', error: '' })} variant="outlined">
-            Cancel
+            {t('common:actions.cancel')}
           </Button>
           <Button onClick={confirmRenameDevice} variant="contained" startIcon={<Save />}>
-            Save Name
+            {t('admin:devices.saveName')}
           </Button>
         </DialogActions>
       </Dialog>
 
-      <Dialog
+      <DeleteConfirmationDialog
         open={deleteDeviceDialog.open}
         onClose={() => setDeleteDeviceDialog({ open: false, device: null })}
-        maxWidth="sm"
-        fullWidth
-      >
-        <DialogTitle>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Warning color="error" />
-            <Typography variant="h6">Delete Device</Typography>
-          </Box>
-        </DialogTitle>
-        <DialogContent>
-          <Alert severity="warning" sx={{ mb: 2 }}>
-            This action cannot be undone.
-          </Alert>
-          <Typography>
-            Are you sure you want to delete device <strong>{deleteDeviceDialog.device?.name}</strong>?
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDeleteDeviceDialog({ open: false, device: null })} variant="outlined">
-            Cancel
-          </Button>
-          <Button onClick={confirmDeleteDevice} variant="contained" color="error" startIcon={<Delete />}>
-            Delete Device
-          </Button>
-        </DialogActions>
-      </Dialog>
+        onConfirm={confirmDeleteDevice}
+        title={t('admin:devices.deleteDevice')}
+        itemName={deleteDeviceDialog.device?.name}
+        itemLabel="Device"
+        warningMessage="This action cannot be undone."
+      />
 
       {/* User Delete Confirmation Dialog */}
-      <Dialog
+      <DeleteConfirmationDialog
         open={deleteUserDialog.open}
         onClose={() => setDeleteUserDialog({ open: false, user: null })}
-        maxWidth="sm"
-        fullWidth
+        onConfirm={() => deleteUser(deleteUserDialog.user?.id)}
+        title={t('admin:users.deleteUser')}
+        itemName={deleteUserDialog.user?.username}
+        itemLabel="User"
+        warningMessage="This action cannot be undone!"
+        confirmLabel="Delete User & Chores"
       >
-        <DialogTitle>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Warning color="error" />
-            <Typography variant="h6">Delete User</Typography>
-          </Box>
-        </DialogTitle>
-        <DialogContent>
-          <Alert severity="warning" sx={{ mb: 2 }}>
-            This action cannot be undone!
-          </Alert>
-          <Typography variant="body1" sx={{ mb: 2 }}>
-            Are you sure you want to delete user <strong>{deleteUserDialog.user?.username}</strong>?
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            This will also delete all {getUserChoreCount(deleteUserDialog.user?.id || 0)} chores assigned to this user.
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={() => setDeleteUserDialog({ open: false, user: null })}
-            variant="outlined"
-          >
-            Cancel
-          </Button>
-          <Button
-            onClick={() => deleteUser(deleteUserDialog.user?.id)}
-            variant="contained"
-            color="error"
-            startIcon={<Delete />}
-          >
-            Delete User & Chores
-          </Button>
-        </DialogActions>
-      </Dialog>
+        <Typography variant="body2" color="text.secondary">
+          This will also delete all {getUserChoreCount(deleteUserDialog.user?.id || 0)} chores assigned to this user.
+        </Typography>
+      </DeleteConfirmationDialog>
 
       {/* User Chores Modal */}
       <Dialog
@@ -3552,6 +4147,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         onClose={closeChoreModal}
         maxWidth="md"
         fullWidth
+        fullScreen={isMobile}
       >
         <DialogTitle>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -3568,47 +4164,47 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         <DialogContent>
           {choreModal.userChores.length === 0 ? (
             <Typography variant="body1" color="text.secondary" sx={{ py: 2, textAlign: 'center' }}>
-              No chores assigned to this user.
+              {t('admin:chores.noChoresForUser')}
             </Typography>
           ) : (
             <TableContainer component={Paper} sx={{ mt: 1 }}>
-              <Table>
+              <Table sx={stackableTableSx}>
                 <TableHead>
                   <TableRow>
-                    <TableCell>Title</TableCell>
-                    <TableCell>Description</TableCell>
-                    <TableCell>Schedule (Crontab)</TableCell>
-                    <TableCell>Visible</TableCell>
-                    <TableCell>Clams</TableCell>
-                    <TableCell>Actions</TableCell>
+                    <TableCell>{t('common:labels.title')}</TableCell>
+                    <TableCell>{t('common:labels.description')}</TableCell>
+                    <TableCell>{t('admin:chores.scheduleCrontab')}</TableCell>
+                    <TableCell>{t('admin:chores.visible')}</TableCell>
+                    <TableCell>{t('admin:chores.clams')}</TableCell>
+                    <TableCell>{t('common:labels.actions')}</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
                   {choreModal.userChores.map((chore) => (
                     <TableRow key={chore.id}>
-                      <TableCell>
+                      <TableCell data-label={t('common:labels.title')}>
                         <Typography variant="body2" sx={{ fontWeight: 'bold' }}>
                           {chore.title}
                         </Typography>
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('common:labels.description')}>
                         <Typography variant="body2" color="text.secondary">
                           {chore.description || 'No description'}
                         </Typography>
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:chores.schedule')}>
                         <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
                           {chore.crontab || 'One-time'}
                         </Typography>
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:chores.visible')}>
                         <Chip
                           label={chore.visible ? 'Visible' : 'Hidden'}
                           color={chore.visible ? 'success' : 'default'}
                           size="small"
                         />
                       </TableCell>
-                      <TableCell>
+                      <TableCell data-label={t('admin:chores.clams')}>
                         {chore.clam_value > 0 ? (
                           <Chip
                             label={`${chore.clam_value} 🥟`}
@@ -3617,7 +4213,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                           />
                         ) : (
                           <Typography variant="body2" color="text.secondary">
-                            Regular
+                            {t('admin:chores.regular')}
                           </Typography>
                         )}
                       </TableCell>
@@ -3626,7 +4222,7 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
                           onClick={() => deleteChore(chore.id)}
                           color="error"
                           size="small"
-                          title="Delete chore"
+                          title={t('admin:chores.deleteChore')}
                         >
                           <Delete />
                         </IconButton>
@@ -3640,93 +4236,13 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         </DialogContent>
         <DialogActions>
           <Button onClick={closeChoreModal} variant="contained">
-            Close
+            {t('common:actions.close')}
           </Button>
         </DialogActions>
       </Dialog>
 
       {/* Loading Indicator */}
-      <Backdrop
-        sx={{
-          color: '#fff',
-          zIndex: (theme) => theme.zIndex.drawer + 1,
-          backdropFilter: 'blur(10px)',
-          backgroundColor: 'rgba(0, 0, 0, 0.3)',
-        }}
-        open={isLoading}
-      >
-        <Box
-          sx={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: 3,
-            p: 4,
-            borderRadius: 3,
-            background: 'rgba(255, 255, 255, 0.1)',
-            backdropFilter: 'blur(20px)',
-            border: '1px solid rgba(255, 255, 255, 0.2)',
-            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
-          }}
-        >
-          <Box
-            sx={{
-              position: 'relative',
-              width: 80,
-              height: 80,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            {[0, 1, 2].map((index) => (
-              <Box
-                key={index}
-                sx={{
-                  position: 'absolute',
-                  fontSize: '2rem',
-                  animation: `clamBounce 1.5s ease-in-out ${index * 0.2}s infinite`,
-                  '@keyframes clamBounce': {
-                    '0%, 80%, 100%': {
-                      transform: 'scale(0.8) translateY(0)',
-                      opacity: 0.6,
-                    },
-                    '40%': {
-                      transform: 'scale(1.2) translateY(-20px)',
-                      opacity: 1,
-                    },
-                  },
-                }}
-              >
-                🥟
-              </Box>
-            ))}
-          </Box>
-
-          <Typography
-            variant="h6"
-            sx={{
-              color: 'white',
-              fontWeight: 'bold',
-              textAlign: 'center',
-              textShadow: '0 2px 4px rgba(0, 0, 0, 0.5)',
-            }}
-          >
-            Processing...
-          </Typography>
-
-          <CircularProgress
-            size={40}
-            thickness={2}
-            sx={{
-              color: 'rgba(255, 255, 255, 0.7)',
-              '& .MuiCircularProgress-circle': {
-                strokeLinecap: 'round',
-              },
-            }}
-          />
-        </Box>
-      </Backdrop>
+      <LoadingBackdrop open={isLoading} />
 
       {/* PIN Modal */}
       <PinModal
@@ -3736,6 +4252,65 @@ const AdminPanel = ({ setWidgetSettings, onPluginsChanged, onTabsChanged }) => {
         mode={pinModal.mode}
         title={pinModal.title}
       />
+
+      <ClamValueModal
+        open={!!clamModalUser}
+        user={clamModalUser}
+        onClose={() => setClamModalUser(null)}
+        onSave={handleClamSave}
+        isSaving={isLoading}
+      />
+
+      {/* Default avatar picker (issue #132) */}
+      <Dialog
+        open={avatarPicker.open}
+        onClose={() => setAvatarPicker({ open: false, userId: null })}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>{t('admin:users.chooseAnAvatar')}</DialogTitle>
+        <DialogContent>
+          {defaultAvatars.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
+              {t('admin:users.noAvatars')}
+            </Typography>
+          ) : (
+            <Box
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(72px, 1fr))',
+                gap: 1.5,
+                pt: 1,
+              }}
+            >
+              {defaultAvatars.map((avatar) => (
+                <Box
+                  key={avatar.filename}
+                  onClick={() => chooseDefaultAvatar(avatar.filename)}
+                  sx={{
+                    display: 'flex',
+                    justifyContent: 'center',
+                    cursor: 'pointer',
+                    borderRadius: 2,
+                    p: 0.75,
+                    '&:hover': { backgroundColor: 'rgba(var(--accent-rgb), 0.12)' },
+                  }}
+                >
+                  <img
+                    src={`${API_BASE_URL}/Uploads/users/${avatar.filename}`}
+                    alt={avatar.name}
+                    loading="lazy"
+                    style={{ width: 56, height: 56, borderRadius: '50%' }}
+                  />
+                </Box>
+              ))}
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAvatarPicker({ open: false, userId: null })}>{t('common:actions.cancel')}</Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

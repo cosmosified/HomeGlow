@@ -1,37 +1,7 @@
 const googleConnection = require('./googleConnection');
 
 const API_BASE = 'https://www.googleapis.com/calendar/v3';
-
-async function googleFetch(accountId, method, pathAndQuery, body) {
-    const accessToken = await googleConnection.getValidAccessToken(accountId);
-    const url = pathAndQuery.startsWith('http') ? pathAndQuery : `${API_BASE}${pathAndQuery}`;
-    const init = {
-        method,
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-        },
-    };
-    if (body !== undefined) {
-        init.headers['Content-Type'] = 'application/json';
-        init.body = JSON.stringify(body);
-    }
-    const res = await fetch(url, init);
-    if (res.status === 204) return null;
-    const text = await res.text();
-    let parsed = null;
-    if (text) {
-        try { parsed = JSON.parse(text); } catch (_) { parsed = { raw: text }; }
-    }
-    if (!res.ok) {
-        const msg = parsed && parsed.error && parsed.error.message ? parsed.error.message : `Google API error ${res.status}`;
-        const err = new Error(msg);
-        err.status = res.status;
-        err.details = parsed;
-        throw err;
-    }
-    return parsed;
-}
+const googleFetch = googleConnection.createGoogleFetch(API_BASE, 'Google Calendar API');
 
 async function listCalendars(accountId) {
     const items = [];
@@ -53,6 +23,41 @@ async function listCalendars(accountId) {
         accessRole: c.accessRole,
         timeZone: c.timeZone,
     }));
+}
+
+// Google's event palette is effectively static, so a long TTL avoids an extra
+// API round trip on every sync.
+const EVENT_COLOR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const eventColorCache = new Map();
+
+// Maps Google's per-event colorId ('1'...'11') to its background hex. Returns
+// an empty map if the palette can't be fetched, which leaves events falling
+// back to their calendar's color rather than showing a wrong one.
+async function listEventColors(accountId) {
+    const cached = eventColorCache.get(accountId);
+    if (cached && Date.now() - cached.fetchedAt < EVENT_COLOR_CACHE_TTL_MS) {
+        return cached.colors;
+    }
+
+    try {
+        const colors = {};
+        const data = await googleFetch(accountId, 'GET', '/colors');
+        if (data && data.event) {
+            for (const [colorId, value] of Object.entries(data.event)) {
+                if (value && value.background) colors[colorId] = value.background;
+            }
+        }
+        // Only successful fetches are cached. Caching an empty palette after a
+        // transient failure would strip per-event colors for the whole TTL —
+        // and since the hex is resolved into raw_data at sync time, events
+        // synced during that window stay uncolored until a later sync. Retrying
+        // on the next sync costs one request and surfaces the error in the log.
+        eventColorCache.set(accountId, { colors, fetchedAt: Date.now() });
+        return colors;
+    } catch (error) {
+        console.error('Error fetching Google event colors:', error.message);
+        return {};
+    }
 }
 
 function parseEventDate(dt) {
@@ -131,6 +136,7 @@ async function deleteEvent(accountId, calendarId, eventId) {
 
 module.exports = {
     listCalendars,
+    listEventColors,
     listEvents,
     createEvent,
     updateEvent,

@@ -7,6 +7,7 @@ module.exports = {
     Setting: require('./Setting'),
     AdminPin: require('./AdminPin'),
     Prize: require('./Prize'),
+    PrizeOffer: require('./PrizeOffer'),
     Chore: require('./Chore'),
     ChoreSchedule: require('./ChoreSchedule'),
     ChoreHistory: require('./ChoreHistory'),
@@ -21,4 +22,6 @@ module.exports = {
     Tab: require('./Tab'),
     GoogleAccount: require('./GoogleAccount'),
     GoogleOauthState: require('./GoogleOauthState'),
+    Plugin: require('./Plugin'),
+    PluginStorage: require('./PluginStorage'),
 };

@@ -5,6 +5,7 @@ const { Model } = require('objection');
 const googleConnection = require('./googleConnection');
 const googleCalendar = require('./googleCalendar');
 const appleCalDAV = require('./appleCalDAV');
+const { dedupeCalendarEvents } = require('../utils/calendarDedup');
 
 class CalendarSyncService {
   constructor(db, decryptPassword) {
@@ -61,6 +62,14 @@ class CalendarSyncService {
       if (!source) {
         console.log(`Source ${sourceId} not found or disabled`);
         return { success: false, error: 'Source not found or disabled' };
+      }
+
+      // Placeholder sources on the RFC 2606 reserved ".invalid" TLD can never
+      // resolve (the demo's baked "Family Calendar" uses one to carry its
+      // pre-cached events). Skip them silently instead of recording a
+      // misleading error status.
+      if (this.isPlaceholderUrl(source.url)) {
+        return { skipped: true };
       }
 
       console.log(`Starting sync for calendar source: ${source.name} (${source.type})`);
@@ -235,6 +244,7 @@ class CalendarSyncService {
     const timeMin = new Date(now - 13 * 30 * 24 * 60 * 60 * 1000);
     const timeMax = new Date(now + 13 * 30 * 24 * 60 * 60 * 1000);
     const items = await googleCalendar.listEvents(account.id, calendarId, { timeMin, timeMax });
+    const eventColors = await googleCalendar.listEventColors(account.id);
 
     const out = [];
     for (const item of items) {
@@ -247,6 +257,10 @@ class CalendarSyncService {
       if (start.allDay) {
         endDate = new Date(endDate.getTime() - 24 * 60 * 60 * 1000);
       }
+      // colorId is only set when the event was individually recolored in
+      // Google; events on the calendar's default color omit it entirely, and
+      // those fall through to the source color at read time.
+      const colorId = item.colorId || null;
       out.push({
         uid: item.id,
         title: item.summary || 'Untitled Event',
@@ -255,10 +269,24 @@ class CalendarSyncService {
         description: item.description || null,
         location: item.location || null,
         all_day: !!start.allDay,
-        raw: { googleEventId: item.id, htmlLink: item.htmlLink, etag: item.etag },
+        raw: {
+          googleEventId: item.id,
+          htmlLink: item.htmlLink,
+          etag: item.etag,
+          colorId,
+          eventColor: colorId ? (eventColors[colorId] || null) : null,
+        },
       });
     }
     return out;
+  }
+
+  isPlaceholderUrl(url) {
+    try {
+      return new URL(url).hostname.toLowerCase().endsWith('.invalid');
+    } catch {
+      return false;
+    }
   }
 
   async syncAllSources() {
@@ -272,6 +300,19 @@ class CalendarSyncService {
     }
 
     return results;
+  }
+
+  // Pulls the per-event color out of a cached row's raw_data. Rows written
+  // before this field existed, and non-Google sources, simply have no value.
+  parseEventColor(rawData) {
+    if (!rawData) return null;
+    try {
+      const parsed = JSON.parse(rawData);
+      const color = parsed && parsed.eventColor;
+      return typeof color === 'string' && /^#[0-9a-fA-F]{6}$/.test(color) ? color : null;
+    } catch {
+      return null;
+    }
   }
 
   async getCachedEvents(startDate, endDate) {
@@ -293,7 +334,7 @@ class CalendarSyncService {
 
     const rows = await query;
 
-    return rows.map(row => {
+    const events = rows.map(row => {
       const source = sourceMap.get(row.source_id);
       return {
         id: row.event_uid,
@@ -305,9 +346,30 @@ class CalendarSyncService {
         all_day: row.all_day === 1,
         source_id: row.source_id,
         source_name: source?.name || 'Unknown',
-        source_color: source?.color || '#6e44ff'
+        source_color: source?.color || '#6e44ff',
+        // Set only for events individually recolored in Google; null otherwise
+        // so the client falls back to source_color.
+        event_color: this.parseEventColor(row.raw_data)
       };
     });
+
+    // On by default: merge the same event synced from multiple calendars.
+    // Users can opt out by explicitly setting CALENDAR_DEDUP_ENABLED='false'.
+    if (await this.isDedupEnabled()) {
+      return dedupeCalendarEvents(events);
+    }
+    return events;
+  }
+
+  async isDedupEnabled() {
+    try {
+      const knex = Model.knex();
+      const row = await knex('settings').select('value').where('key', 'CALENDAR_DEDUP_ENABLED').first();
+      // Absent setting means default (enabled); only an explicit 'false' disables.
+      return row?.value !== 'false';
+    } catch {
+      return true;
+    }
   }
 
   async getSyncStatus(sourceId) {

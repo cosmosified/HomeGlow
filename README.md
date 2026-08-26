@@ -1,4 +1,4 @@
-<img width="252" height="199" alt="Image" src="https://github.com/user-attachments/assets/b75dbb9d-8abc-4c86-b5a3-c0083395e413" />
+<img width="233" height="181" alt="HomeGlowLogo" src="https://github.com/user-attachments/assets/6442af5c-f6a0-44d6-83b3-4c2767bc36bb" />
 
 Discord: https://discord.gg/Ea5kbC5wFv | Demo: https://demo.homeglow.dev
 
@@ -177,7 +177,5 @@ This project is open-source and available under the [AGPL v3.0](LICENSE).
 **HomeGlow** - Transform your home with a beautiful, intelligent dashboard that grows with your family's needs.
 
 <img width="1148" height="1920" alt="image" src="https://github.com/user-attachments/assets/4588fe42-10e4-484e-85a0-39e5516095c8" />
-
-
 
 ENJOY!

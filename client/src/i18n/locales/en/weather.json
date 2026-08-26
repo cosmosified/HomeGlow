@@ -1,0 +1,66 @@
+{
+  "widget": {
+    "title": "Weather",
+    "noData": "No weather data available",
+    "openSettings": "Open Settings",
+    "openSettingsAria": "Open weather widget settings",
+    "airQuality": "Air Quality",
+    "serviceError": "Weather service error: {{status}} {{statusText}}",
+    "loadingData": "Loading weather data...",
+    "loadingSettings": "Loading weather settings...",
+    "forecastHeading": "3-Day Forecast",
+    "feelsLike": "Feels like {{value}}",
+    "humidity": "Humidity: {{value}}%",
+    "wind": "Wind: {{value}}"
+  },
+  "units": {
+    "milesPerHour": "mph",
+    "metersPerSecond": "m/s"
+  },
+  "conditions": {
+    "clear-night": "clear night",
+    "cloudy": "cloudy",
+    "exceptional": "exceptional",
+    "fog": "fog",
+    "hail": "hail",
+    "lightning": "thunderstorm",
+    "lightning-rainy": "thunderstorm with rain",
+    "partlycloudy": "partly cloudy",
+    "pouring": "heavy rain",
+    "rainy": "rain",
+    "snowy": "snow",
+    "snowy-rainy": "sleet",
+    "sunny": "sunny",
+    "windy": "windy",
+    "windy-variant": "windy"
+  },
+  "airQuality": {
+    "good": "Good",
+    "fair": "Fair",
+    "moderate": "Moderate",
+    "poor": "Poor",
+    "veryPoor": "Very Poor",
+    "unknown": "Unknown"
+  },
+  "settings": {
+    "title": "Weather Widget Settings",
+    "scopeNote": "These settings apply only to this tab's weather widget instance.",
+    "location": "Location",
+    "locationHelp": "Examples: Sydney,AU or 14818,US",
+    "temperatureUnit": "Temperature Unit",
+    "fahrenheit": "Fahrenheit (°F)",
+    "celsius": "Celsius (°C)",
+    "layoutMode": "Layout Mode",
+    "layoutAuto": "Auto (based on widget size)",
+    "layoutCompact": "Compact",
+    "layoutMedium": "Medium",
+    "layoutFull": "Full"
+  },
+  "errors": {
+    "enterLocation": "Please enter a location.",
+    "invalidLocation": "Invalid location. Try a city and country code like \"Sydney,AU\" or a postal code like \"14818,US\".",
+    "badCredentials": "The weather provider rejected the saved credentials. Check them in the Admin Panel's Connections tab.",
+    "providerUnreachable": "Could not reach the weather provider. Check that it is running and reachable from HomeGlow.",
+    "fetchFailed": "Failed to fetch weather data. Please try again later."
+  }
+}

@@ -2,6 +2,22 @@
 require('dotenv').config();
 
 const APP_TIMEZONE = process.env.TZ || 'America/New_York';
+
+// Demo mode: a single opt-in flag for running a public, throwaway demo
+// instance. It uses an in-memory database (wiped on container stop), disables
+// the admin PIN, seeds sample data (re-seeded every DEMO_RESET_HOURS), and
+// blocks routes that a public visitor could abuse (uploads, outbound fetch
+// proxies, OAuth credential storage). Never enabled unless DEMO_MODE=true.
+const DEMO_MODE = process.env.DEMO_MODE === 'true';
+const DEMO_RESET_HOURS = 6;
+
+// Guard for routes disabled in demo mode. Sends a 403 and returns true when
+// the request should stop (send-reply-then-return convention).
+const demoBlocked = (reply) => {
+  if (!DEMO_MODE) return false;
+  reply.status(403).send({ error: 'This feature is disabled in demo mode.' });
+  return true;
+};
 process.env.TZ = APP_TIMEZONE;
 
 const fastify = require('fastify')({ logger: true });
@@ -9,7 +25,7 @@ const Database = require('better-sqlite3');
 const { Model } = require('objection');
 const { createKnex } = require('./db/knex');
 const { adoptOrMigrate } = require('./db/migrate');
-const { Setting, AdminPin, Prize, User, Chore, ChoreSchedule, ChoreHistory, Event, CalendarSource, CalendarEventsCache, CalendarSyncStatus, PhotoSource, GooglePickedMedia, HomeglowPhoto, Device, Tab } = require('./db/models');
+const { Setting, AdminPin, Prize, PrizeOffer, User, Chore, ChoreSchedule, ChoreHistory, Event, CalendarSource, CalendarEventsCache, CalendarSyncStatus, PhotoSource, GooglePickedMedia, HomeglowPhoto, Device, Tab, Plugin, PluginStorage } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -27,6 +43,66 @@ const cron = require('node-cron');
 // For widget upload and registry
 const widgetRegistryPath = path.join(__dirname, 'widgets_registry.json');
 
+// Chore notification sounds: bundled defaults (in the image) seeded into the
+// persisted uploads volume, plus user uploads. Served via the /Uploads/ static root.
+const DEFAULT_SOUNDS_DIR = path.join(__dirname, 'assets', 'sounds');
+const SOUNDS_UPLOAD_DIR = path.join(__dirname, 'uploads', 'sounds');
+const ALLOWED_SOUND_EXTENSIONS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.aac']);
+
+function getDefaultSoundFilenames() {
+  try {
+    return new Set(fsSync.readdirSync(DEFAULT_SOUNDS_DIR));
+  } catch {
+    return new Set();
+  }
+}
+
+async function seedDefaultSounds() {
+  await fs.mkdir(SOUNDS_UPLOAD_DIR, { recursive: true });
+  let defaults = [];
+  try {
+    defaults = await fs.readdir(DEFAULT_SOUNDS_DIR);
+  } catch {
+    return; // No bundled defaults present; nothing to seed.
+  }
+
+  for (const filename of defaults) {
+    const target = path.join(SOUNDS_UPLOAD_DIR, filename);
+    try {
+      await fs.access(target);
+    } catch {
+      await fs.copyFile(path.join(DEFAULT_SOUNDS_DIR, filename), target);
+      console.log(`Seeded default sound: ${filename}`);
+    }
+  }
+}
+
+// Default profile avatars (issue #132): bundled flat SVG art seeded into the
+// persisted uploads volume under users/defaults/, so a selected default is
+// served by the exact same /Uploads/users/<profile_picture> path the client
+// already uses for uploaded pictures.
+const DEFAULT_AVATARS_DIR = path.join(__dirname, 'assets', 'avatars');
+const AVATARS_UPLOAD_DIR = path.join(__dirname, 'uploads', 'users', 'defaults');
+
+async function seedDefaultAvatars() {
+  await fs.mkdir(AVATARS_UPLOAD_DIR, { recursive: true });
+  let defaults = [];
+  try {
+    defaults = await fs.readdir(DEFAULT_AVATARS_DIR);
+  } catch {
+    return; // No bundled defaults present; nothing to seed.
+  }
+
+  for (const filename of defaults) {
+    const target = path.join(AVATARS_UPLOAD_DIR, filename);
+    try {
+      await fs.access(target);
+    } catch {
+      await fs.copyFile(path.join(DEFAULT_AVATARS_DIR, filename), target);
+    }
+  }
+}
+
 // Calendar sync service
 const CalendarSyncService = require('./services/calendarSync');
 const googleConnection = require('./services/googleConnection');
@@ -34,9 +110,45 @@ const googleCalendar = require('./services/googleCalendar');
 const appleCalDAV = require('./services/appleCalDAV');
 const googlePhotos = require('./services/googlePhotos');
 const googlePhotosPicker = require('./services/googlePhotosPicker');
-const { isEncryptionConfigured, getEncryptionStatus } = require('./utils/encryption');
+const homeAssistant = require('./services/homeAssistant');
+const weatherService = require('./services/weather');
+const { computeSunTimes } = require('./services/weather/sun');
+const {
+  isEncryptionConfigured,
+  getEncryptionStatus,
+  encrypt,
+  decrypt,
+  isLegacyCiphertext,
+  decryptLegacy,
+} = require('./utils/encryption');
+const { httpsAgentFor, isCertificateVerificationSkipped } = require('./utils/outboundTls');
+
+// Certificate policy for every outbound axios request, decided per URL from the
+// target's address class (issue #139). Registered on the default axios instance,
+// which is shared by every module that requires axios — the calendar sync
+// service and the Apple CalDAV client included — so no call site has to remember
+// this, and a new one cannot forget it.
+//
+// Public hosts are always verified. Private ones (RFC1918, loopback, .local and
+// friends) accept a self-signed certificate, because that is the normal case for
+// a NAS or a photo server on the household's own network and there is no public
+// CA that would ever issue for 192.168.1.50.
+axios.interceptors.request.use((config) => {
+  try {
+    const resolved = config.baseURL && !/^https?:\/\//i.test(config.url || '')
+      ? new URL(config.url || '', config.baseURL)
+      : new URL(config.url);
+    const agent = httpsAgentFor(resolved);
+    if (agent) config.httpsAgent = agent;
+  } catch (_) {
+    // Not a URL we can classify; axios will fail on it anyway, and leaving the
+    // config untouched means Node's default (verify) applies.
+  }
+  return config;
+});
 let calendarSyncService = null;
 
+const pluginEvents = require('./services/pluginEvents');
 const initializeDatabase = require('./migrations/initializeDatabase');
 const migrateChoresDatabase = require('./migrations/migrateChoresDatabase');
 const migrateClamsToHistory = require('./migrations/migrateClamsToHistory');
@@ -58,10 +170,30 @@ const schemaMigrations = [
   { schemaId: 12, migrationPath: './migrations/schema12-onceCompletedScheduling', },
   { schemaId: 13, migrationPath: './migrations/schema13-tabsByDefaultBackfill', },
   { schemaId: 14, migrationPath: './migrations/schema14-deviceAndTabJsonStorage', },
+  { schemaId: 15, migrationPath: './migrations/schema15-choreDueTimeSound', },
+  { schemaId: 16, migrationPath: './migrations/schema16-choreDueDate', },
+  { schemaId: 17, migrationPath: './migrations/schema17-choreTransferSnooze', },
+  { schemaId: 18, migrationPath: './migrations/schema18-pluginsTable', },
+  { schemaId: 19, migrationPath: './migrations/schema19-pluginStorage', },
+  { schemaId: 20, migrationPath: './migrations/schema20-choreHistoryKind', },
+  { schemaId: 21, migrationPath: './migrations/schema21-prizeOffers', },
+  { schemaId: 22, migrationPath: './migrations/schema22-prizeRepeatSplit', },
+  { schemaId: 23, migrationPath: './migrations/schema23-userSortOrder', },
+  { schemaId: 24, migrationPath: './migrations/schema24-choreIcon', },
+  { schemaId: 25, migrationPath: './migrations/schema25-unifyCredentialEncryption', },
 ];
 
 const ALLOWED_SCHEDULE_DURATIONS = new Set(['day-of', 'until-completed', 'once-completed']);
 const SCHEDULE_INTERVAL_REGEX = /^([1-9]\d*)([dwmy])$/;
+
+// Fisher-Yates in-place shuffle. Mutates and returns the array.
+const shuffleInPlace = (array) => {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+};
 
 // GitHub API configuration
 const GITHUB_REPO_OWNER = 'jherforth';
@@ -111,6 +243,32 @@ function isValidScheduleInterval(intervalValue) {
   return typeof intervalValue === 'string' && SCHEDULE_INTERVAL_REGEX.test(intervalValue);
 }
 
+const DUE_TIME_REGEX = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// Returns { valid, value } where value is a normalized 'HH:MM' string or null.
+function normalizeDueTime(dueTime) {
+  if (dueTime === undefined || dueTime === null || dueTime === '') {
+    return { valid: true, value: null };
+  }
+  const normalized = String(dueTime).trim();
+  if (!DUE_TIME_REGEX.test(normalized)) {
+    return { valid: false, value: null };
+  }
+  return { valid: true, value: normalized };
+}
+
+// Returns { valid, value } where value is a positive integer of minutes or null.
+function normalizeReminderInterval(minutes) {
+  if (minutes === undefined || minutes === null || minutes === '' || Number(minutes) === 0) {
+    return { valid: true, value: null };
+  }
+  const parsed = Number.parseInt(minutes, 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return { valid: false, value: null };
+  }
+  return { valid: true, value: parsed > 0 ? parsed : null };
+}
+
 function parseDateOnlyToLocalDate(dateString) {
   if (typeof dateString !== 'string') {
     return null;
@@ -128,6 +286,126 @@ function parseDateOnlyToLocalDate(dateString) {
 
   return new Date(year, month - 1, day, 0, 0, 0, 0);
 }
+
+const DUE_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+function formatDateOnlyLocal(dateObj) {
+  return `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}-${String(dateObj.getDate()).padStart(2, '0')}`;
+}
+
+function extractDateOnlyString(value) {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    if (DUE_DATE_REGEX.test(normalized)) {
+      return normalized;
+    }
+    const match = normalized.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (match) {
+      return match[1];
+    }
+    return null;
+  }
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return formatDateOnlyLocal(value);
+  }
+
+  return null;
+}
+
+function calculateDateOffsetDays(startDateValue, endDateValue) {
+  const startDateOnly = extractDateOnlyString(startDateValue);
+  const endDateOnly = extractDateOnlyString(endDateValue);
+  if (!startDateOnly || !endDateOnly) {
+    return null;
+  }
+
+  const startDate = parseDateOnlyToLocalDate(startDateOnly);
+  const endDate = parseDateOnlyToLocalDate(endDateOnly);
+  if (!startDate || !endDate) {
+    return null;
+  }
+
+  return Math.round((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+function addDaysToDateOnly(baseDateValue, dayOffset) {
+  if (!Number.isInteger(dayOffset)) {
+    return null;
+  }
+
+  const baseDateOnly = extractDateOnlyString(baseDateValue);
+  if (!baseDateOnly) {
+    return null;
+  }
+
+  const baseDate = parseDateOnlyToLocalDate(baseDateOnly);
+  if (!baseDate) {
+    return null;
+  }
+
+  const resultDate = new Date(baseDate);
+  resultDate.setDate(resultDate.getDate() + dayOffset);
+  return formatDateOnlyLocal(resultDate);
+}
+
+// Returns { valid, value } where value is a normalized 'YYYY-MM-DD' string or null.
+// Rejects malformed strings and impossible calendar dates (e.g. 2026-02-30).
+function normalizeDueDate(dueDate) {
+  if (dueDate === undefined || dueDate === null || dueDate === '') {
+    return { valid: true, value: null };
+  }
+  const normalized = String(dueDate).trim();
+  if (!DUE_DATE_REGEX.test(normalized)) {
+    return { valid: false, value: null };
+  }
+  const parsed = parseDateOnlyToLocalDate(normalized);
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    return { valid: false, value: null };
+  }
+  // Guard against roll-over (e.g. '2026-02-30' -> Mar 2): re-serialize and compare.
+  const roundTrip = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}-${String(parsed.getDate()).padStart(2, '0')}`;
+  if (roundTrip !== normalized) {
+    return { valid: false, value: null };
+  }
+  return { valid: true, value: normalized };
+}
+
+// Snoozed-until is stored as an ISO UTC datetime so server and client compare
+// it against "now" without timezone drift. Empty/null clears the snooze.
+function normalizeSnoozedUntil(snoozedUntil) {
+  if (snoozedUntil === undefined || snoozedUntil === null || snoozedUntil === '') {
+    return { valid: true, value: null };
+  }
+  const parsed = new Date(snoozedUntil);
+  if (Number.isNaN(parsed.getTime())) {
+    return { valid: false, value: null };
+  }
+  return { valid: true, value: parsed.toISOString() };
+}
+
+// Validates the shared schedule due_time / due_date / reminder fields. On the
+// first failure it sends a 400 and returns null; otherwise it returns the three
+// normalized results. Used by the create + bulk-create schedule handlers. The
+// PATCH handler keeps its own guards because it only validates provided fields.
+const validateScheduleDateFields = ({ due_time, due_date, reminder_interval_minutes }, reply) => {
+  const dueTimeResult = normalizeDueTime(due_time);
+  if (!dueTimeResult.valid) {
+    reply.status(400).send({ error: 'due_time must be in HH:MM 24-hour format' });
+    return null;
+  }
+  const dueDateResult = normalizeDueDate(due_date);
+  if (!dueDateResult.valid) {
+    reply.status(400).send({ error: 'due_date must be a valid YYYY-MM-DD date' });
+    return null;
+  }
+  const reminderResult = normalizeReminderInterval(reminder_interval_minutes);
+  if (!reminderResult.valid) {
+    reply.status(400).send({ error: 'reminder_interval_minutes must be a non-negative integer' });
+    return null;
+  }
+  return { dueTimeResult, dueDateResult, reminderResult };
+};
 
 function addMonthsCalendarAware(baseDate, monthCount) {
   const result = new Date(baseDate);
@@ -184,31 +462,29 @@ function buildDateCrontab(dateObj) {
   return `0 0 ${dayOfMonth} ${month} *`;
 }
 
-// Encryption utilities for calendar credentials
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'homeglow-default-key-change-in-production-32bytes';
-const ENCRYPTION_ALGORITHM = 'aes-256-cbc';
-
+// Credential encryption for calendar and photo sources.
+//
+// These used to have their own AES-256-CBC scheme keyed on
+// `ENCRYPTION_KEY || <a string hardcoded in this repository>`, which meant that
+// on any install that did not set the variable — including every install using
+// the stock docker-compose, which never forwarded it — Apple app passwords,
+// Immich API keys and photo refresh tokens were encrypted with a published key.
+//
+// They now use the same auto-keyed AES-256-GCM store as the Google and Home
+// Assistant credentials (utils/encryption.js), which generates and persists its
+// own key and needs no configuration. Values written before that change are
+// still read through the legacy path; migration 25 re-encrypts them in place.
 function encryptPassword(password) {
   if (!password) return null;
-  const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32);
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, key, iv);
-  let encrypted = cipher.update(password, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  return iv.toString('hex') + ':' + encrypted;
+  return encrypt(password);
 }
 
 function decryptPassword(encryptedPassword) {
   if (!encryptedPassword) return null;
   try {
-    const key = crypto.scryptSync(ENCRYPTION_KEY, 'salt', 32);
-    const parts = encryptedPassword.split(':');
-    const iv = Buffer.from(parts[0], 'hex');
-    const encrypted = parts[1];
-    const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv);
-    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
+    return isLegacyCiphertext(encryptedPassword)
+      ? decryptLegacy(encryptedPassword)
+      : decrypt(encryptedPassword);
   } catch (error) {
     console.error('Error decrypting password:', error);
     return null;
@@ -235,16 +511,20 @@ fastify.addHook('preHandler', (request, reply, done) => {
   done();
 });
 
-// Serve static files for uploads
+// Serve static files for uploads.
+//
+// maxAge alone emits `Cache-Control: public, max-age=86400`, so there is no
+// setHeaders callback here on purpose: the one that used to live here only
+// re-set that identical header. Keeping it bought nothing and cost an outage
+// in #136, where v10 changed the callback's first argument from the Node
+// response to a Fastify Reply and `res.setHeader` became an uncaught
+// TypeError that killed the process on the first file request. Headers are
+// deliberately kept minimal to avoid "Request Header Fields Too Large".
 fastify.register(require('@fastify/static'), {
   root: path.join(__dirname, 'uploads'),
   prefix: '/Uploads/',
   decorateReply: false,
   maxAge: 86400000, // 1 day cache
-  setHeaders: (res, path) => {
-    // Minimize headers to avoid "Request Header Fields Too Large" error
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-  }
 });
 
 // Additional static route specifically for user uploads
@@ -253,10 +533,6 @@ fastify.register(require('@fastify/static'), {
   prefix: '/Uploads/users/',
   decorateReply: false,
   maxAge: 86400000, // 1 day cache
-  setHeaders: (res, path) => {
-    // Minimize headers to avoid "Request Header Fields Too Large" error
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-  }
 });
 
 // Serve static files for widgets
@@ -266,39 +542,76 @@ fastify.register(require('@fastify/static'), {
   decorateReply: false
 });
 
-// Add debugging for widget file requests
+// Widget filenames are restricted to this charset at upload/install time; the
+// serve route enforces the same rule so encoded ../ segments can never reach
+// the disk-fallback path.join below (path traversal guard).
+const WIDGET_FILENAME_REGEX = /^[a-zA-Z0-9-._]+$/;
+
+// Serve widget HTML from the DB-backed plugin store (issue #105 Phase 0), with
+// a read-only disk fallback for files that predate the plugins table.
 fastify.get('/widgets/:filename', async (request, reply) => {
   const { filename } = request.params;
-  const filePath = path.join(__dirname, 'widgets', filename);
 
-  console.log(`Widget request for: ${filename}`);
-  console.log(`Looking for file at: ${filePath}`);
+  if (!WIDGET_FILENAME_REGEX.test(filename) || filename.includes('..')) {
+    return reply.status(404).send(`Widget file not found: ${filename}`);
+  }
 
   try {
-    const stats = await fs.stat(filePath);
-    console.log(`File exists, size: ${stats.size} bytes`);
-
-    let content = await fs.readFile(filePath, 'utf-8');
-    console.log(`File content preview: ${content.substring(0, 100)}...`);
+    let content;
+    let pluginId = null;
+    const row = await Plugin.query().select('content', 'plugin_id').where('filename', filename).first();
+    if (row) {
+      content = row.content;
+      pluginId = row.plugin_id;
+    } else {
+      const filePath = path.join(__dirname, 'widgets', filename);
+      content = await fs.readFile(filePath, 'utf-8');
+    }
 
     content = content.replace(/window\.location\.origin\.replace\(['"`]:\d+['"`],\s*['"`]:\d+['"`]\)/g, 'window.location.origin');
     content = content.replace(/\$\{window\.location\.protocol\}\/\/\$\{window\.location\.hostname\}:\d+/g, '${window.location.origin}');
     content = content.replace(/window\.location\.protocol\s*\+\s*'\/\/'\s*\+\s*window\.location\.hostname\s*\+\s*':\d+'/g, 'window.location.origin');
 
-    const overflowFix = `<style>html,body{max-width:100%!important;overflow-x:hidden!important;box-sizing:border-box;}*{box-sizing:border-box;}</style>`;
-    if (content.includes('</head>')) {
-      content = content.replace('</head>', `${overflowFix}</head>`);
+    let injection = `<style>html,body{max-width:100%!important;overflow-x:hidden!important;box-sizing:border-box;}*{box-sizing:border-box;}</style>`;
+    // Manifest plugins get their identity injected so /plugin-sdk/v1.js knows
+    // which storage/settings namespace to talk to. plugin_id is validated to
+    // [a-z0-9-] at install time, so it is safe to embed verbatim.
+    if (pluginId) {
+      injection += `<script>window.__HOMEGLOW_PLUGIN__={id:"${pluginId}",apiVersion:"v1"};</script>`;
+    }
+    // Inject at the START of <head> so the identity script runs before any
+    // plugin script — including an SDK <script src> placed early in head.
+    const headOpen = content.match(/<head\b[^>]*>/i);
+    if (headOpen) {
+      content = content.replace(headOpen[0], `${headOpen[0]}${injection}`);
     } else if (content.includes('<body')) {
-      content = content.replace('<body', `${overflowFix}<body`);
+      content = content.replace('<body', `${injection}<body`);
     } else {
-      content = overflowFix + content;
+      content = injection + content;
     }
 
-    reply.header('Content-Type', 'text/html');
+    reply.header('Content-Type', 'text/html; charset=utf-8');
     return content;
   } catch (error) {
     console.error(`Error serving widget ${filename}:`, error);
     reply.status(404).send(`Widget file not found: ${filename}`);
+  }
+});
+
+// Serve the plugin SDK (issue #105). Cached after first read; versioned by
+// path so a future v2 can coexist with v1.
+let pluginSdkV1Cache = null;
+fastify.get('/plugin-sdk/v1.js', async (request, reply) => {
+  try {
+    if (!pluginSdkV1Cache) {
+      pluginSdkV1Cache = await fs.readFile(path.join(__dirname, 'plugin-sdk', 'v1.js'), 'utf-8');
+    }
+    reply.header('Content-Type', 'application/javascript');
+    reply.header('Cache-Control', 'public, max-age=3600');
+    return pluginSdkV1Cache;
+  } catch (error) {
+    console.error('Error serving plugin SDK:', error);
+    reply.status(500).send('// plugin SDK unavailable');
   }
 });
 
@@ -471,9 +784,200 @@ fastify.get('/index.css', async (request, reply) => {
   }
 });
 
-// --- Widget Upload Endpoint and Registry ---
+// --- Widget Upload Endpoints and Plugin Store ---
+// Plugins live in the `plugins` table (issue #105 Phase 0) so they survive image
+// upgrades; the old widgets_registry.json is only read once by migration 18.
 
-// Helper: Load widget registry
+// A plugin may embed a manifest in its HTML to opt into platform capabilities
+// (issue #105 Phase 1). Plain widgets simply omit the block and work as before.
+//   <script type="application/json" id="homeglow-manifest">{ ... }</script>
+const PLUGIN_MANIFEST_REGEX = /<script[^>]*id=["']homeglow-manifest["'][^>]*>([\s\S]*?)<\/script>/i;
+const PLUGIN_ID_REGEX = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const PLUGIN_SETTING_KEY_REGEX = /^[a-zA-Z][a-zA-Z0-9]{0,63}$/;
+const PLUGIN_SETTING_TYPES = new Set(['number', 'string', 'boolean', 'select']);
+const PLUGIN_SETTING_SCOPES = new Set(['household', 'device']);
+
+// Returns { manifest: object|null, errors: string[] }. A missing block is not
+// an error (legacy widget); a present-but-invalid block is, so a typo'd
+// manifest fails the upload loudly instead of silently installing as legacy.
+function extractPluginManifest(htmlContent) {
+  const match = htmlContent.match(PLUGIN_MANIFEST_REGEX);
+  if (!match) {
+    return { manifest: null, errors: [] };
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(match[1]);
+  } catch (parseError) {
+    return { manifest: null, errors: [`Manifest is not valid JSON: ${parseError.message}`] };
+  }
+
+  const errors = [];
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return { manifest: null, errors: ['Manifest must be a JSON object.'] };
+  }
+  if (manifest.manifestVersion !== 1) {
+    errors.push('manifestVersion must be 1.');
+  }
+  if (typeof manifest.id !== 'string' || !PLUGIN_ID_REGEX.test(manifest.id)) {
+    errors.push('id is required and must be a lowercase slug (a-z, 0-9, hyphens, max 64 chars).');
+  }
+  if (manifest.name !== undefined && typeof manifest.name !== 'string') {
+    errors.push('name must be a string.');
+  }
+  if (manifest.apiVersion !== undefined && manifest.apiVersion !== 'v1') {
+    errors.push("apiVersion must be 'v1'.");
+  }
+  if (manifest.storage !== undefined && typeof manifest.storage !== 'boolean') {
+    errors.push('storage must be a boolean.');
+  }
+  if (manifest.events !== undefined) {
+    if (!Array.isArray(manifest.events) || manifest.events.some((event) => typeof event !== 'string')) {
+      errors.push('events must be an array of strings.');
+    } else {
+      for (const event of manifest.events) {
+        if (!pluginEvents.isKnownEvent(event)) {
+          errors.push(`events: "${event}" is not a known event (catalog: ${pluginEvents.PLUGIN_EVENT_CATALOG.join(', ')}).`);
+        }
+      }
+    }
+  }
+  if (manifest.reactions !== undefined) {
+    if (!Array.isArray(manifest.reactions)) {
+      errors.push('reactions must be an array.');
+    } else {
+      if (manifest.reactions.length > 0 && manifest.storage !== true) {
+        errors.push('reactions require "storage": true (they write to plugin storage).');
+      }
+      manifest.reactions.forEach((reaction, index) => {
+        if (!reaction || typeof reaction !== 'object') {
+          errors.push(`reactions[${index}] must be an object.`);
+          return;
+        }
+        if (typeof reaction.on !== 'string' || !pluginEvents.isKnownEvent(reaction.on)) {
+          errors.push(`reactions[${index}].on must be a known event (catalog: ${pluginEvents.PLUGIN_EVENT_CATALOG.join(', ')}).`);
+        }
+        if (reaction.action !== 'increment') {
+          errors.push(`reactions[${index}].action must be 'increment' (the only supported action).`);
+        }
+        if (typeof reaction.key !== 'string' || !PLUGIN_STORAGE_KEY_REGEX.test(reaction.key)) {
+          errors.push(`reactions[${index}].key must be a valid storage key.`);
+        }
+        if (typeof reaction.path !== 'string' || reaction.path.length === 0 ||
+            reaction.path.split('.').some((segment) => segment.length === 0)) {
+          errors.push(`reactions[${index}].path must be a non-empty dot-separated path.`);
+        }
+        // Optional multiplier applied to the resolved delta — factor: -1 lets a
+        // mirror reaction (e.g. on chore.uncompleted) compensate a setting- or
+        // payload-driven increment that cannot be negated in the manifest.
+        if (reaction.factor !== undefined && (typeof reaction.factor !== 'number' || !Number.isFinite(reaction.factor))) {
+          errors.push(`reactions[${index}].factor must be a finite number.`);
+        }
+        const delta = reaction.delta;
+        const deltaValid = (typeof delta === 'number' && Number.isFinite(delta)) ||
+          (delta && typeof delta === 'object' && !Array.isArray(delta) &&
+            (typeof delta.setting === 'string' || typeof delta.payload === 'string'));
+        if (!deltaValid) {
+          errors.push(`reactions[${index}].delta must be a number, { "setting": "<key>" }, or { "payload": "<field>" }.`);
+        } else if (delta && typeof delta === 'object' && typeof delta.setting === 'string') {
+          const declared = Array.isArray(manifest.settings)
+            ? manifest.settings.find((setting) => setting && setting.key === delta.setting)
+            : null;
+          // Device-scoped settings are excluded: a server-side reaction has no
+          // device context to resolve them against.
+          if (!declared || declared.type !== 'number' || declared.scope === 'device') {
+            errors.push(`reactions[${index}].delta.setting must reference a declared household number setting.`);
+          }
+        }
+      });
+    }
+  }
+  if (manifest.settings !== undefined) {
+    if (!Array.isArray(manifest.settings)) {
+      errors.push('settings must be an array.');
+    } else {
+      manifest.settings.forEach((setting, index) => {
+        if (!setting || typeof setting !== 'object') {
+          errors.push(`settings[${index}] must be an object.`);
+          return;
+        }
+        if (typeof setting.key !== 'string' || !PLUGIN_SETTING_KEY_REGEX.test(setting.key)) {
+          errors.push(`settings[${index}].key must be an alphanumeric identifier.`);
+        }
+        if (!PLUGIN_SETTING_TYPES.has(setting.type)) {
+          errors.push(`settings[${index}].type must be one of: ${[...PLUGIN_SETTING_TYPES].join(', ')}.`);
+        }
+        if (setting.scope !== undefined && !PLUGIN_SETTING_SCOPES.has(setting.scope)) {
+          errors.push(`settings[${index}].scope must be 'household' or 'device'.`);
+        }
+        if (setting.type === 'select' && (
+          !Array.isArray(setting.options) || setting.options.length === 0 ||
+          setting.options.some((option) => typeof option !== 'string')
+        )) {
+          errors.push(`settings[${index}].options must be a non-empty array of strings for select settings.`);
+        }
+        if (setting.min !== undefined && typeof setting.min !== 'number') {
+          errors.push(`settings[${index}].min must be a number.`);
+        }
+        if (setting.max !== undefined && typeof setting.max !== 'number') {
+          errors.push(`settings[${index}].max must be a number.`);
+        }
+      });
+    }
+  }
+
+  return { manifest: errors.length === 0 ? manifest : null, errors };
+}
+
+// Shared by upload and GitHub install: validate any embedded manifest and
+// upsert the plugin row. Returns an { error, status } object on rejection.
+async function installPluginRow({ filename, fallbackName, content, source, originalUrl = null }) {
+  const { manifest, errors } = extractPluginManifest(content);
+  if (errors.length > 0) {
+    return { error: `Invalid plugin manifest: ${errors.join(' ')}`, status: 400 };
+  }
+
+  const pluginId = manifest ? manifest.id : null;
+  if (pluginId) {
+    const conflict = await Plugin.query()
+      .select('filename')
+      .where('plugin_id', pluginId)
+      .whereNot('filename', filename)
+      .first();
+    if (conflict) {
+      return {
+        error: `Plugin id "${pluginId}" is already used by ${conflict.filename}.`,
+        status: 409,
+      };
+    }
+  }
+
+  await Plugin.query()
+    .insert({
+      filename,
+      name: (manifest && manifest.name) || fallbackName,
+      content,
+      source,
+      original_url: originalUrl,
+      plugin_id: pluginId,
+      manifest_json: manifest ? JSON.stringify(manifest) : null,
+    })
+    .onConflict('filename')
+    .merge({
+      content,
+      name: (manifest && manifest.name) || fallbackName,
+      source,
+      original_url: originalUrl,
+      plugin_id: pluginId,
+      manifest_json: manifest ? JSON.stringify(manifest) : null,
+      updated_at: knex.fn.now(),
+    });
+
+  return { pluginId };
+}
+
+// Helper: Load legacy on-disk widget registry (kept for the debug endpoint)
 async function loadWidgetRegistry() {
   try {
     const data = await fs.readFile(widgetRegistryPath, 'utf-8');
@@ -483,12 +987,26 @@ async function loadWidgetRegistry() {
   }
 }
 
-// Helper: Save widget registry
-async function saveWidgetRegistry(registry) {
-  await fs.writeFile(widgetRegistryPath, JSON.stringify(registry, null, 2), 'utf-8');
+// Helper: List installed plugins in the legacy registry response shape
+async function listInstalledPlugins() {
+  const rows = await Plugin.query()
+    .select('filename', 'name', 'source', 'original_url', 'plugin_id', 'manifest_json', 'installed_at')
+    .orderBy([{ column: 'installed_at' }, { column: 'filename' }]);
+  return rows.map((row) => ({
+    name: row.name,
+    filename: row.filename,
+    uploadedAt: row.installed_at,
+    source: row.source,
+    ...(row.original_url ? { originalUrl: row.original_url } : {}),
+    ...(row.plugin_id ? { pluginId: row.plugin_id } : {}),
+    ...(row.manifest_json ? { manifest: parseJsonObject(row.manifest_json, null) } : {}),
+  }));
 }
 
 // Endpoint: Upload a widget (HTML file)
+// Deliberately NOT demo-blocked: plugins are a showcase feature, and since the
+// plugin store moved into the database (issue #105 Phase 0) demo installs live
+// in the in-memory DB and vanish on the demo reset cycle — nothing persists.
 fastify.post('/api/widgets/upload', async (request, reply) => {
   try {
     const data = await request.file();
@@ -497,23 +1015,21 @@ fastify.post('/api/widgets/upload', async (request, reply) => {
     }
 
     const widgetName = data.filename.replace(/[^a-zA-Z0-9-._]/g, '_');
-    const savePath = path.join(__dirname, 'widgets', widgetName);
+    const content = (await data.toBuffer()).toString('utf-8');
 
-    // Save the file
-    await fs.writeFile(savePath, await data.toBuffer());
-
-    // Update registry
-    const registry = await loadWidgetRegistry();
-    if (!registry.find(w => w.filename === widgetName)) {
-      registry.push({
-        name: widgetName.replace('.html', ''),
-        filename: widgetName,
-        uploadedAt: new Date().toISOString()
-      });
-      await saveWidgetRegistry(registry);
+    // Re-uploading the same filename replaces the content (matches the old
+    // overwrite-the-file behavior); an embedded manifest is validated first.
+    const result = await installPluginRow({
+      filename: widgetName,
+      fallbackName: widgetName.replace('.html', ''),
+      content,
+      source: 'upload',
+    });
+    if (result.error) {
+      return reply.status(result.status).send({ error: result.error });
     }
 
-    return { success: true, message: 'Widget uploaded!', widget: widgetName };
+    return { success: true, message: 'Widget uploaded!', widget: widgetName, pluginId: result.pluginId || null };
   } catch (err) {
     console.error('Widget upload error:', err);
     reply.status(500).send({ error: 'Failed to upload widget.' });
@@ -523,66 +1039,637 @@ fastify.post('/api/widgets/upload', async (request, reply) => {
 // Endpoint: List widgets
 fastify.get('/api/widgets', async (request, reply) => {
   try {
-    const registry = await loadWidgetRegistry();
-    return registry;
+    return await listInstalledPlugins();
   } catch (err) {
+    console.error('Error listing plugins:', err);
     reply.status(500).send({ error: 'Failed to load widget registry.' });
   }
 });
 
-// Endpoint: Delete a widget
+// Endpoint: Delete a widget.
+// By default the plugin's platform state (storage, settings) is KEPT so a
+// reinstall under the same id picks up where it left off. Pass
+// ?purgeData=true to also wipe it — recommended before installing a
+// *different* plugin that declares the same id, which would otherwise
+// silently inherit the predecessor's data.
+// Not demo-blocked — see the widget upload endpoint.
 fastify.delete('/api/widgets/:filename', async (request, reply) => {
   const { filename } = request.params;
+  const purgeData = request.query.purgeData === 'true';
   try {
-    const filePath = path.join(__dirname, 'widgets', filename);
-    await fs.unlink(filePath);
+    const pluginRow = await Plugin.query().select('plugin_id').where('filename', filename).first();
+    const result = { changes: await Plugin.query().delete().where('filename', filename) };
 
-    // Update registry
-    let registry = await loadWidgetRegistry();
-    registry = registry.filter(w => w.filename !== filename);
-    await saveWidgetRegistry(registry);
+    if (purgeData && pluginRow?.plugin_id) {
+      const pluginId = pluginRow.plugin_id;
+      await PluginStorage.query().delete().where('plugin_id', pluginId);
+      await Setting.query().delete().where('key', pluginHouseholdSettingsKey(pluginId));
+      // Sweep device-scoped values out of every device blob.
+      const devices = await knex('devices').select('name', 'device_settings_json');
+      for (const device of devices) {
+        const deviceSettings = parseJsonObject(device.device_settings_json, {});
+        const platformSettings = deviceSettings.pluginPlatformSettings;
+        if (platformSettings && typeof platformSettings === 'object' && platformSettings[pluginId] !== undefined) {
+          delete platformSettings[pluginId];
+          await knex('devices').where('name', device.name).update({
+            device_settings_json: JSON.stringify(deviceSettings),
+            updateTime: knex.raw('CURRENT_TIMESTAMP'),
+          });
+        }
+      }
+    }
+
+    // Best-effort cleanup of a pre-migration file on disk.
+    let removedFromDisk = false;
+    try {
+      await fs.unlink(path.join(__dirname, 'widgets', filename));
+      removedFromDisk = true;
+    } catch {
+      // Nothing on disk — expected for DB-backed plugins.
+    }
+
+    if (result.changes === 0 && !removedFromDisk) {
+      return reply.status(404).send({ error: 'Widget not found.' });
+    }
 
     return { success: true, message: 'Widget deleted.' };
   } catch (err) {
+    console.error('Widget delete error:', err);
     reply.status(500).send({ error: 'Failed to delete widget.' });
   }
 });
 
-// Debug endpoint to list widget files
+// --- Plugin Platform v1 API: storage (issue #105 Phase 1, capability c) ---
+// Namespaced key/value documents for manifest plugins. Everything under
+// /api/plugin/v1 is the versioned contract plugins may rely on; see
+// docs/architecture/plugin-platform.md.
+
+const PLUGIN_STORAGE_MAX_VALUE_BYTES = 64 * 1024;
+const PLUGIN_STORAGE_MAX_KEYS = 500;
+const PLUGIN_STORAGE_KEY_REGEX = /^[A-Za-z0-9:_.-]{1,128}$/;
+
+// Guard: the pluginId must belong to an installed manifest plugin that declared
+// `"storage": true`. Sends the error reply and returns null on failure.
+async function requireStoragePlugin(pluginId, reply) {
+  const row = await Plugin.query().select('manifest_json').where('plugin_id', pluginId).first();
+  if (!row) {
+    reply.status(403).send({ error: `Unknown plugin id "${pluginId}".` });
+    return null;
+  }
+  const manifest = parseJsonObject(row.manifest_json, {});
+  if (manifest.storage !== true) {
+    reply.status(403).send({ error: `Plugin "${pluginId}" does not declare storage in its manifest.` });
+    return null;
+  }
+  return manifest;
+}
+
+function validStorageKey(key, reply) {
+  if (!PLUGIN_STORAGE_KEY_REGEX.test(key)) {
+    reply.status(400).send({ error: 'Storage keys must be 1-128 chars of A-Za-z0-9 : _ . -' });
+    return false;
+  }
+  return true;
+}
+
+fastify.get('/api/plugin/v1/storage/:pluginId', async (request, reply) => {
+  const { pluginId } = request.params;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
+
+  const rows = await PluginStorage.query().select('key', 'value_json').where('plugin_id', pluginId).orderBy('key');
+  const values = {};
+  for (const row of rows) {
+    try {
+      values[row.key] = JSON.parse(row.value_json);
+    } catch {
+      values[row.key] = null;
+    }
+  }
+  return values;
+});
+
+fastify.get('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
+  const { pluginId, key } = request.params;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
+  if (!validStorageKey(key, reply)) return;
+
+  const row = await PluginStorage.query().select('value_json').where({ plugin_id: pluginId, key }).first();
+  if (!row) {
+    return reply.status(404).send({ error: 'Key not found.' });
+  }
+  reply.header('Content-Type', 'application/json');
+  return row.value_json;
+});
+
+// Plugin platform mutations are not demo-blocked: they only write to the
+// plugin's own namespace in the (in-memory, self-resetting) demo DB, and demo
+// visitors should be able to try plugins end-to-end.
+fastify.put('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
+  const { pluginId, key } = request.params;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
+  if (!validStorageKey(key, reply)) return;
+
+  const valueJson = JSON.stringify(request.body === undefined ? null : request.body);
+  if (Buffer.byteLength(valueJson, 'utf-8') > PLUGIN_STORAGE_MAX_VALUE_BYTES) {
+    return reply.status(413).send({ error: `Value exceeds ${PLUGIN_STORAGE_MAX_VALUE_BYTES / 1024} KB limit.` });
+  }
+
+  const exists = await PluginStorage.query().select('plugin_id').where({ plugin_id: pluginId, key }).first();
+  if (!exists) {
+    const { count } = await knex('plugin_storage').where('plugin_id', pluginId).count({ count: '*' }).first();
+    if (count >= PLUGIN_STORAGE_MAX_KEYS) {
+      return reply.status(413).send({ error: `Plugin storage is limited to ${PLUGIN_STORAGE_MAX_KEYS} keys.` });
+    }
+  }
+
+  await PluginStorage.query()
+    .insert({ plugin_id: pluginId, key, value_json: valueJson })
+    .onConflict(['plugin_id', 'key'])
+    .merge({ value_json: valueJson, updated_at: knex.fn.now() });
+
+  return { success: true };
+});
+
+fastify.delete('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
+  const { pluginId, key } = request.params;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
+  if (!validStorageKey(key, reply)) return;
+
+  const changes = await PluginStorage.query().delete().where({ plugin_id: pluginId, key });
+  if (changes === 0) {
+    return reply.status(404).send({ error: 'Key not found.' });
+  }
+  return { success: true };
+});
+
+// Atomic numeric delta on a JSON path inside a stored document — the primitive
+// the clam-bucket siphon needs ("add N to the give pool") without a general
+// transaction API. Creates the key/path if missing. Body: { path, delta }.
+// `ex` is the Knex executor: callers pass a transaction so the read-modify-write
+// is one atomic unit.
+const incrementPluginStorage = async (pluginId, key, pathSegments, delta, ex = knex) => {
+  const row = await ex('plugin_storage').select('value_json').where({ plugin_id: pluginId, key }).first();
+  let doc = {};
+  if (row) {
+    try {
+      doc = JSON.parse(row.value_json);
+    } catch {
+      doc = {};
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+      throw Object.assign(new Error('Stored value is not a JSON object.'), { statusCode: 409 });
+    }
+  }
+
+  let target = doc;
+  for (const segment of pathSegments.slice(0, -1)) {
+    if (target[segment] === undefined) {
+      target[segment] = {};
+    }
+    if (!target[segment] || typeof target[segment] !== 'object' || Array.isArray(target[segment])) {
+      throw Object.assign(new Error(`Path segment "${segment}" is not an object.`), { statusCode: 409 });
+    }
+    target = target[segment];
+  }
+
+  const leaf = pathSegments[pathSegments.length - 1];
+  const current = target[leaf] === undefined ? 0 : target[leaf];
+  if (typeof current !== 'number' || !Number.isFinite(current)) {
+    throw Object.assign(new Error(`Value at path is not a number.`), { statusCode: 409 });
+  }
+  target[leaf] = current + delta;
+
+  const valueJson = JSON.stringify(doc);
+  if (Buffer.byteLength(valueJson, 'utf-8') > PLUGIN_STORAGE_MAX_VALUE_BYTES) {
+    throw Object.assign(new Error('Value exceeds size limit.'), { statusCode: 413 });
+  }
+
+  await ex('plugin_storage')
+    .insert({ plugin_id: pluginId, key, value_json: valueJson })
+    .onConflict(['plugin_id', 'key'])
+    .merge({ value_json: valueJson, updated_at: ex.fn.now() });
+
+  return { result: target[leaf], value: doc };
+};
+
+fastify.post('/api/plugin/v1/storage/:pluginId/:key/increment', async (request, reply) => {
+  const { pluginId, key } = request.params;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
+  if (!validStorageKey(key, reply)) return;
+
+  const { path: incrementPath, delta } = request.body || {};
+  if (typeof incrementPath !== 'string' || incrementPath.length === 0) {
+    return reply.status(400).send({ error: 'path is required (dot-separated, e.g. "buckets.give").' });
+  }
+  if (typeof delta !== 'number' || !Number.isFinite(delta)) {
+    return reply.status(400).send({ error: 'delta must be a finite number.' });
+  }
+  const pathSegments = incrementPath.split('.');
+  if (pathSegments.some((segment) => segment.length === 0)) {
+    return reply.status(400).send({ error: 'path segments must be non-empty.' });
+  }
+
+  try {
+    // The read-modify-write runs inside one transaction so concurrent HTTP
+    // requests cannot interleave and lose an increment.
+    const { result, value } = await knex.transaction(
+      (trx) => incrementPluginStorage(pluginId, key, pathSegments, delta, trx)
+    );
+    return { success: true, result, value };
+  } catch (error) {
+    if (error.statusCode) {
+      return reply.status(error.statusCode).send({ error: error.message });
+    }
+    console.error('Plugin storage increment error:', error);
+    return reply.status(500).send({ error: 'Failed to apply increment.' });
+  }
+});
+
+// --- Plugin Platform v1 API: settings (issue #105 Phase 2, capability d) ---
+// Values for the settings a plugin declared in its manifest. Each key lives at
+// exactly one scope: 'household' (default; global `settings` table under
+// plugin:<id>:settings) or 'device' (per-device blob under
+// device_settings_json.pluginPlatformSettings[<id>]). GET returns the merged
+// effective values: manifest default <- stored value for the key's scope.
+
+async function requireManifestPlugin(pluginId, reply) {
+  const row = await Plugin.query().select('manifest_json').where('plugin_id', pluginId).first();
+  if (!row) {
+    reply.status(403).send({ error: `Unknown plugin id "${pluginId}".` });
+    return null;
+  }
+  return parseJsonObject(row.manifest_json, {});
+}
+
+function pluginHouseholdSettingsKey(pluginId) {
+  return `plugin:${pluginId}:settings`;
+}
+
+async function readHouseholdPluginSettings(pluginId) {
+  const row = await knex('settings').select('value').where('key', pluginHouseholdSettingsKey(pluginId)).first();
+  return parseJsonObject(row?.value, {});
+}
+
+async function readDevicePluginSettings(pluginId, deviceName) {
+  const row = await knex('devices').select('device_settings_json').where('name', deviceName).first();
+  const deviceSettings = parseJsonObject(row?.device_settings_json, {});
+  const platformSettings = deviceSettings.pluginPlatformSettings;
+  const values = platformSettings && typeof platformSettings === 'object' && !Array.isArray(platformSettings)
+    ? platformSettings[pluginId]
+    : undefined;
+  return values && typeof values === 'object' && !Array.isArray(values) ? values : {};
+}
+
+// Returns a problem string or null.
+function validatePluginSettingValue(setting, value) {
+  switch (setting.type) {
+    case 'number':
+      if (typeof value !== 'number' || !Number.isFinite(value)) return 'must be a finite number';
+      if (typeof setting.min === 'number' && value < setting.min) return `must be >= ${setting.min}`;
+      if (typeof setting.max === 'number' && value > setting.max) return `must be <= ${setting.max}`;
+      return null;
+    case 'string':
+      if (typeof value !== 'string') return 'must be a string';
+      if (value.length > 1024) return 'must be at most 1024 characters';
+      return null;
+    case 'boolean':
+      return typeof value === 'boolean' ? null : 'must be a boolean';
+    case 'select':
+      if (typeof value !== 'string') return 'must be a string';
+      if (Array.isArray(setting.options) && !setting.options.includes(value)) {
+        return `must be one of: ${setting.options.join(', ')}`;
+      }
+      return null;
+    default:
+      return 'has an unsupported type';
+  }
+}
+
+// The single source of truth for effective setting values (manifest default <-
+// stored value at the key's scope). Used by the GET route AND the declarative
+// reaction executor so the two can never drift.
+async function resolveEffectiveSettings(pluginId, manifest, deviceName = null) {
+  const declared = Array.isArray(manifest.settings) ? manifest.settings : [];
+  const household = await readHouseholdPluginSettings(pluginId);
+  const deviceValues = deviceName ? await readDevicePluginSettings(pluginId, deviceName) : {};
+
+  const merged = {};
+  for (const setting of declared) {
+    const stored = setting.scope === 'device' ? deviceValues[setting.key] : household[setting.key];
+    const value = stored !== undefined ? stored : setting.default;
+    merged[setting.key] = value === undefined ? null : value;
+  }
+  return merged;
+}
+
+fastify.get('/api/plugin/v1/settings/:pluginId', async (request, reply) => {
+  const { pluginId } = request.params;
+  const manifest = await requireManifestPlugin(pluginId, reply);
+  if (!manifest) return;
+
+  const deviceName = typeof request.query.device === 'string' && request.query.device ? request.query.device : null;
+  return await resolveEffectiveSettings(pluginId, manifest, deviceName);
+});
+
+fastify.put('/api/plugin/v1/settings/:pluginId', async (request, reply) => {
+  const { pluginId } = request.params;
+  const manifest = await requireManifestPlugin(pluginId, reply);
+  if (!manifest) return;
+
+  const body = request.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return reply.status(400).send({ error: 'Body must be an object of { settingKey: value }.' });
+  }
+
+  const declared = Array.isArray(manifest.settings) ? manifest.settings : [];
+  const declaredByKey = new Map(declared.map((setting) => [setting.key, setting]));
+  const deviceName = typeof request.query.device === 'string' && request.query.device ? request.query.device : null;
+
+  const householdUpdates = {};
+  const deviceUpdates = {};
+  for (const [key, value] of Object.entries(body)) {
+    const setting = declaredByKey.get(key);
+    if (!setting) {
+      return reply.status(400).send({ error: `"${key}" is not declared in the plugin manifest.` });
+    }
+    const problem = validatePluginSettingValue(setting, value);
+    if (problem) {
+      return reply.status(400).send({ error: `"${key}" ${problem}.` });
+    }
+    if (setting.scope === 'device') {
+      deviceUpdates[key] = value;
+    } else {
+      householdUpdates[key] = value;
+    }
+  }
+
+  if (Object.keys(deviceUpdates).length > 0 && !deviceName) {
+    return reply.status(400).send({ error: 'A ?device= query parameter is required to write device-scoped settings.' });
+  }
+
+  if (Object.keys(householdUpdates).length > 0) {
+    const current = await readHouseholdPluginSettings(pluginId);
+    const value = JSON.stringify({ ...current, ...householdUpdates });
+    await knex('settings')
+      .insert({ key: pluginHouseholdSettingsKey(pluginId), value })
+      .onConflict('key')
+      .merge({ value });
+  }
+
+  if (Object.keys(deviceUpdates).length > 0) {
+    await knex('devices').insert({ name: deviceName, device_settings_json: '{}' }).onConflict('name').ignore();
+    const row = await knex('devices').select('device_settings_json').where('name', deviceName).first();
+    const deviceSettings = parseJsonObject(row?.device_settings_json, {});
+    const platformSettings = (deviceSettings.pluginPlatformSettings && typeof deviceSettings.pluginPlatformSettings === 'object')
+      ? deviceSettings.pluginPlatformSettings
+      : {};
+    platformSettings[pluginId] = { ...(platformSettings[pluginId] || {}), ...deviceUpdates };
+    deviceSettings.pluginPlatformSettings = platformSettings;
+    await knex('devices').where('name', deviceName).update({
+      device_settings_json: JSON.stringify(deviceSettings),
+      updateTime: knex.raw('CURRENT_TIMESTAMP'),
+    });
+  }
+
+  return { success: true };
+});
+
+// --- Plugin Platform v1 API: event stream (issue #105 Phase 3, capability b) ---
+// One SSE connection per dashboard; every catalog event is sent as a `data:`
+// message ({ event, payload, emittedAt }) and the client bridge filters per
+// plugin against its declared events. Delivery is ephemeral by design (no
+// replay) — durable state belongs in plugin storage.
+fastify.get('/api/plugin/v1/events/stream', (request, reply) => {
+  reply.hijack();
+  reply.raw.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    // Tell the Nginx reverse proxy not to buffer the stream.
+    'X-Accel-Buffering': 'no',
+    // reply.hijack() bypasses @fastify/cors, so mirror its policy (origin '*',
+    // see the cors registration above) or cross-origin EventSources (dev mode)
+    // are blocked by the browser.
+    'Access-Control-Allow-Origin': '*',
+  });
+  reply.raw.write(': connected\n\n');
+
+  const unsubscribe = pluginEvents.subscribe((message) => {
+    reply.raw.write(`data: ${JSON.stringify(message)}\n\n`);
+  });
+  // Comment-only heartbeat keeps idle connections alive through proxies.
+  const heartbeat = setInterval(() => {
+    reply.raw.write(': ping\n\n');
+  }, 25000);
+
+  request.raw.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+});
+
+// --- Plugin Platform: declarative reactions (issue #105 Phase 4, Model C) ---
+// A manifest may declare reactions — bounded, validated storage increments the
+// server executes when a core event fires, e.g. the clam-bucket siphon:
+//   { "on": "clam.withdrawn", "action": "increment",
+//     "key": "give-pool", "path": "total", "delta": { "setting": "siphonAmount" } }
+// This runs at emission, exactly once per event, regardless of how many (or
+// zero) dashboards have the plugin mounted — no arbitrary plugin code ever runs
+// on the server, only the declared increment. Reaction failures are logged and
+// never break the core mutation or other plugins' reactions.
+
+async function resolveReactionDelta(deltaSpec, manifest, pluginId, payload) {
+  if (typeof deltaSpec === 'number' && Number.isFinite(deltaSpec)) {
+    return deltaSpec;
+  }
+  if (deltaSpec && typeof deltaSpec === 'object') {
+    if (typeof deltaSpec.setting === 'string') {
+      // Same resolution the settings GET route serves — via the shared helper,
+      // so Admin-Panel-visible values and reaction deltas can never disagree.
+      const value = (await resolveEffectiveSettings(pluginId, manifest))[deltaSpec.setting];
+      return typeof value === 'number' && Number.isFinite(value) ? value : null;
+    }
+    if (typeof deltaSpec.payload === 'string') {
+      const value = payload ? payload[deltaSpec.payload] : undefined;
+      return typeof value === 'number' && Number.isFinite(value) ? value : null;
+    }
+  }
+  return null;
+}
+
+async function runDeclarativeReactions(message) {
+  try {
+    const rows = await Plugin.query()
+      .select('plugin_id', 'manifest_json')
+      .whereNotNull('plugin_id')
+      .whereNotNull('manifest_json');
+    for (const row of rows) {
+      const manifest = parseJsonObject(row.manifest_json, {});
+      const reactions = Array.isArray(manifest.reactions) ? manifest.reactions : [];
+      for (const reaction of reactions) {
+        if (reaction.on !== message.event) continue;
+        const resolved = await resolveReactionDelta(reaction.delta, manifest, row.plugin_id, message.payload);
+        if (resolved === null) continue;
+        const factor = typeof reaction.factor === 'number' && Number.isFinite(reaction.factor) ? reaction.factor : 1;
+        const delta = resolved * factor;
+        if (delta === 0) continue;
+        try {
+          const pathSegments = String(reaction.path).split('.');
+          await knex.transaction(
+            (trx) => incrementPluginStorage(row.plugin_id, reaction.key, pathSegments, delta, trx)
+          );
+        } catch (error) {
+          console.error(`Plugin reaction failed (${row.plugin_id} on ${message.event}):`, error.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Declarative reaction executor failed:', error);
+  }
+}
+
+// Reactions run before the event is broadcast (they used to be the
+// first-registered subscriber, back when the executor was synchronous), so
+// storage is up to date by the time any dashboard is notified — and by the time
+// the route that emitted answers. `pluginEvents.emit()` is synchronous and
+// discards return values, so an async executor can no longer be a plain
+// subscriber: it is invoked and awaited here instead.
+async function emitPluginEvent(event, payload) {
+  if (!pluginEvents.isKnownEvent(event)) {
+    // Mirrors emit()'s own guard so an unknown name is refused identically
+    // rather than silently running reactions for it.
+    pluginEvents.emit(event, payload);
+    return;
+  }
+  await runDeclarativeReactions({ event, payload, emittedAt: new Date().toISOString() });
+  pluginEvents.emit(event, payload);
+}
+
+// --- Chore notification sound bank ---
+
+// Endpoint: List available sounds (bundled defaults + user uploads)
+fastify.get('/api/sounds', async (request, reply) => {
+  try {
+    await fs.mkdir(SOUNDS_UPLOAD_DIR, { recursive: true });
+    const defaults = getDefaultSoundFilenames();
+    const files = await fs.readdir(SOUNDS_UPLOAD_DIR);
+
+    return files
+      .filter((filename) => ALLOWED_SOUND_EXTENSIONS.has(path.extname(filename).toLowerCase()))
+      .sort((a, b) => a.localeCompare(b))
+      .map((filename) => ({
+        filename,
+        name: filename.replace(/\.[^.]+$/, ''),
+        url: `/Uploads/sounds/${filename}`,
+        isDefault: defaults.has(filename),
+      }));
+  } catch (error) {
+    console.error('Error listing sounds:', error);
+    reply.status(500).send({ error: 'Failed to list sounds' });
+  }
+});
+
+// Endpoint: Upload a custom sound
+fastify.post('/api/sounds/upload', async (request, reply) => {
+  if (demoBlocked(reply)) return;
+  try {
+    const data = await request.file();
+    if (!data) {
+      return reply.status(400).send({ error: 'No file uploaded.' });
+    }
+
+    const ext = path.extname(data.filename).toLowerCase();
+    if (!ALLOWED_SOUND_EXTENSIONS.has(ext)) {
+      return reply.status(400).send({
+        error: `Unsupported file type. Allowed: ${Array.from(ALLOWED_SOUND_EXTENSIONS).join(', ')}`,
+      });
+    }
+
+    await fs.mkdir(SOUNDS_UPLOAD_DIR, { recursive: true });
+    const safeName = data.filename.replace(/[^a-zA-Z0-9-._]/g, '_');
+    await fs.writeFile(path.join(SOUNDS_UPLOAD_DIR, safeName), await data.toBuffer());
+
+    return {
+      success: true,
+      message: 'Sound uploaded!',
+      sound: { filename: safeName, name: safeName.replace(/\.[^.]+$/, ''), url: `/Uploads/sounds/${safeName}`, isDefault: false },
+    };
+  } catch (error) {
+    console.error('Error uploading sound:', error);
+    reply.status(500).send({ error: 'Failed to upload sound.' });
+  }
+});
+
+// Endpoint: Delete an uploaded sound (bundled defaults are protected)
+fastify.delete('/api/sounds/:filename', async (request, reply) => {
+  if (demoBlocked(reply)) return;
+  const { filename } = request.params;
+  try {
+    if (getDefaultSoundFilenames().has(filename)) {
+      return reply.status(400).send({ error: 'Default sounds cannot be deleted.' });
+    }
+
+    await fs.unlink(path.join(SOUNDS_UPLOAD_DIR, filename));
+    return { success: true, message: 'Sound deleted.' };
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return reply.status(404).send({ error: 'Sound not found.' });
+    }
+    console.error('Error deleting sound:', error);
+    reply.status(500).send({ error: 'Failed to delete sound.' });
+  }
+});
+
+// Debug endpoint to list installed plugins (DB) and any legacy on-disk files
 fastify.get('/api/widgets/debug', async (request, reply) => {
   try {
     const widgetsDir = path.join(__dirname, 'widgets');
-    console.log(`Checking widgets directory: ${widgetsDir}`);
 
-    const files = await fs.readdir(widgetsDir);
-    console.log(`Files in widgets directory:`, files);
-
-    const fileDetails = [];
-    for (const file of files) {
-      const filePath = path.join(widgetsDir, file);
-      try {
-        const stats = await fs.stat(filePath);
-        fileDetails.push({
-          name: file,
-          size: stats.size,
-          isFile: stats.isFile(),
-          modified: stats.mtime
-        });
-      } catch (err) {
-        fileDetails.push({
-          name: file,
-          error: err.message
-        });
+    let fileDetails = [];
+    try {
+      const files = await fs.readdir(widgetsDir);
+      for (const file of files) {
+        const filePath = path.join(widgetsDir, file);
+        try {
+          const stats = await fs.stat(filePath);
+          fileDetails.push({
+            name: file,
+            size: stats.size,
+            isFile: stats.isFile(),
+            modified: stats.mtime
+          });
+        } catch (err) {
+          fileDetails.push({
+            name: file,
+            error: err.message
+          });
+        }
       }
+    } catch (dirError) {
+      fileDetails = [{ error: dirError.message }];
     }
 
+    const plugins = await knex('plugins')
+      .select(
+        'filename',
+        'name',
+        'source',
+        'original_url',
+        knex.raw('LENGTH(content) AS content_length'),
+        knex.raw('manifest_json IS NOT NULL AS has_manifest'),
+        'installed_at',
+        'updated_at'
+      )
+      .orderBy([{ column: 'installed_at' }, { column: 'filename' }]);
+
     return {
-      directory: widgetsDir,
-      files: fileDetails,
-      registry: await loadWidgetRegistry()
+      plugins,
+      legacyDirectory: widgetsDir,
+      legacyFiles: fileDetails,
+      legacyRegistry: await loadWidgetRegistry()
     };
   } catch (error) {
-    console.error('Error reading widgets directory:', error);
+    console.error('Error reading plugin store:', error);
     return { error: error.message };
   }
 });
@@ -675,6 +1762,7 @@ fastify.get('/api/widgets/github', async (request, reply) => {
 });
 
 // Endpoint: Install a widget from GitHub repository
+// Not demo-blocked — see the widget upload endpoint.
 fastify.post('/api/widgets/github/install', async (request, reply) => {
   try {
     const { download_url, filename, name } = request.body;
@@ -696,24 +1784,19 @@ fastify.post('/api/widgets/github/install', async (request, reply) => {
 
     // Sanitize filename
     const sanitizedFilename = filename.replace(/[^a-zA-Z0-9-._]/g, '_');
-    const savePath = path.join(__dirname, 'widgets', sanitizedFilename);
+    const content = typeof response.data === 'string' ? response.data : String(response.data);
 
-    // Save the widget file
-    await fs.writeFile(savePath, response.data, 'utf-8');
-
-    // Update registry
-    const registry = await loadWidgetRegistry();
-    const existingWidget = registry.find(w => w.filename === sanitizedFilename);
-
-    if (!existingWidget) {
-      registry.push({
-        name: name || sanitizedFilename.replace('.html', ''),
-        filename: sanitizedFilename,
-        uploadedAt: new Date().toISOString(),
-        source: 'github',
-        originalUrl: download_url
-      });
-      await saveWidgetRegistry(registry);
+    // Reinstalling refreshes the content in place; provenance is kept so a
+    // future "update available" check knows where the plugin came from.
+    const result = await installPluginRow({
+      filename: sanitizedFilename,
+      fallbackName: name || sanitizedFilename.replace('.html', ''),
+      content,
+      source: 'github',
+      originalUrl: download_url,
+    });
+    if (result.error) {
+      return reply.status(result.status).send({ error: result.error });
     }
 
     console.log(`Successfully installed widget: ${sanitizedFilename}`);
@@ -738,10 +1821,13 @@ fastify.post('/api/widgets/github/install', async (request, reply) => {
   }
 });
 
-// Initialize database
-const dbPath = process.env.DB_PATH
-  ? path.resolve(process.env.DB_PATH)
-  : path.resolve(__dirname, 'data', 'tasks.db');
+// Initialize database. Demo mode uses an in-memory database so all data is
+// discarded when the container stops.
+const dbPath = DEMO_MODE
+  ? ':memory:'
+  : (process.env.DB_PATH
+    ? path.resolve(process.env.DB_PATH)
+    : path.resolve(__dirname, 'data', 'tasks.db'));
 console.log('Database path:', dbPath);
 let db; // Declare db variable outside to hold the single instance
 let knex; // Knex/Objection instance, wired alongside the legacy `db` during the ORM migration
@@ -753,11 +1839,18 @@ let knex; // Knex/Objection instance, wired alongside the legacy `db` during the
 // db.exec/db.transaction/new Database usage exists OUTSIDE these markers.) ===
 async function ConnectOrCreateDb() {
   try {
-    await fs.mkdir(path.dirname(dbPath), { recursive: true });
-    await fs.chmod(path.dirname(dbPath), 0o777);
+    if (dbPath !== ':memory:') {
+      await fs.mkdir(path.dirname(dbPath), { recursive: true });
+      await fs.chmod(path.dirname(dbPath), 0o777);
+    }
 
     const newDb = new Database(dbPath);
     newDb.pragma('foreign_keys = ON');
+    // WAL lets readers proceed while a writer is active (better-sqlite3 is still
+    // single-threaded, but this avoids POSIX lock stalls across connections).
+    if (dbPath !== ':memory:') {
+      newDb.pragma('journal_mode = WAL');
+    }
     return newDb;
   } catch (error) {
     console.error('Failed to connect or create database:', error);
@@ -801,8 +1894,11 @@ function runSchemaMigrationModule(migration) {
 }
 
 async function applySchemaMigrations(currentSchemaId) {
+  // Capped at the baseline: Knex owns every schema above v14, and the
+  // post-baseline migrations in db/migrations reproduce 15.. Replaying the raw
+  // legacy modules for those would double-apply their DDL.
   const pendingMigrations = schemaMigrations
-    .filter(migration => migration.schemaId > currentSchemaId)
+    .filter(migration => migration.schemaId > currentSchemaId && migration.schemaId <= BASELINE_SCHEMA_VERSION)
     .sort((a, b) => a.schemaId - b.schemaId);
 
   if (pendingMigrations.length === 0) {
@@ -823,13 +1919,71 @@ async function dailyBackgroundProcessing() {
     let results = {};
     const today = getTodayLocalDateString();
 
-    // We want to delete schedules that are completed and will never run again to avoid clutter
+    // Missed-chore logging (issue #72): record yesterday's due-but-uncompleted
+    // regular chores BEFORE any pruning below deletes their schedules. Runs
+    // first, in its own try/catch — metrics capture must never block the rest
+    // of the nightly housekeeping. Idempotent via the partial unique index on
+    // (user_id, chore_schedule_id, date) WHERE kind='missed', so the midnight
+    // cron and the manual /api/system/backgroundTasks trigger can both run.
+    // Vacation mode (issue #121) pauses this entirely: days off must not count
+    // against completion rates or streaks.
+    try {
+      const missedDate = addDaysToDateOnly(today, -1);
+      if (await isVacationActiveOn(missedDate)) {
+        console.log(`Vacation mode active for ${missedDate} — skipping missed-chore logging`);
+        results = { ...results, missedLoggedCount: 0, missedSkippedForVacation: true };
+      } else {
+        const endOfMissedDay = parseDateOnlyToLocalDate(missedDate);
+        endOfMissedDay.setHours(23, 59, 59, 999);
+
+        let missedLoggedCount = 0;
+        const missedRows = [];
+        const allUsers = await knex('users').select('id').whereNot('id', 0);
+        for (const user of allUsers) {
+          const dueChores = await getTodaysRegularChoresForUser(user.id, missedDate, endOfMissedDay);
+          for (const schedule of dueChores) {
+            if (schedule.completed_today) continue;
+            // Idempotent, as the old INSERT OR IGNORE against the partial unique
+            // index on (user_id, chore_schedule_id, date) WHERE kind='missed'
+            // was: an already-logged miss is skipped and not counted.
+            const alreadyLogged = await knex('chore_history')
+              .where({ user_id: user.id, chore_schedule_id: schedule.id, date: missedDate, kind: 'missed' })
+              .first();
+            if (alreadyLogged) continue;
+            await knex('chore_history').insert({
+              user_id: user.id,
+              chore_schedule_id: schedule.id,
+              date: missedDate,
+              clam_value: 0,
+              title: schedule.title,
+              kind: 'missed',
+            });
+            missedLoggedCount++;
+            missedRows.push({ userId: user.id, scheduleId: schedule.id, title: schedule.title, date: missedDate });
+          }
+        }
+        console.log(`Logged ${missedLoggedCount} missed chore(s) for ${missedDate}`);
+        results = { ...results, missedLoggedCount, missedChores: missedRows };
+      }
+    } catch (missedError) {
+      console.error('Missed-chore logging failed (continuing with housekeeping):', missedError);
+      results = { ...results, missedLoggedCount: 0, missedLoggingError: missedError.message };
+    }
+
+    // We want to delete schedules that are completed and will never run again to avoid clutter.
+    // kind = 'completion' is load-bearing (issue #72): a 'missed' row must not
+    // make an UNcompleted one-time chore look completed and get it pruned.
     const schedulesToPrune = await knex('chore_schedules as cs')
       .join('chores as c', 'cs.chore_id', 'c.id')
       .select('cs.id', 'cs.chore_id', 'cs.user_id', 'c.title')
       .whereNull('cs.crontab')
       .where('cs.visible', 1)
-      .whereRaw('EXISTS (SELECT 1 FROM chore_history ch WHERE ch.chore_schedule_id = cs.id)');
+      .whereExists(
+        knex('chore_history as ch')
+          .select(knex.raw('1'))
+          .whereRaw('ch.chore_schedule_id = cs.id')
+          .where('ch.kind', 'completion')
+      );
     console.log(`Found ${schedulesToPrune.length} completed one-time chores to prune`);
 
     let prunedScheduleCount = 0;
@@ -887,26 +2041,34 @@ async function dailyBackgroundProcessing() {
 
     // Handle sticky schedules: create one-time children for until-completed and once-completed parents that trigger today.
     const stickyParentSchedules = await knex('chore_schedules as cs')
-      .select('cs.id', 'cs.chore_id', 'cs.user_id', 'cs.crontab', 'cs.duration', 'cs.interval')
+      .select(
+        'cs.id', 'cs.chore_id', 'cs.user_id', 'cs.crontab', 'cs.duration', 'cs.interval',
+        'cs.created_at', 'cs.due_date', 'cs.due_time', 'cs.sound_enabled', 'cs.sound',
+        'cs.reminder_interval_minutes'
+      )
       .whereNotNull('cs.crontab')
       .whereIn('cs.duration', ['until-completed', 'once-completed'])
       .where('cs.visible', 1)
-      .whereRaw(`NOT EXISTS (
-          SELECT 1 FROM chore_schedules child
-          WHERE child.crontab IS NULL
-            AND child.visible = 1
-            AND (
-              child.parent_schedule_id = cs.id
-              OR (
-                child.parent_schedule_id IS NULL
-                AND child.chore_id = cs.chore_id
-                AND (
-                  (child.user_id = cs.user_id)
-                  OR (child.user_id IS NULL AND cs.user_id IS NULL)
-                )
-              )
-            )
-        )`);
+      .whereNotExists(
+        knex('chore_schedules as child')
+          .select(knex.raw('1'))
+          .whereNull('child.crontab')
+          .where('child.visible', 1)
+          .where((builder) => {
+            builder
+              .whereRaw('child.parent_schedule_id = cs.id')
+              .orWhere((inner) => {
+                inner
+                  .whereNull('child.parent_schedule_id')
+                  .whereRaw('child.chore_id = cs.chore_id')
+                  .where((owner) => {
+                    owner
+                      .whereRaw('child.user_id = cs.user_id')
+                      .orWhereRaw('(child.user_id IS NULL AND cs.user_id IS NULL)');
+                  });
+              });
+          })
+      );
     console.log(`Found ${stickyParentSchedules.length} sticky schedules to check`);
 
     const startOfToday = new Date();
@@ -929,15 +2091,28 @@ async function dailyBackgroundProcessing() {
       }
 
       if (today === next) {
-        const insertedSticky = await ChoreSchedule.query().insert({
-          chore_id: schedule.chore_id,
-          user_id: schedule.user_id,
-          crontab: null,
-          duration: 'day-of',
-          visible: 1,
-          parent_schedule_id: schedule.id,
-        });
-        const scheduleResult = await ChoreSchedule.query().findById(insertedSticky.id);
+        const dueDateOffset = calculateDateOffsetDays(schedule.created_at, schedule.due_date);
+        const childDueDate = dueDateOffset === null
+          ? (schedule.due_date || null)
+          : addDaysToDateOnly(today, dueDateOffset);
+
+        const [insertedChildId] = await knex('chore_schedules')
+          .insert({
+            chore_id: schedule.chore_id,
+            user_id: schedule.user_id,
+            crontab: null,
+            duration: 'day-of',
+            visible: 1,
+            parent_schedule_id: schedule.id,
+            due_date: childDueDate,
+            due_time: schedule.due_time || null,
+            sound_enabled: schedule.sound_enabled ? 1 : 0,
+            sound: schedule.sound || null,
+            reminder_interval_minutes: schedule.reminder_interval_minutes || null,
+          });
+        // Read the row back so the response carries every column (including the
+        // DB-side defaults), matching the old INSERT ... RETURNING *.
+        const scheduleResult = await knex('chore_schedules').where('id', insertedChildId).first();
 
         triggeredSchedules.push(scheduleResult);
         stickySchedulesCreated++;
@@ -1319,6 +2494,20 @@ fastify.delete('/api/devices/:deviceName', async (request, reply) => {
   }
 });
 
+// Chore icons (issue #141) are stored as the literal emoji rather than a name,
+// so the client can grow its bank without a migration and an unrecognized value
+// still renders. The only rules are "empty means none" and a length cap — a
+// single emoji can legitimately be several code points (skin tones, ZWJ
+// sequences), so the cap is generous rather than 1.
+const CHORE_ICON_MAX_LENGTH = 16;
+
+function normalizeChoreIcon(icon) {
+  if (icon === undefined || icon === null) return null;
+  const trimmed = String(icon).trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, CHORE_ICON_MAX_LENGTH);
+}
+
 // Chore routes (updated for new schema)
 fastify.get('/api/chores', async (request, reply) => {
   try {
@@ -1331,9 +2520,16 @@ fastify.get('/api/chores', async (request, reply) => {
 });
 
 fastify.post('/api/chores', async (request, reply) => {
-  const { title, description, clam_value } = request.body;
+  const { title, description, clam_value, icon } = request.body;
   try {
-    const inserted = await Chore.query().insert({ title, description, clam_value: clam_value || 0 });
+    // Empty string and undefined both mean "no icon"; store NULL so the widget
+    // has a single falsy case to check (issue #141).
+    const inserted = await Chore.query().insert({
+      title,
+      description,
+      clam_value: clam_value || 0,
+      icon: normalizeChoreIcon(icon),
+    });
     return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding chore:', error);
@@ -1343,9 +2539,11 @@ fastify.post('/api/chores', async (request, reply) => {
 
 fastify.patch('/api/chores/:id', async (request, reply) => {
   const { id } = request.params;
-  const { title, description, clam_value } = request.body;
+  const { title, description, clam_value, icon } = request.body;
   try {
-    const updated = await Chore.query().patch({ title, description, clam_value }).where({ id });
+    const updated = await Chore.query()
+      .patch({ title, description, clam_value, icon: normalizeChoreIcon(icon) })
+      .where({ id });
     if (updated === 0) {
       return reply.status(404).send({ error: 'Chore not found' });
     }
@@ -1379,7 +2577,7 @@ fastify.get('/api/chore-schedules', async (request, reply) => {
     const { user_id, visible, usage, chore_id } = request.query;
     const query = knex('chore_schedules as cs')
       .join('chores as c', 'cs.chore_id', 'c.id')
-      .select('cs.*', 'c.title', 'c.description', 'c.clam_value');
+      .select('cs.*', 'c.title', 'c.description', 'c.clam_value', 'c.icon');
 
     if (user_id !== undefined) {
       query.where('cs.user_id', user_id);
@@ -1421,10 +2619,19 @@ fastify.get('/api/chore-schedules/:id', async (request, reply) => {
 });
 
 fastify.post('/api/chore-schedules', async (request, reply) => {
-  const { chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id } = request.body;
+  const { chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id, due_time, sound, sound_enabled, reminder_interval_minutes, due_date, transferable, can_snooze, snoozed_until } = request.body;
   try {
     if (!chore_id) {
       return reply.status(400).send({ error: 'chore_id is required' });
+    }
+
+    const dateFields = validateScheduleDateFields(request.body, reply);
+    if (!dateFields) return;
+    const { dueTimeResult, dueDateResult, reminderResult } = dateFields;
+
+    const snoozedUntilResult = normalizeSnoozedUntil(snoozed_until);
+    if (snoozed_until !== undefined && !snoozedUntilResult.valid) {
+      return reply.status(400).send({ error: 'snoozed_until must be a valid date/time' });
     }
 
     const normalizedDuration = normalizeScheduleDuration(duration);
@@ -1473,6 +2680,14 @@ fastify.post('/api/chore-schedules', async (request, reply) => {
       visible: visible !== undefined ? visible : 1,
       interval: normalizedDuration === 'once-completed' ? normalizedInterval : null,
       parent_schedule_id: normalizedParentScheduleId,
+      due_time: dueTimeResult.value,
+      sound: sound || null,
+      sound_enabled: sound_enabled ? 1 : 0,
+      reminder_interval_minutes: reminderResult.value,
+      due_date: dueDateResult.value,
+      transferable: transferable !== undefined ? (transferable ? 1 : 0) : 1,
+      can_snooze: can_snooze !== undefined ? (can_snooze ? 1 : 0) : 1,
+      snoozed_until: snoozedUntilResult.value,
     });
     return { id: inserted.id, success: true };
   } catch (error) {
@@ -1482,11 +2697,15 @@ fastify.post('/api/chore-schedules', async (request, reply) => {
 });
 
 fastify.post('/api/chore-schedules/bulk', async (request, reply) => {
-  const { chore_id, user_ids, crontab, visible } = request.body;
+  const { chore_id, user_ids, crontab, visible, due_time, sound, sound_enabled, reminder_interval_minutes, due_date, transferable, can_snooze } = request.body;
   try {
     if (!chore_id || !user_ids || !Array.isArray(user_ids)) {
       return reply.status(400).send({ error: 'chore_id and user_ids array are required' });
     }
+
+    const dateFields = validateScheduleDateFields(request.body, reply);
+    if (!dateFields) return;
+    const { dueTimeResult, dueDateResult, reminderResult } = dateFields;
 
     if (crontab) {
       try {
@@ -1503,6 +2722,13 @@ fastify.post('/api/chore-schedules/bulk', async (request, reply) => {
         user_id,
         crontab: crontab || null,
         visible: visible !== undefined ? visible : 1,
+        due_time: dueTimeResult.value,
+        sound: sound || null,
+        sound_enabled: sound_enabled ? 1 : 0,
+        reminder_interval_minutes: reminderResult.value,
+        due_date: dueDateResult.value,
+        transferable: transferable !== undefined ? (transferable ? 1 : 0) : 1,
+        can_snooze: can_snooze !== undefined ? (can_snooze ? 1 : 0) : 1,
       });
       ids.push(inserted.id);
     }
@@ -1516,8 +2742,32 @@ fastify.post('/api/chore-schedules/bulk', async (request, reply) => {
 
 fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
-  const { chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id } = request.body;
+  const { chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id, due_time, sound, sound_enabled, reminder_interval_minutes, due_date, transferable, can_snooze, snoozed_until, revoke_daily_bonus, transfer_bonus_clams } = request.body;
   try {
+    const dueTimeResult = normalizeDueTime(due_time);
+    if (due_time !== undefined && !dueTimeResult.valid) {
+      return reply.status(400).send({ error: 'due_time must be in HH:MM 24-hour format' });
+    }
+    const dueDateResult = normalizeDueDate(due_date);
+    if (due_date !== undefined && !dueDateResult.valid) {
+      return reply.status(400).send({ error: 'due_date must be a valid YYYY-MM-DD date' });
+    }
+    const snoozedUntilResult = normalizeSnoozedUntil(snoozed_until);
+    if (snoozed_until !== undefined && !snoozedUntilResult.valid) {
+      return reply.status(400).send({ error: 'snoozed_until must be a valid date/time' });
+    }
+    let normalizedTransferBonus = null;
+    if (transfer_bonus_clams !== undefined) {
+      normalizedTransferBonus = parseInt(transfer_bonus_clams, 10);
+      if (Number.isNaN(normalizedTransferBonus) || normalizedTransferBonus < 0) {
+        return reply.status(400).send({ error: 'transfer_bonus_clams must be a non-negative integer' });
+      }
+    }
+    const reminderResult = normalizeReminderInterval(reminder_interval_minutes);
+    if (reminder_interval_minutes !== undefined && !reminderResult.valid) {
+      return reply.status(400).send({ error: 'reminder_interval_minutes must be a non-negative integer' });
+    }
+
     if (crontab !== undefined && crontab !== null) {
       try {
         CronExpressionParser.parse(crontab);
@@ -1526,7 +2776,10 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       }
     }
 
-    const existingSchedule = await ChoreSchedule.query().findById(id);
+    const existingSchedule = await knex('chore_schedules')
+      .select('id', 'user_id', 'crontab', 'duration', 'interval', 'snoozed_until')
+      .where('id', id)
+      .first();
     if (!existingSchedule) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -1577,6 +2830,15 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       }
     }
     if (visible !== undefined) { patch.visible = visible ? 1 : 0; }
+    if (due_time !== undefined) { patch.due_time = dueTimeResult.value; }
+    if (sound !== undefined) { patch.sound = sound || null; }
+    if (sound_enabled !== undefined) { patch.sound_enabled = sound_enabled ? 1 : 0; }
+    if (reminder_interval_minutes !== undefined) { patch.reminder_interval_minutes = reminderResult.value; }
+    if (due_date !== undefined) { patch.due_date = dueDateResult.value; }
+    if (transferable !== undefined) { patch.transferable = transferable ? 1 : 0; }
+    if (can_snooze !== undefined) { patch.can_snooze = can_snooze ? 1 : 0; }
+    if (snoozed_until !== undefined) { patch.snoozed_until = snoozedUntilResult.value; }
+    if (transfer_bonus_clams !== undefined) { patch.transfer_bonus_clams = normalizedTransferBonus; }
 
     if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
@@ -1587,6 +2849,45 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
     if (updated === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
+
+    // When a chore is reassigned to a different person, re-check the daily "all
+    // regular chores done" bonus for both the previous and new owner. Losing a
+    // chore can make someone newly all-done, so this awards the bonus they've
+    // earned. By default no one loses points on a move; the transfer dialog can
+    // explicitly send `revoke_daily_bonus` (the parent's "revoke current reward
+    // and assign" choice, issue #122) to take back the receiver's already-earned
+    // daily bonus. The alternative "keep reward" choice persists
+    // `transfer_bonus_clams` (threaded above), paid out when the moved chore is
+    // completed.
+    if (user_id !== undefined) {
+      const previousUserId = existingSchedule.user_id;
+      const nextUserId = user_id || null;
+      if (previousUserId !== nextUserId) {
+        const today = getTodayLocalDateString();
+        if (previousUserId) {
+          await awardDailyRegularBonusIfDue(previousUserId, today);
+        }
+        if (nextUserId) {
+          if (revoke_daily_bonus === true) {
+            await revokeDailyRegularBonus(nextUserId, today);
+          }
+          // Revoke-then-award is idempotent: if the receiver's due set is
+          // somehow still complete, the bonus is immediately re-awarded.
+          await awardDailyRegularBonusIfDue(nextUserId, today);
+        }
+      }
+    }
+
+    // Snoozing defers a chore out of today's required set — if that was the
+    // assignee's last open chore, their day is now complete. Award-only:
+    // un-snoozing never takes points back.
+    if (snoozed_until !== undefined) {
+      const assigneeId = user_id !== undefined ? (user_id || null) : existingSchedule.user_id;
+      if (assigneeId) {
+        await awardDailyRegularBonusIfDue(assigneeId, getTodayLocalDateString());
+      }
+    }
+
     return { success: true };
   } catch (error) {
     console.error('Error updating schedule:', error);
@@ -1652,18 +2953,25 @@ fastify.get('/api/chore-history/summary/:userId', async (request, reply) => {
   }
 });
 
+const CHORE_HISTORY_KINDS = new Set(['completion', 'daily_bonus', 'transfer_bonus', 'adjustment', 'missed', 'spent']);
+
 fastify.post('/api/chore-history', async (request, reply) => {
-  const { user_id, chore_schedule_id, date, clam_value } = request.body;
+  const { user_id, chore_schedule_id, date, clam_value, kind } = request.body;
   try {
     if (!user_id || !date) {
       return reply.status(400).send({ error: 'user_id and date are required' });
     }
+    if (kind !== undefined && !CHORE_HISTORY_KINDS.has(kind)) {
+      return reply.status(400).send({ error: `kind must be one of: ${[...CHORE_HISTORY_KINDS].join(', ')}` });
+    }
+    const rowKind = kind || (chore_schedule_id ? 'completion' : 'adjustment');
 
     const inserted = await ChoreHistory.query().insert({
       user_id,
       chore_schedule_id: chore_schedule_id || null,
       date,
       clam_value: clam_value || 0,
+      kind: rowKind,
     });
     return { id: inserted.id, success: true };
   } catch (error) {
@@ -1680,7 +2988,7 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
     const sinceStr = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-${String(since.getDate()).padStart(2, '0')}`;
     const rows = await knex('chore_history as ch')
       .leftJoin('users as u', 'ch.user_id', 'u.id')
-      .select('ch.id', 'ch.date', 'ch.clam_value', 'ch.title', 'ch.created_at', 'u.username')
+      .select('ch.id', 'ch.date', 'ch.clam_value', 'ch.title', 'ch.kind', 'ch.created_at', 'u.username')
       .where('ch.date', '>=', sinceStr)
       .whereNot('ch.clam_value', 0)
       .orderBy([{ column: 'ch.date', order: 'desc' }, { column: 'ch.created_at', order: 'desc' }]);
@@ -1705,6 +3013,154 @@ fastify.delete('/api/chore-history/:id', async (request, reply) => {
   }
 });
 
+// Household vacation state (issues #121/#72): written by the Admin Panel's
+// vacation-mode save as the `vacation_mode` settings key —
+// { enabled, startDate, endDate } ('YYYY-MM-DD', empty = unbounded). While
+// active, the nightly job skips missed-chore logging so days off never count
+// against completion rates, and the metrics plugin bridges streaks across
+// those days.
+async function isVacationActiveOn(dateStr) {
+  try {
+    const row = await knex('settings').select('value').where('key', 'vacation_mode').first();
+    if (!row || !row.value) return false;
+    const vacation = JSON.parse(row.value);
+    if (!vacation || vacation.enabled !== true) return false;
+    if (vacation.startDate && dateStr < vacation.startDate) return false;
+    if (vacation.endDate && dateStr > vacation.endDate) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Returns the list of a user's regular (non-bonus) chore schedules that were
+// due on `dateStr` ('YYYY-MM-DD' local). `referenceNow` anchors the snooze
+// check: the award path uses real now (default); the nightly missed logger
+// passes end-of-that-day so "snoozed through the day" excludes the chore
+// (issue #72).
+async function getTodaysRegularChoresForUser(userId, dateStr, referenceNow = new Date()) {
+  const allUserSchedules = await knex('chore_schedules as cs')
+    .join('chores as c', 'cs.chore_id', 'c.id')
+    .select(
+      'cs.*',
+      'c.clam_value',
+      'c.title',
+      knex.raw(
+        `EXISTS (
+         SELECT 1
+         FROM chore_history ch
+         WHERE ch.chore_schedule_id = cs.id
+           AND ch.user_id = cs.user_id
+           AND ch.date = ?
+           AND ch.kind = 'completion'
+     ) AS completed_today`,
+        [dateStr]
+      )
+    )
+    .where('cs.user_id', userId)
+    .where('cs.visible', 1)
+    .whereRaw("NOT (cs.crontab IS NOT NULL AND cs.duration IN ('until-completed', 'once-completed'))");
+
+  const regularChores = allUserSchedules
+    .filter(s => s.clam_value === 0)
+    // Snoozed chores are deferred: hidden from the dashboard and neither
+    // required for nor counted toward the daily completion bonus.
+    .filter(s => !s.snoozed_until || new Date(s.snoozed_until) <= referenceNow);
+
+  // Anchor the cron replay to the target date, not the wall clock, so the
+  // helper works for past dates too. For today this is byte-identical to the
+  // old new Date()-based anchor.
+  const startOfDay = parseDateOnlyToLocalDate(dateStr) || new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const justBeforeDay = new Date(startOfDay.getTime() - 1);
+  const options = { currentDate: justBeforeDay, utc: false };
+
+  const todaysChores = [];
+  for (const schedule of regularChores) {
+    // schedules without crontab are one-time and always part of today's chores
+    if (!schedule.crontab) {
+      todaysChores.push(schedule);
+      continue;
+    }
+
+    // ensure only chores that are due today are part of today's chores
+    const interval = CronExpressionParser.parse(schedule.crontab, options);
+    const next = interval.next().toISOString().split('T')[0];
+    if (dateStr === next) {
+      todaysChores.push(schedule);
+    }
+  }
+
+  return todaysChores;
+}
+
+// Awards the daily "all regular chores completed" bonus to a user if every regular
+// chore due today is completed and the bonus hasn't already been recorded.
+// Never removes points; safe to call any time a user's chore set changes (e.g. reassignment).
+async function awardDailyRegularBonusIfDue(userId, date) {
+  const today = getTodayLocalDateString();
+  const todaysChores = await getTodaysRegularChoresForUser(userId, today);
+  const uncompletedRegularChores = todaysChores.filter(cs => cs.completed_today == 0);
+
+  if (!todaysChores.length || uncompletedRegularChores.length) {
+    return;
+  }
+
+  const dailyRewardSetting = await knex('settings').select('value').where('key', 'daily_completion_clam_reward').first();
+  const dailyReward = dailyRewardSetting ? parseInt(dailyRewardSetting.value, 10) : 2;
+
+  // kind-based lookup (issue #72): unlike the old (clam_value = current
+  // setting) tuple, this still matches bonuses awarded under an older reward.
+  const bonusAlreadyAwarded = await knex('chore_history')
+    .select('id')
+    .where({ user_id: userId, date, kind: 'daily_bonus' })
+    .first();
+
+  if (!bonusAlreadyAwarded) {
+    await knex('chore_history').insert({
+      user_id: userId,
+      chore_schedule_id: null,
+      date,
+      clam_value: dailyReward,
+      title: 'Regular chores',
+      kind: 'daily_bonus',
+    });
+
+    // This is the one moment "everything on today's list is done" becomes true
+    // for a user, and every route that can finish someone's day funnels through
+    // here — completing a chore, receiving a transfer, or snoozing the last one
+    // out of today. Emitting from inside the not-already-awarded branch gives
+    // the celebration the same once-per-day semantics as the bonus itself
+    // (issue #140).
+    //
+    // The event is emitted regardless of whether any display is configured to
+    // celebrate: it is a factual domain signal that plugins may want, and the
+    // CHORE_CELEBRATION_ENABLED setting is a presentation preference applied
+    // client-side, exactly as CHORE_SOUND_ENABLED gates playback rather than data.
+    const user = await knex('users').select('username').where('id', userId).first();
+    await emitPluginEvent('chore.allCompleted', {
+      userId,
+      username: user ? user.username : null,
+      date,
+      reward: dailyReward,
+    });
+  }
+}
+
+// Deletes the user's daily-completion bonus row for the given date, if present.
+// Used when uncompleting a regular chore, and by the transfer dialog's explicit
+// "revoke current reward and assign" option (issue #122).
+async function revokeDailyRegularBonus(userId, date) {
+  const bonusEntry = await knex('chore_history')
+    .select('id')
+    .where({ user_id: userId, date, kind: 'daily_bonus' })
+    .first();
+
+  if (bonusEntry) {
+    await knex('chore_history').where('id', bonusEntry.id).del();
+  }
+}
+
 // Chore completion endpoints
 fastify.post('/api/chores/complete', async (request, reply) => {
   const { chore_schedule_id, user_id, date } = request.body;
@@ -1726,12 +3182,41 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       return reply.status(400).send({ error: 'Schedule is not visible' });
     }
 
-    const existing = await knex('chore_history').where({ chore_schedule_id, user_id, date }).first();
+    // A 'missed' row must not block completion (retroactive catch-up is
+    // legitimate); it is replaced by the completion below (issue #72).
+    const existing = await knex('chore_history')
+      .select('id')
+      .where({ chore_schedule_id, user_id, date })
+      .whereNot('kind', 'missed')
+      .first();
     if (existing) {
       return reply.status(409).send({ error: 'Chore already completed for this date' });
     }
 
-    await ChoreHistory.query().insert({ user_id, chore_schedule_id, date, clam_value: schedule.clam_value, title: schedule.title });
+    await knex('chore_history').where({ chore_schedule_id, user_id, date, kind: 'missed' }).del();
+    await knex('chore_history').insert({
+      user_id,
+      chore_schedule_id,
+      date,
+      clam_value: schedule.clam_value,
+      title: schedule.title,
+      kind: 'completion',
+    });
+
+    // Pay out a pending transfer bonus (attached by the parent when moving
+    // this chore to a kid whose day was already complete) and clear it so it
+    // pays only once.
+    if (schedule.transfer_bonus_clams > 0) {
+      await knex('chore_history').insert({
+        user_id,
+        chore_schedule_id,
+        date,
+        clam_value: schedule.transfer_bonus_clams,
+        title: 'Transfer bonus',
+        kind: 'transfer_bonus',
+      });
+      await knex('chore_schedules').where('id', chore_schedule_id).update({ transfer_bonus_clams: 0 });
+    }
 
     if (schedule.parent_schedule_id) {
       const parentSchedule = await knex('chore_schedules')
@@ -1751,57 +3236,21 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       }
     }
 
-    const today = getTodayLocalDateString();
-    const allUserSchedules = await knex('chore_schedules as cs')
-      .join('chores as c', 'cs.chore_id', 'c.id')
-      .select('cs.*', 'c.clam_value')
-      .select(knex.raw(
-        'EXISTS (SELECT 1 FROM chore_history ch WHERE ch.chore_schedule_id = cs.id AND ch.user_id = cs.user_id AND ch.date = ?) AS completed_today',
-        [today]
-      ))
-      .where('cs.user_id', user_id)
-      .where('cs.visible', 1)
-      .whereRaw("NOT (cs.crontab IS NOT NULL AND cs.duration IN ('until-completed', 'once-completed'))");
+    // Announce this completion before awarding the daily bonus, because the
+    // award emits chore.allCompleted. Emitting in the other order would tell a
+    // subscriber the day was finished while the chore that finished it had not
+    // been announced yet — a plugin counting completions would be one short.
+    await emitPluginEvent('chore.completed', {
+      userId: user_id,
+      choreId: schedule.chore_id,
+      scheduleId: chore_schedule_id,
+      clamValue: schedule.clam_value,
+      date,
+    });
 
-    const regularChores = allUserSchedules.filter(s => s.clam_value === 0);
+    await awardDailyRegularBonusIfDue(user_id, date);
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const justBeforeToday = new Date(startOfToday.getTime() - 1);
-    let options = {
-      currentDate: justBeforeToday,
-      utc: false,
-    }
-    let todaysChores = []
-    for (const schedule of regularChores) {
-      // schedules without crontab are one-time and always part of today's chores
-      if (!schedule.crontab) {
-        todaysChores.push(schedule);
-        continue;
-      }
-
-      // ensure only chores that are due today are part of today's chores
-      const interval = CronExpressionParser.parse(schedule.crontab, options);
-      const next = interval.next().toISOString().split('T')[0];
-      if (today === next) {
-        todaysChores.push(schedule);
-      }
-    }
-
-    const uncompletedRegularChores = todaysChores.filter(cs => cs.completed_today == 0);
-    if (todaysChores.length && !uncompletedRegularChores.length) {
-      const dailyRewardSetting = await Setting.query().findById('daily_completion_clam_reward');
-      const dailyReward = dailyRewardSetting ? parseInt(dailyRewardSetting.value, 10) : 2;
-
-      const bonusAlreadyAwarded = await knex('chore_history')
-        .where({ user_id, date, chore_schedule_id: null, clam_value: dailyReward, title: 'Regular chores' })
-        .first();
-
-      if (!bonusAlreadyAwarded) {
-        await ChoreHistory.query().insert({ user_id, chore_schedule_id: null, date, clam_value: dailyReward, title: 'Regular chores' });
-      }
-    }
-
+    // Read the total after the award so the response includes the bonus.
     const total = await getUserClamTotal(user_id);
 
     return { success: true, clam_total: total };
@@ -1818,9 +3267,11 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
       return reply.status(400).send({ error: 'chore_schedule_id, user_id, and date are required' });
     }
 
+    // kind-based lookup finds the actual completion record, never a transfer
+    // payout or a stale missed row (issue #72).
     const history = await knex('chore_history')
       .select('id', 'clam_value')
-      .where({ chore_schedule_id, user_id, date })
+      .where({ chore_schedule_id, user_id, date, kind: 'completion' })
       .first();
     if (!history) {
       return reply.status(404).send({ error: 'Completion record not found' });
@@ -1828,21 +3279,35 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
 
     await knex('chore_history').where('id', history.id).del();
 
+    // If completing this chore paid out a transfer bonus, take the payout back
+    // and re-arm it on the schedule so re-completing pays again.
+    const transferBonusRow = await knex('chore_history')
+      .select('id', 'clam_value')
+      .where({ chore_schedule_id, user_id, date, kind: 'transfer_bonus' })
+      .first();
+    if (transferBonusRow) {
+      await knex('chore_history').where('id', transferBonusRow.id).del();
+      await knex('chore_schedules').where('id', chore_schedule_id).update({ transfer_bonus_clams: transferBonusRow.clam_value });
+    }
+
     // if the uncompleted chore was a bonus chore (has clam value), don't remove the daily bonus when uncompleting
     if (!history.clam_value) {
-      const dailyRewardSetting = await Setting.query().findById('daily_completion_clam_reward');
-      const dailyReward = dailyRewardSetting ? parseInt(dailyRewardSetting.value, 10) : 2;
-
-      const bonusEntry = await knex('chore_history')
-        .where({ user_id, date, chore_schedule_id: null, clam_value: dailyReward, title: 'Regular chores' })
-        .first();
-
-      if (bonusEntry) {
-        await knex('chore_history').where('id', bonusEntry.id).del();
-      }
+      await revokeDailyRegularBonus(user_id, date);
     }
 
     const total = await getUserClamTotal(user_id);
+
+    // Mirror of chore.completed so plugins (and declarative reactions with a
+    // negative factor) can compensate — without this, complete → uncomplete →
+    // re-complete double-counts durable reaction effects.
+    const uncompletedSchedule = await knex('chore_schedules').select('chore_id').where('id', chore_schedule_id).first();
+    await emitPluginEvent('chore.uncompleted', {
+      userId: user_id,
+      choreId: uncompletedSchedule?.chore_id ?? null,
+      scheduleId: chore_schedule_id,
+      clamValue: history.clam_value,
+      date,
+    });
 
     return { success: true, clam_total: total };
   } catch (error) {
@@ -1878,9 +3343,11 @@ fastify.post('/api/users/:id/clams/add', async (request, reply) => {
       date: useDate,
       clam_value: amount,
       title: 'Adjustment',
+      kind: 'adjustment',
     });
 
     const total = await getUserClamTotal(id);
+    await emitPluginEvent('clam.deposited', { userId: parseInt(id), amount, newTotal: total });
     return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error adding clams:', error);
@@ -1890,36 +3357,42 @@ fastify.post('/api/users/:id/clams/add', async (request, reply) => {
 
 fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
   const { id } = request.params;
-  const { amount } = request.body;
+  const { amount, kind, title } = request.body;
   try {
     if (!amount || amount <= 0) {
       return reply.status(400).send({ error: 'Valid positive amount is required' });
     }
+    // 'spent' = prize redemption / spending (default); 'adjustment' lets the
+    // admin clam editor mark corrections distinctly.
+    const rowKind = kind === undefined ? 'spent' : kind;
+    if (rowKind !== 'spent' && rowKind !== 'adjustment') {
+      return reply.status(400).send({ error: "kind must be 'spent' or 'adjustment'" });
+    }
+    // Optional note recording WHAT was spent on (e.g. "Toy store" from the
+    // avatar quick-spend) — lands in the ledger and metrics.
+    const trimmedTitle = typeof title === 'string' ? title.trim().slice(0, 120) : '';
 
     const currentTotal = await getUserClamTotal(id);
     if (currentTotal < amount) {
       return reply.status(400).send({ error: 'Insufficient clams' });
     }
 
-    let remaining = amount;
-    const entries = await knex('chore_history')
-      .where('user_id', id)
-      .where('clam_value', '>', 0)
-      .orderBy('created_at', 'asc');
-
-    for (const entry of entries) {
-      if (remaining <= 0) break;
-
-      if (entry.clam_value <= remaining) {
-        await knex('chore_history').where('id', entry.id).del();
-        remaining -= entry.clam_value;
-      } else {
-        await knex('chore_history').where('id', entry.id).update({ clam_value: entry.clam_value - remaining });
-        remaining = 0;
-      }
-    }
+    // Non-destructive spend (issue #72): record a negative ledger row instead
+    // of the old FIFO delete/mutate of earned rows. Balances are
+    // SUM(clam_value) everywhere, so totals are unchanged — but history no
+    // longer shrinks retroactively when clams are spent.
+    const useDate = getTodayLocalDateString();
+    await knex('chore_history').insert({
+      user_id: id,
+      chore_schedule_id: null,
+      date: useDate,
+      clam_value: -amount,
+      title: trimmedTitle || (rowKind === 'spent' ? 'Spent' : 'Adjustment'),
+      kind: rowKind,
+    });
 
     const total = await getUserClamTotal(id);
+    await emitPluginEvent('clam.withdrawn', { userId: parseInt(id), amount, newTotal: total });
     return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error reducing clams:', error);
@@ -1937,7 +3410,12 @@ async function getUserClamTotal(userId) {
 
 fastify.get('/api/users', async (request, reply) => {
   try {
-    const users = await User.query().select('id', 'username', 'email', 'profile_picture');
+    // Admin-chosen display order (issue #134). Every consumer — the chore
+    // widget columns, assignment dropdowns, transfer and split pickers —
+    // renders in the order returned here, so this one clause orders them all.
+    const users = await knex('users')
+      .select('id', 'username', 'email', 'profile_picture', 'sort_order')
+      .orderBy([{ column: 'sort_order' }, { column: 'id' }]);
 
     const usersWithClams = await Promise.all(
       users.map(async (user) => ({
@@ -1959,11 +3437,54 @@ fastify.get('/api/users', async (request, reply) => {
 fastify.post('/api/users', async (request, reply) => {
   const { username, email, profile_picture } = request.body;
   try {
-    const inserted = await User.query().insert({ username, email, profile_picture });
+    // New users land at the end of the display order.
+    const maxOrder = await knex('users').max({ max: 'sort_order' }).first();
+    const inserted = await User.query().insert({
+      username,
+      email,
+      profile_picture,
+      sort_order: (maxOrder?.max ?? 0) + 1,
+    });
     return { id: inserted.id };
   } catch (error) {
     console.error('Error adding user:', error);
     reply.status(500).send({ error: 'Failed to add user' });
+  }
+});
+
+// Set the display order (issue #134). The client sends the full desired order
+// and the server just persists it — same contract as the tab reorder endpoint.
+// Registered before /api/users/:id; find-my-way matches the static path first.
+fastify.patch('/api/users/reorder', async (request, reply) => {
+  const { orderedUserIds } = request.body || {};
+  try {
+    if (!Array.isArray(orderedUserIds) || orderedUserIds.some((id) => !Number.isInteger(id))) {
+      return reply.status(400).send({ error: 'orderedUserIds must be an array of user ids' });
+    }
+
+    // The bonus pseudo-user (id 0) never renders on the dashboard and keeps
+    // sort_order 0, so it stays pinned first and is not reorderable.
+    const reorderable = (await knex('users').select('id').whereNot('id', 0)).map((row) => row.id);
+    const unique = new Set(orderedUserIds);
+    const coversEveryUser = unique.size === orderedUserIds.length
+      && orderedUserIds.length === reorderable.length
+      && reorderable.every((id) => unique.has(id));
+    if (!coversEveryUser) {
+      return reply.status(400).send({ error: 'orderedUserIds must list every reorderable user exactly once' });
+    }
+
+    // Dense 1..n keeps bonus (0) first; no UNIQUE constraint here, so unlike
+    // the tab reorder this needs no temporary-value pass.
+    await knex.transaction(async (trx) => {
+      for (let index = 0; index < orderedUserIds.length; index++) {
+        await trx('users').where('id', orderedUserIds[index]).update({ sort_order: index + 1 });
+      }
+    });
+
+    return { success: true, orderedUserIds };
+  } catch (error) {
+    console.error('Error reordering users:', error);
+    reply.status(500).send({ error: 'Failed to reorder users' });
   }
 });
 
@@ -1983,8 +3504,69 @@ fastify.patch('/api/users/:id', async (request, reply) => {
   }
 });
 
+// Default avatar bank (issue #132): bundled art users can pick instead of
+// uploading a photo. Listed in a stable, curated order — people first
+// (each in five skin tones), then the fun ones.
+const DEFAULT_AVATAR_ORDER = ['mom', 'dad', 'girl', 'boy', 'cat', 'dog', 'fish', 'alpaca', 'chicken', 'dino', 'robot', 'unicorn', 'frog'];
+
+fastify.get('/api/avatars/defaults', async (request, reply) => {
+  try {
+    let files = [];
+    try {
+      files = fsSync.readdirSync(AVATARS_UPLOAD_DIR).filter((f) => f.endsWith('.svg'));
+    } catch {
+      files = [];
+    }
+    const rank = (f) => {
+      const base = f.replace(/\.svg$/, '');
+      const prefix = base.replace(/-\d+$/, '');
+      const idx = DEFAULT_AVATAR_ORDER.indexOf(prefix);
+      return [idx === -1 ? DEFAULT_AVATAR_ORDER.length : idx, base];
+    };
+    files.sort((a, b) => {
+      const [ra, na] = rank(a);
+      const [rb, nb] = rank(b);
+      return ra - rb || na.localeCompare(nb);
+    });
+    // profile_picture values are relative to /Uploads/users/, so the stored
+    // filename for a default is "defaults/<file>".
+    return files.map((f) => ({
+      filename: `defaults/${f}`,
+      name: f.replace(/\.svg$/, '').replace(/-\d+$/, '').replace(/^./, (c) => c.toUpperCase()),
+    }));
+  } catch (error) {
+    console.error('Error listing default avatars:', error);
+    reply.status(500).send({ error: 'Failed to list default avatars' });
+  }
+});
+
+// Select a default avatar as a user's profile picture. Unlike photo uploads
+// this is safe to allow in demo mode.
+fastify.post('/api/users/:id/avatar', async (request, reply) => {
+  const { id } = request.params;
+  const { filename } = request.body || {};
+  try {
+    if (typeof filename !== 'string' || !/^defaults\/[a-z0-9-]+\.svg$/.test(filename)) {
+      return reply.status(400).send({ error: 'filename must be a default avatar (defaults/<name>.svg)' });
+    }
+    const base = filename.slice('defaults/'.length);
+    if (!fsSync.existsSync(path.join(AVATARS_UPLOAD_DIR, base))) {
+      return reply.status(404).send({ error: 'Unknown default avatar' });
+    }
+    const updated = await User.query().patch({ profile_picture: filename }).where({ id });
+    if (updated === 0) {
+      return reply.status(404).send({ error: 'User not found' });
+    }
+    return { success: true, filename };
+  } catch (error) {
+    console.error('Error setting default avatar:', error);
+    reply.status(500).send({ error: 'Failed to set avatar' });
+  }
+});
+
 // NEW: Endpoint to upload user profile picture
 fastify.post('/api/users/:id/upload-picture', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     const { id } = request.params;
     console.log(`Upload picture request for user ${id}`);
@@ -2105,6 +3687,98 @@ fastify.get('/api/timezone', async (request, reply) => {
   return reply.send({ timezone: APP_TIMEZONE });
 });
 
+// Demo-mode status for the client (banner, first-run seeding, PIN skip).
+fastify.get('/api/demo', async () => {
+  return { demo: DEMO_MODE, resetHours: DEMO_MODE ? DEMO_RESET_HOURS : null };
+});
+
+// Weather (issue #57). The provider — OpenWeatherMap, Home Assistant, or the
+// demo snapshot — is chosen server-side, so credentials never reach a browser
+// and one upstream call serves every display in the house.
+fastify.get('/api/weather', async (request, reply) => {
+  try {
+    const { location, lat, lon, units, lang, refresh } = request.query || {};
+    const payload = await weatherService.getWeather({
+      locationQuery: location,
+      lat: lat === undefined ? undefined : Number(lat),
+      lon: lon === undefined ? undefined : Number(lon),
+      units: units === 'metric' ? 'metric' : 'imperial',
+      lang: String(lang || 'en').split('-')[0],
+      demoMode: DEMO_MODE,
+      forceRefresh: refresh === '1' || refresh === 'true',
+    });
+    return payload;
+  } catch (error) {
+    // Provider errors already carry a status (401 bad credentials, 404 unknown
+    // location, 503 unreachable); anything else is ours.
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    console.error('Error fetching weather:', error.message);
+    return reply.status(status).send({ error: error.message || 'Failed to fetch weather.' });
+  }
+});
+
+// Resolve a free-text location to coordinates. Used by the weather widget's
+// settings dialog and by auto dark mode, both of which used to call
+// OpenWeatherMap's geocoder from the browser with the raw API key.
+fastify.get('/api/weather/geocode', async (request, reply) => {
+  try {
+    const query = String(request.query?.q || '').trim();
+
+    // With no query, report the provider's own location where it has one. A
+    // Home Assistant household already told HA where it lives, so auto dark
+    // mode should not need a second answer — or an OpenWeatherMap key.
+    if (!query) {
+      if ((await weatherService.getConfiguredProvider()) === weatherService.PROVIDERS.HOMEASSISTANT
+        && (await homeAssistant.isConfigured())) {
+        const config = await homeAssistant.homeAssistantFetch('GET', '/api/config');
+        if (Number.isFinite(config?.latitude) && Number.isFinite(config?.longitude)) {
+          return {
+            lat: config.latitude,
+            lon: config.longitude,
+            resolvedName: config.location_name || '',
+          };
+        }
+      }
+      return reply.status(400).send({ error: 'A location query is required.' });
+    }
+
+    const apiKey = (await knex('settings').select('value').where('key', 'WEATHER_API_KEY').first())?.value;
+    if (!apiKey) {
+      return reply.status(400).send({
+        error: 'Geocoding needs an OpenWeatherMap API key. Save one in the Connections tab, or let Home Assistant supply the location.',
+      });
+    }
+
+    const openWeatherMap = require('./services/weather/openweathermap');
+    const resolved = await openWeatherMap.resolveCoordinates(query, apiKey);
+    return { lat: resolved.lat, lon: resolved.lon, resolvedName: resolved.name || '' };
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    console.error('Error geocoding location:', error.message);
+    return reply.status(status).send({ error: error.message || 'Failed to resolve location.' });
+  }
+});
+
+// Sunrise/sunset for auto dark mode. Computed from coordinates rather than
+// fetched, so the theme switches on schedule with no weather provider
+// configured and no API key held.
+fastify.get('/api/sun', async (request, reply) => {
+  const lat = Number(request.query?.lat);
+  const lon = Number(request.query?.lon);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return reply.status(400).send({ error: 'lat and lon are required.' });
+  }
+
+  const times = computeSunTimes(lat, lon);
+  return {
+    sunrise: times.sunrise,
+    sunset: times.sunset,
+    alwaysUp: times.alwaysUp,
+    alwaysDown: times.alwaysDown,
+  };
+});
+
 function deserializeSettingValue(value) {
   if (typeof value !== 'string') {
     return value;
@@ -2123,15 +3797,37 @@ function deserializeSettingValue(value) {
   }
 }
 
+// Settings that must never be serialized to a client. GET /api/settings is
+// unauthenticated and returns the whole table, so anything secret has to be
+// filtered here rather than merely encrypted at rest — the ciphertext is still
+// not something to hand out. Connection state for these lives behind the
+// /api/connections/* status routes, which report booleans and previews instead.
+const REDACTED_SETTING_KEYS = new Set([
+  'GOOGLE_CLIENT_SECRET_ENC',
+  homeAssistant.TOKEN_KEY,
+  // The OpenWeatherMap key used to be handed to every browser so the widget
+  // could call the API itself. Now that weather is fetched server-side, nothing
+  // on the client needs it — the Admin Panel shows whether one is stored via
+  // GET /api/connections/weather/status and writes a replacement blind.
+  'WEATHER_API_KEY',
+]);
+
+// Convert an array of {key, value} settings rows into a single {key: value}
+// object, deserializing any JSON-encoded values and dropping secrets.
+const rowsToSettingsObject = (rows) => rows.reduce((acc, row) => {
+  if (REDACTED_SETTING_KEYS.has(row.key)) return acc;
+  acc[row.key] = deserializeSettingValue(row.value);
+  return acc;
+}, {});
+
 // NEW: API Endpoints for Settings (including API keys)
 fastify.get('/api/settings', async (request, reply) => {
   try {
-    const rows = await Setting.query().select('key', 'value');
-    // Convert array of {key, value} objects to a single object {key: value}
-    const settings = rows.reduce((acc, row) => {
-      acc[row.key] = deserializeSettingValue(row.value);
-      return acc;
-    }, {});
+    console.log('=== FETCHING SETTINGS ===');
+    const rows = await knex('settings').select('key', 'value');
+    console.log('Raw settings from database:', rows);
+    const settings = rowsToSettingsObject(rows);
+    console.log('Processed settings object:', settings);
     return settings;
   } catch (error) {
     console.error('Error fetching settings:', error);
@@ -2146,17 +3842,18 @@ fastify.post('/api/settings/search', async (request, reply) => {
 
     // accept simple wildcards for partial match via * (e.g. WEATHER_* to match all
     // weather related settings)
-    const query = Setting.query().select('key', 'value');
+    const query = knex('settings').select('key', 'value');
     if (keys.length) {
       query.where((builder) => {
         keys.forEach((key) => builder.orWhere('key', 'like', String(key).replaceAll('*', '%')));
       });
     }
     const rows = await query;
-    const settings = rows.reduce((acc, row) => {
-      acc[row.key] = deserializeSettingValue(row.value);
-      return acc;
-    }, {});
+    console.log('Raw settings from database:', rows);
+    // rowsToSettingsObject drops REDACTED_SETTING_KEYS, so a wildcard search is
+    // not a way around the redaction that GET /api/settings applies.
+    const settings = rowsToSettingsObject(rows);
+    console.log('Processed settings object:', settings);
     return settings;
   } catch (error) {
     console.error('Error fetching settings:', error);
@@ -2171,9 +3868,27 @@ fastify.post('/api/settings', async (request, reply) => {
     return reply.status(400).send({ error: 'Key and value are required.' });
   }
   try {
-    // Upsert: insert a new setting or replace the value of an existing one
-    // (equivalent to the previous INSERT OR REPLACE).
-    await Setting.query().insert({ key, value }).onConflict('key').merge();
+    // Redacted settings are never sent to the client, so the Admin Panel edits
+    // them blind and submits an empty string when the user did not retype one.
+    // Treat that as "leave it alone" rather than as "delete it" — otherwise
+    // saving any other field on the same form would silently wipe the secret.
+    if (REDACTED_SETTING_KEYS.has(key) && String(value).trim() === '') {
+      console.log(`Skipping blank write to redacted setting '${key}' (left unchanged).`);
+      return { success: true, message: `Setting '${key}' left unchanged.` };
+    }
+
+    // Use an upsert to either insert a new setting or update an existing one
+    await knex('settings').insert({ key, value }).onConflict('key').merge({ value });
+
+    // Verify the setting was saved
+    const verification = await knex('settings').select('key', 'value').where('key', key).first();
+    console.log('Verification query result:', verification);
+
+    // Changing the provider or its credentials invalidates anything cached
+    // under the old configuration.
+    if (key === 'WEATHER_API_KEY' || key === weatherService.PROVIDER_SETTING_KEY) {
+      weatherService.clearCache();
+    }
     return { success: true, message: `Setting '${key}' saved successfully.` };
   } catch (error) {
     console.error(`Error saving setting '${key}':`, error);
@@ -2579,7 +4294,7 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout/bulk', async (
   try {
     await ensureDeviceExists(deviceName);
     const tabsByNumber = new Map(
-      await getTabsForDevice(deviceName).map(tab => [tab.number, {
+      (await getTabsForDevice(deviceName)).map(tab => [tab.number, {
         tab,
         layoutMap: parseTabConfigJson(tab.config_json),
         changed: false,
@@ -2663,6 +4378,7 @@ fastify.post('/api/test-api-key', async (request, reply) => {
 
 // NEW: Generic CORS Proxy Endpoint
 fastify.get('/api/proxy', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   console.log('=== PROXY REQUEST RECEIVED ===');
   console.log('Query params:', request.query);
   console.log('Headers:', request.headers);
@@ -2708,6 +4424,8 @@ fastify.get('/api/proxy', async (request, reply) => {
 
     console.log(`Proxying request to whitelisted domain: ${targetUrl}`);
 
+    const proxyHttpsAgent = httpsAgentFor(targetUrl);
+
     // Configure axios for both HTTP and HTTPS
     const axiosConfig = {
       timeout: 15000, // 15 second timeout
@@ -2719,17 +4437,16 @@ fastify.get('/api/proxy', async (request, reply) => {
       maxRedirects: 5,
       validateStatus: function (status) {
         return status < 500; // Resolve only if the status code is less than 500
-      }
+      },
+      // Certificate policy is decided per request from the target's address
+      // class (issue #139). This used to set NODE_TLS_REJECT_UNAUTHORIZED='0',
+      // which disabled verification for the whole process — every later Google
+      // token exchange included — and never restored it.
+      ...(proxyHttpsAgent ? { httpsAgent: proxyHttpsAgent } : {}),
     };
 
-    // For HTTP requests, ensure we don't have HTTPS-specific configurations
-    if (target.protocol === 'http:') {
-      console.log('Making HTTP request (not HTTPS)');
-      // No special HTTPS agent needed for HTTP
-    } else {
-      console.log('Making HTTPS request');
-      // For HTTPS, we might need to handle self-signed certificates
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // Only for development
+    if (isCertificateVerificationSkipped(targetUrl)) {
+      console.log(`Proxy: ${targetHostname} is a private address; accepting a self-signed certificate.`);
     }
 
     console.log('Making axios request with config:', axiosConfig);
@@ -2802,6 +4519,17 @@ fastify.get('/api/proxy', async (request, reply) => {
 });
 
 // Prize routes
+
+// Shared validation for the prize create/update body. Returns { error } on
+// failure, or the parsed { name, clam_cost } on success.
+const validatePrizeBody = (body) => {
+  const { name, clam_cost } = body || {};
+  if (!name || !clam_cost || clam_cost <= 0) {
+    return { error: 'Prize name and a positive clam cost are required.' };
+  }
+  return { name, clam_cost };
+};
+
 fastify.get('/api/prizes', async (request, reply) => {
   try {
     const rows = await Prize.query();
@@ -2813,12 +4541,13 @@ fastify.get('/api/prizes', async (request, reply) => {
 });
 
 fastify.post('/api/prizes', async (request, reply) => {
-  const { name, clam_cost } = request.body;
-  if (!name || !clam_cost || clam_cost <= 0) {
-    return reply.status(400).send({ error: 'Prize name and a positive clam cost are required.' });
+  const { name, clam_cost, error: validationError } = validatePrizeBody(request.body);
+  if (validationError) {
+    return reply.status(400).send({ error: validationError });
   }
   try {
-    const inserted = await Prize.query().insert({ name, clam_cost });
+    const repeatable = request.body.repeatable === true ? 1 : 0;
+    const inserted = await Prize.query().insert({ name, clam_cost, repeatable });
     return { id: inserted.id };
   } catch (error) {
     console.error('Error adding prize:', error);
@@ -2828,12 +4557,15 @@ fastify.post('/api/prizes', async (request, reply) => {
 
 fastify.patch('/api/prizes/:id', async (request, reply) => {
   const { id } = request.params;
-  const { name, clam_cost } = request.body;
-  if (!name || !clam_cost || clam_cost <= 0) {
-    return reply.status(400).send({ error: 'Prize name and a positive clam cost are required.' });
+  const { name, clam_cost, error: validationError } = validatePrizeBody(request.body);
+  if (validationError) {
+    return reply.status(400).send({ error: validationError });
   }
   try {
-    const updated = await Prize.query().patch({ name, clam_cost }).where({ id });
+    const repeatable = request.body.repeatable === true ? 1 : (request.body.repeatable === false ? 0 : null);
+    const updated = repeatable === null
+      ? await Prize.query().patch({ name, clam_cost }).where({ id })
+      : await Prize.query().patch({ name, clam_cost, repeatable }).where({ id });
     if (updated === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
@@ -2855,6 +4587,250 @@ fastify.delete('/api/prizes/:id', async (request, reply) => {
   } catch (error) {
     console.error('Error deleting prize:', error);
     reply.status(500).send({ error: 'Failed to delete prize' });
+  }
+});
+
+// --- Prize store (prize spending mechanism) ---
+// `prizes` is the definitions ledger; a prize_offers row is one redeemable
+// instance a parent placed in the store — mirroring chores/chore_schedules.
+// Request-queue lifecycle: available → requested (kid asks on the kiosk) →
+// redeemed (parent approves: clams deducted via a kind='spent' ledger row,
+// offer leaves the store — one-time). Decline/cancel returns to available.
+
+// List store offers (everything not yet redeemed), joined with the live prize
+// definition and the requesting kid.
+fastify.get('/api/prize-offers', async (request, reply) => {
+  try {
+    const offers = await knex('prize_offers as po')
+      .join('prizes as p', 'po.prize_id', 'p.id')
+      .leftJoin('users as u', 'po.requested_by', 'u.id')
+      .select(
+        'po.id', 'po.prize_id', 'po.status', 'po.requested_by', 'po.requested_at', 'po.created_at',
+        'po.split_user_ids',
+        'p.name', 'p.clam_cost', 'p.repeatable',
+        'u.username as requested_by_name'
+      )
+      .whereNot('po.status', 'redeemed')
+      .orderBy([{ column: 'po.created_at', order: 'asc' }, { column: 'po.id', order: 'asc' }]);
+    return offers.map((offer) => ({
+      ...offer,
+      repeatable: offer.repeatable === 1,
+      split_user_ids: offer.split_user_ids ? JSON.parse(offer.split_user_ids) : [],
+    }));
+  } catch (error) {
+    console.error('Error listing prize offers:', error);
+    reply.status(500).send({ error: 'Failed to list prize offers' });
+  }
+});
+
+// Parent: place a prize from the ledger into the store.
+fastify.post('/api/prize-offers', async (request, reply) => {
+  const { prize_id } = request.body;
+  try {
+    const prize = await Prize.query().select('id').findById(prize_id);
+    if (!prize) {
+      return reply.status(404).send({ error: 'Prize not found' });
+    }
+    const inserted = await PrizeOffer.query().insert({ prize_id, status: 'available' });
+    return { id: inserted.id, success: true };
+  } catch (error) {
+    console.error('Error creating prize offer:', error);
+    reply.status(500).send({ error: 'Failed to add prize to the store' });
+  }
+});
+
+// Parent: take an unredeemed offer back out of the store.
+fastify.delete('/api/prize-offers/:id', async (request, reply) => {
+  const { id } = request.params;
+  try {
+    const deleted = await PrizeOffer.query().delete().where('id', id).whereNot('status', 'redeemed');
+    if (deleted === 0) {
+      return reply.status(404).send({ error: 'Offer not found (or already redeemed)' });
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('Error removing prize offer:', error);
+    reply.status(500).send({ error: 'Failed to remove prize offer' });
+  }
+});
+
+// Kid: request an available offer (goes to the parent approval queue).
+// Optional split_user_ids: co-spenders sharing the cost evenly with the
+// requester (each pays floor(cost / participants); the remainder of an uneven
+// split is silently discounted).
+fastify.post('/api/prize-offers/:id/request', async (request, reply) => {
+  const { id } = request.params;
+  const { user_id, split_user_ids } = request.body;
+  try {
+    if (!user_id) {
+      return reply.status(400).send({ error: 'user_id is required' });
+    }
+    const user = await User.query().select('id').findById(user_id);
+    if (!user) {
+      return reply.status(404).send({ error: 'User not found' });
+    }
+
+    let splitJson = null;
+    if (split_user_ids !== undefined) {
+      if (!Array.isArray(split_user_ids) || split_user_ids.some((sid) => !Number.isInteger(sid))) {
+        return reply.status(400).send({ error: 'split_user_ids must be an array of user ids' });
+      }
+      const distinct = [...new Set(split_user_ids)].filter((sid) => sid !== user_id && sid !== 0);
+      for (const sid of distinct) {
+        if (!(await User.query().select('id').findById(sid))) {
+          return reply.status(404).send({ error: `Split user ${sid} not found` });
+        }
+      }
+      if (distinct.length > 0) splitJson = JSON.stringify(distinct);
+    }
+
+    const updated = await PrizeOffer.query()
+      .patch({
+        status: 'requested',
+        requested_by: user_id,
+        requested_at: knex.raw('CURRENT_TIMESTAMP'),
+        split_user_ids: splitJson,
+      })
+      .where({ id, status: 'available' });
+    if (updated === 0) {
+      return reply.status(409).send({ error: 'Offer is not available (already requested or redeemed)' });
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('Error requesting prize offer:', error);
+    reply.status(500).send({ error: 'Failed to request prize' });
+  }
+});
+
+// Cancel (kid withdraws) and decline (parent refuses) are the same
+// transition: requested → back on the store shelf.
+const returnOfferToStore = async (offerId, reply) => {
+  const updated = await PrizeOffer.query()
+    .patch({ status: 'available', requested_by: null, requested_at: null, split_user_ids: null })
+    .where({ id: offerId, status: 'requested' });
+  if (updated === 0) {
+    reply.status(409).send({ error: 'Offer has no pending request' });
+    return null;
+  }
+  return { success: true };
+};
+
+fastify.post('/api/prize-offers/:id/cancel-request', async (request, reply) => {
+  try {
+    return await returnOfferToStore(request.params.id, reply);
+  } catch (error) {
+    console.error('Error cancelling prize request:', error);
+    reply.status(500).send({ error: 'Failed to cancel request' });
+  }
+});
+
+fastify.post('/api/prize-offers/:id/decline', async (request, reply) => {
+  try {
+    return await returnOfferToStore(request.params.id, reply);
+  } catch (error) {
+    console.error('Error declining prize request:', error);
+    reply.status(500).send({ error: 'Failed to decline request' });
+  }
+});
+
+// Parent: approve a pending request. Deducts the prize's CURRENT cost as a
+// negative kind='spent' ledger row (title = prize name), consumes the offer,
+// and emits clam.withdrawn + prize.redeemed (drives the kiosk celebration).
+// Insufficient balance leaves the request pending so the parent sees why.
+fastify.post('/api/prize-offers/:id/approve', async (request, reply) => {
+  const { id } = request.params;
+  try {
+    const offer = await knex('prize_offers as po')
+      .join('prizes as p', 'po.prize_id', 'p.id')
+      .leftJoin('users as u', 'po.requested_by', 'u.id')
+      .select(
+        'po.id', 'po.prize_id', 'po.requested_by', 'po.split_user_ids',
+        'p.name', 'p.clam_cost', 'p.repeatable',
+        'u.username as requested_by_name'
+      )
+      .where('po.id', id)
+      .where('po.status', 'requested')
+      .first();
+    if (!offer) {
+      return reply.status(409).send({ error: 'Offer has no pending request' });
+    }
+
+    // Split spending: everyone (requester + co-spenders) pays an equal
+    // floor(cost / N) share; an uneven remainder is silently discounted.
+    const splitIds = offer.split_user_ids ? JSON.parse(offer.split_user_ids) : [];
+    const participantIds = [offer.requested_by, ...splitIds];
+    const share = Math.floor(offer.clam_cost / participantIds.length);
+
+    const usernameFor = async (pid) => {
+      const row = await knex('users').select('username').where('id', pid).first();
+      return row?.username;
+    };
+
+    const short = [];
+    for (const pid of participantIds) {
+      if ((await getUserClamTotal(pid)) < share) short.push(pid);
+    }
+    if (short.length > 0) {
+      const names = (await Promise.all(short.map(async (pid) => (await usernameFor(pid)) || `user ${pid}`))).join(', ');
+      return reply.status(400).send({
+        error: `Insufficient clams: ${names} ${short.length === 1 ? 'has' : 'have'} less than the ${share}-clam share`,
+      });
+    }
+
+    const today = getTodayLocalDateString();
+    await knex.transaction(async (trx) => {
+      for (const pid of participantIds) {
+        await trx('chore_history').insert({
+          user_id: pid,
+          chore_schedule_id: null,
+          date: today,
+          clam_value: -share,
+          title: offer.name,
+          kind: 'spent',
+        });
+      }
+      if (offer.repeatable === 1) {
+        // Repeatable prize: back on the shelf for the next redemption.
+        await trx('prize_offers').where('id', offer.id).update({
+          status: 'available',
+          requested_by: null,
+          requested_at: null,
+          split_user_ids: null,
+        });
+      } else {
+        await trx('prize_offers').where('id', offer.id).update({
+          status: 'redeemed',
+          redeemed_at: trx.raw('CURRENT_TIMESTAMP'),
+        });
+      }
+    });
+
+    const participants = [];
+    for (const pid of participantIds) {
+      participants.push({
+        userId: pid,
+        username: (await usernameFor(pid)) || null,
+        share,
+        newTotal: await getUserClamTotal(pid),
+      });
+    }
+    for (const participant of participants) {
+      await emitPluginEvent('clam.withdrawn', { userId: participant.userId, amount: share, newTotal: participant.newTotal });
+    }
+    await emitPluginEvent('prize.redeemed', {
+      userId: offer.requested_by,
+      prizeId: offer.prize_id,
+      offerId: offer.id,
+      prizeName: offer.name,
+      cost: share * participantIds.length,
+      newTotal: participants[0].newTotal,
+      participants,
+    });
+
+    return { success: true, clam_total: participants[0].newTotal, prize: offer.name, share, participants };
+  } catch (error) {
+    console.error('Error approving prize request:', error);
+    reply.status(500).send({ error: 'Failed to approve prize request' });
   }
 });
 
@@ -2891,6 +4867,7 @@ fastify.get('/api/connections/google/status', async (request, reply) => {
 });
 
 fastify.post('/api/connections/google/config', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     if (!isEncryptionConfigured()) {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
@@ -2909,6 +4886,7 @@ fastify.post('/api/connections/google/config', async (request, reply) => {
 });
 
 fastify.get('/api/connections/google/authorize', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     if (!isEncryptionConfigured()) {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
@@ -2929,6 +4907,7 @@ fastify.get('/api/connections/google/authorize', async (request, reply) => {
 });
 
 fastify.get('/api/connections/google/callback', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   const { code, state, error: oauthError } = request.query || {};
   const renderPage = (title, message, ok) => {
     reply.header('Content-Type', 'text/html; charset=utf-8');
@@ -2994,16 +4973,28 @@ fastify.get('/api/connections/google/calendars', async (request, reply) => {
   }
 });
 
+// Loads a calendar source by id, asserting it's a writable Google source.
+// Sends a 404 (missing) or 400 (read-only, non-Google) and returns null on failure.
+const loadGoogleCalendarSource = async (id, reply) => {
+  const source = await CalendarSource.query().findById(id);
+  if (!source) {
+    reply.status(404).send({ error: 'Calendar source not found' });
+    return null;
+  }
+  if (source.type !== 'Google') {
+    reply.status(400).send({ error: 'This calendar type is read-only.' });
+    return null;
+  }
+  return source;
+};
+
 fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
   try {
     const { id } = request.params;
-    const source = await CalendarSource.query().findById(id);
-    if (!source) return reply.status(404).send({ error: 'Calendar source not found' });
-    if (source.type !== 'Google') {
-      return reply.status(400).send({ error: 'This calendar type is read-only.' });
-    }
-    const account = await googleConnection.getConnectedAccount();
-    if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
+    const source = await loadGoogleCalendarSource(id, reply);
+    if (!source) return;
+    const account = await loadConnectedGoogleAccountOr400(reply);
+    if (!account) return;
 
     const created = await googleCalendar.createEvent(account.id, source.url, request.body || {});
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
@@ -3017,13 +5008,10 @@ fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
 fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply) => {
   try {
     const { id, eventId } = request.params;
-    const source = await CalendarSource.query().findById(id);
-    if (!source) return reply.status(404).send({ error: 'Calendar source not found' });
-    if (source.type !== 'Google') {
-      return reply.status(400).send({ error: 'This calendar type is read-only.' });
-    }
-    const account = await googleConnection.getConnectedAccount();
-    if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
+    const source = await loadGoogleCalendarSource(id, reply);
+    if (!source) return;
+    const account = await loadConnectedGoogleAccountOr400(reply);
+    if (!account) return;
 
     const updated = await googleCalendar.updateEvent(account.id, source.url, eventId, request.body || {});
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
@@ -3037,13 +5025,10 @@ fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply
 fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, reply) => {
   try {
     const { id, eventId } = request.params;
-    const source = await CalendarSource.query().findById(id);
-    if (!source) return reply.status(404).send({ error: 'Calendar source not found' });
-    if (source.type !== 'Google') {
-      return reply.status(400).send({ error: 'This calendar type is read-only.' });
-    }
-    const account = await googleConnection.getConnectedAccount();
-    if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
+    const source = await loadGoogleCalendarSource(id, reply);
+    if (!source) return;
+    const account = await loadConnectedGoogleAccountOr400(reply);
+    if (!account) return;
 
     await googleCalendar.deleteEvent(account.id, source.url, eventId);
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
@@ -3055,6 +5040,7 @@ fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, repl
 });
 
 fastify.delete('/api/connections/google/account', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     const account = await googleConnection.getConnectedAccount();
     if (!account) {
@@ -3068,8 +5054,99 @@ fastify.delete('/api/connections/google/account', async (request, reply) => {
   }
 });
 
+// Home Assistant connection routes (issue #57).
+//
+// The status route reports whether a token is stored, never the token itself —
+// a Home Assistant long-lived token controls the whole house, so it is stored
+// encrypted, redacted from GET /api/settings, and written blind.
+fastify.get('/api/connections/homeassistant/status', async (request, reply) => {
+  try {
+    const status = await homeAssistant.getHomeAssistantStatus();
+    return {
+      ...status,
+      encryption: { configured: status.encryption_configured, status: getEncryptionStatus() },
+    };
+  } catch (error) {
+    console.error('Error fetching Home Assistant status:', error);
+    reply.status(500).send({ error: 'Failed to fetch Home Assistant status' });
+  }
+});
+
+fastify.put('/api/connections/homeassistant', async (request, reply) => {
+  if (demoBlocked(reply)) return;
+  try {
+    const { url, token, weather_entity } = request.body || {};
+
+    // Only the token needs encryption, so only the token needs the key.
+    if (token !== undefined && token !== null && String(token).trim() !== '' && !isEncryptionConfigured()) {
+      return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
+    }
+
+    // saveConfig is async and rejects a bad URL, so it has to be awaited INSIDE
+    // this try for that rejection to become the 400 below rather than an
+    // unhandled rejection.
+    await homeAssistant.saveConfig({ url, token, weatherEntity: weather_entity });
+    // Provider config changed, so anything cached under the old settings is stale.
+    weatherService.clearCache();
+    return { success: true, status: await homeAssistant.getHomeAssistantStatus() };
+  } catch (error) {
+    console.error('Error saving Home Assistant config:', error);
+    reply.status(400).send({ error: error.message || 'Failed to save Home Assistant config' });
+  }
+});
+
+fastify.post('/api/connections/homeassistant/test', async (request, reply) => {
+  if (demoBlocked(reply)) return;
+  try {
+    return await homeAssistant.testConnection();
+  } catch (error) {
+    console.error('Error testing Home Assistant connection:', error);
+    reply.status(500).send({ error: error.message || 'Failed to test Home Assistant connection' });
+  }
+});
+
+fastify.get('/api/connections/homeassistant/weather-entities', async (request, reply) => {
+  if (demoBlocked(reply)) return;
+  try {
+    if (!(await homeAssistant.isConfigured())) {
+      return reply.status(400).send({ error: 'Home Assistant is not configured.' });
+    }
+    return { entities: await homeAssistant.listWeatherEntities() };
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    console.error('Error listing Home Assistant weather entities:', error.message);
+    reply.status(status).send({ error: error.message || 'Failed to list weather entities' });
+  }
+});
+
+fastify.delete('/api/connections/homeassistant', async (request, reply) => {
+  if (demoBlocked(reply)) return;
+  try {
+    await homeAssistant.clearConfig();
+    weatherService.clearCache();
+    return { success: true };
+  } catch (error) {
+    console.error('Error clearing Home Assistant config:', error);
+    reply.status(500).send({ error: error.message || 'Failed to clear Home Assistant config' });
+  }
+});
+
+// Which weather provider is active and whether it is usable. Lets the Admin
+// Panel show "no API key saved" without the key ever being sent to it.
+fastify.get('/api/connections/weather/status', async (request, reply) => {
+  try {
+    const status = await weatherService.getProviderStatus({ demoMode: DEMO_MODE });
+    const hasApiKey = !!(await knex('settings').select('value').where('key', 'WEATHER_API_KEY').first())?.value;
+    return { ...status, has_api_key: hasApiKey };
+  } catch (error) {
+    console.error('Error fetching weather provider status:', error);
+    reply.status(500).send({ error: 'Failed to fetch weather provider status' });
+  }
+});
+
 // Apple Calendar (iCloud CalDAV) connection routes
 fastify.post('/api/connections/apple/calendars', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     const { appleId, appPassword } = request.body || {};
     if (!appleId || !appPassword) {
@@ -3097,6 +5174,9 @@ fastify.get('/api/calendar-sources', async (request, reply) => {
 });
 
 fastify.post('/api/calendar-sources', async (request, reply) => {
+  // Demo-blocked: with the sync service running in demo mode, a visitor-added
+  // source would be fetched server-side (SSRF). Only the seeded feeds sync.
+  if (demoBlocked(reply)) return;
   const { name, type, url, username, password, color } = request.body;
   if (!name || !type || !url) {
     return reply.status(400).send({ error: 'Name, type, and URL are required.' });
@@ -3138,6 +5218,9 @@ fastify.post('/api/calendar-sources', async (request, reply) => {
 });
 
 fastify.patch('/api/calendar-sources/:id', async (request, reply) => {
+  // Demo-blocked: editing a source's URL would make the sync service fetch a
+  // visitor-supplied address (SSRF).
+  if (demoBlocked(reply)) return;
   const { id } = request.params;
   const { name, type, url, username, password, color, enabled } = request.body;
 
@@ -3190,6 +5273,8 @@ fastify.patch('/api/calendar-sources/:id', async (request, reply) => {
 });
 
 fastify.delete('/api/calendar-sources/:id', async (request, reply) => {
+  // Demo-blocked so one visitor can't remove the curated demo feeds for the next.
+  if (demoBlocked(reply)) return;
   const { id } = request.params;
   try {
     if (calendarSyncService) {
@@ -3208,6 +5293,7 @@ fastify.delete('/api/calendar-sources/:id', async (request, reply) => {
 });
 
 fastify.post('/api/calendar-sources/:id/test', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   const { id } = request.params;
   try {
     const source = await CalendarSource.query().findById(id);
@@ -3293,6 +5379,7 @@ fastify.get('/api/calendar-sync/status/:sourceId', async (request, reply) => {
 
 // Trigger manual sync for a specific source
 fastify.post('/api/calendar-sync/:sourceId', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     const { sourceId } = request.params;
     if (!calendarSyncService) {
@@ -3308,6 +5395,7 @@ fastify.post('/api/calendar-sync/:sourceId', async (request, reply) => {
 
 // Trigger manual sync for all sources
 fastify.post('/api/calendar-sync/all', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
@@ -3322,6 +5410,7 @@ fastify.post('/api/calendar-sync/all', async (request, reply) => {
 
 // Set sync interval for a specific source
 fastify.patch('/api/calendar-sync/:sourceId/interval', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     const { sourceId } = request.params;
     const { interval_minutes } = request.body;
@@ -3579,15 +5668,27 @@ fastify.get('/api/photo-proxy/:sourceId/:assetId', async (request, reply) => {
   }
 });
 
+// Loads a HomeGlow Photos source by id, asserting its type. On miss, sends a
+// 404 and returns null so the caller can `if (!source) return;`.
+const loadHomeGlowPhotoSourceOr404 = async (sourceId, reply) => {
+  const source = await PhotoSource.query().select('id', 'type').findById(sourceId);
+  if (!source || source.type !== 'HomeGlowPhotos') {
+    reply.status(404).send({ error: 'HomeGlow Photos source not found' });
+    return null;
+  }
+  return source;
+};
+
 // HomeGlow Photos - list uploaded photos for a source
 fastify.get('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = await PhotoSource.query().findById(sourceId);
-    if (!source || source.type !== 'HomeGlowPhotos') {
-      return reply.status(404).send({ error: 'HomeGlow Photos source not found' });
-    }
-    const rows = await HomeglowPhoto.query().select('id', 'filename', 'original_name', 'mime_type', 'size', 'uploaded_at').where('source_id', sourceId).orderBy('uploaded_at', 'desc');
+    const source = await loadHomeGlowPhotoSourceOr404(sourceId, reply);
+    if (!source) return;
+    const rows = await HomeglowPhoto.query()
+      .select('id', 'filename', 'original_name', 'mime_type', 'size', 'uploaded_at')
+      .where('source_id', sourceId)
+      .orderBy('uploaded_at', 'desc');
     return rows.map((r) => ({
       ...r,
       url: `/api/photo-sources/${sourceId}/uploaded/${r.id}/file`,
@@ -3618,12 +5719,11 @@ fastify.get('/api/photo-sources/:sourceId/uploaded/:photoId/file', async (reques
 
 // HomeGlow Photos - upload one or more photos (multipart)
 fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   const { sourceId } = request.params;
   try {
-    const source = await PhotoSource.query().findById(sourceId);
-    if (!source || source.type !== 'HomeGlowPhotos') {
-      return reply.status(404).send({ error: 'HomeGlow Photos source not found' });
-    }
+    const source = await loadHomeGlowPhotoSourceOr404(sourceId, reply);
+    if (!source) return;
     const uploadDir = path.join(__dirname, 'uploads', 'homeglow-photos', String(sourceId));
     await fs.mkdir(uploadDir, { recursive: true });
 
@@ -3718,15 +5818,34 @@ fastify.delete('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request
   }
 });
 
+// Loads a Google Photos photo source by id. On miss (absent or wrong type),
+// sends a 404 and returns null so the caller can `if (!source) return;`.
+const loadGooglePhotoSourceOr404 = async (sourceId, reply) => {
+  const source = await PhotoSource.query().findById(sourceId);
+  if (!source || source.type !== 'GooglePhotos') {
+    reply.status(404).send({ error: 'Google Photos source not found' });
+    return null;
+  }
+  return source;
+};
+
+// Returns the connected Google account, or sends a 400 and returns null.
+const loadConnectedGoogleAccountOr400 = async (reply) => {
+  const account = await googleConnection.getConnectedAccount();
+  if (!account) {
+    reply.status(400).send({ error: 'No Google account connected.' });
+    return null;
+  }
+  return account;
+};
+
 fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = await PhotoSource.query().findById(sourceId);
-    if (!source || source.type !== 'GooglePhotos') {
-      return reply.status(404).send({ error: 'Google Photos source not found' });
-    }
-    const account = await googleConnection.getConnectedAccount();
-    if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
+    const source = await loadGooglePhotoSourceOr404(sourceId, reply);
+    if (!source) return;
+    const account = await loadConnectedGoogleAccountOr400(reply);
+    if (!account) return;
 
     const session = await googlePhotosPicker.createSession(account.id);
     await PhotoSource.query().findById(sourceId).patch({ picker_session_id: session.id || null, picker_session_expire: session.expireTime || null });
@@ -3747,15 +5866,13 @@ fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, repl
 fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = await PhotoSource.query().findById(sourceId);
-    if (!source || source.type !== 'GooglePhotos') {
-      return reply.status(404).send({ error: 'Google Photos source not found' });
-    }
+    const source = await loadGooglePhotoSourceOr404(sourceId, reply);
+    if (!source) return;
     if (!source.picker_session_id) {
       return { sessionId: null, mediaItemsSet: false };
     }
-    const account = await googleConnection.getConnectedAccount();
-    if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
+    const account = await loadConnectedGoogleAccountOr400(reply);
+    if (!account) return;
 
     const session = await googlePhotosPicker.getSession(account.id, source.picker_session_id);
     return {
@@ -3777,15 +5894,13 @@ fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply
 fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = await PhotoSource.query().findById(sourceId);
-    if (!source || source.type !== 'GooglePhotos') {
-      return reply.status(404).send({ error: 'Google Photos source not found' });
-    }
+    const source = await loadGooglePhotoSourceOr404(sourceId, reply);
+    if (!source) return;
     if (!source.picker_session_id) {
       return reply.status(400).send({ error: 'No active picker session' });
     }
-    const account = await googleConnection.getConnectedAccount();
-    if (!account) return reply.status(400).send({ error: 'No Google account connected.' });
+    const account = await loadConnectedGoogleAccountOr400(reply);
+    if (!account) return;
 
     const session = await googlePhotosPicker.getSession(account.id, source.picker_session_id);
     if (!session.mediaItemsSet) {
@@ -3868,15 +5983,23 @@ fastify.get('/api/photo-items', async (request, reply) => {
           let assets = [];
 
           if (source.album_id) {
-            const albumResponse = await axios.get(`${apiBase}/albums/${source.album_id}`, {
-              headers: immichHeaders,
-              timeout: 15000
-            });
-            assets = albumResponse.data?.assets || [];
-            for (let i = assets.length - 1; i > 0; i--) {
-              const j = Math.floor(Math.random() * (i + 1));
-              [assets[i], assets[j]] = [assets[j], assets[i]];
+            // Immich v3 removed the `assets` array from GET /api/albums/{id}
+            // (https://immich.app/blog/v3-migration). Fetch album assets via the
+            // paginated metadata search instead — works on both Immich v2 and v3.
+            let page = 1;
+            while (page && assets.length < 1000) {
+              const searchResponse = await axios.post(`${apiBase}/search/metadata`,
+                { albumIds: [source.album_id], page, size: 1000 },
+                {
+                  headers: immichHeaders,
+                  timeout: 15000
+                }
+              );
+              const bucket = searchResponse.data?.assets || {};
+              assets.push(...(bucket.items || []));
+              page = bucket.nextPage ? Number(bucket.nextPage) : null;
             }
+            shuffleInPlace(assets);
             assets = assets.slice(0, 100);
           } else {
             const response = await axios.post(`${apiBase}/search/random`,
@@ -3909,10 +6032,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
             source_name: source.name,
             source_type: 'GooglePhotos',
           }));
-          for (let i = photos.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [photos[i], photos[j]] = [photos[j], photos[i]];
-          }
+          shuffleInPlace(photos);
           return photos;
         } else if (source.type === 'HomeGlowPhotos') {
           const rows = await HomeglowPhoto.query().select('id', 'filename').where('source_id', source.id).orderBy('uploaded_at', 'desc');
@@ -3925,10 +6045,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
             source_name: source.name,
             source_type: 'HomeGlowPhotos',
           }));
-          for (let i = photos.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [photos[i], photos[j]] = [photos[j], photos[i]];
-          }
+          shuffleInPlace(photos);
           return photos;
         }
       } catch (error) {
@@ -3944,10 +6061,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
     const results = await Promise.all(fetchPromises);
     const allPhotos = results.flat();
 
-    for (let i = allPhotos.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [allPhotos[i], allPhotos[j]] = [allPhotos[j], allPhotos[i]];
-    }
+    shuffleInPlace(allPhotos);
 
     return allPhotos;
   } catch (error) {
@@ -3959,7 +6073,13 @@ fastify.get('/api/photo-items', async (request, reply) => {
 // Admin PIN routes
 fastify.get('/api/admin-pin/exists', async (request, reply) => {
   try {
-    const pin = await AdminPin.query().findById(1);
+    // Demo mode: report no PIN so the Admin Panel opens without prompting;
+    // the set/verify/delete routes below are blocked so a visitor can't
+    // lock others out by creating one.
+    if (DEMO_MODE) {
+      return { exists: false, demo: true };
+    }
+    const pin = await AdminPin.query().select('id').findById(1);
     return { exists: !!pin };
   } catch (error) {
     console.error('Error checking PIN existence:', error);
@@ -3968,6 +6088,7 @@ fastify.get('/api/admin-pin/exists', async (request, reply) => {
 });
 
 fastify.post('/api/admin-pin/set', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   const { pin } = request.body;
 
   if (!pin || typeof pin !== 'string') {
@@ -4002,6 +6123,7 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 });
 
 fastify.delete('/api/admin-pin', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   try {
     await AdminPin.query().deleteById(1);
     return { success: true, message: 'PIN cleared successfully' };
@@ -4012,6 +6134,7 @@ fastify.delete('/api/admin-pin', async (request, reply) => {
 });
 
 fastify.post('/api/admin-pin/verify', async (request, reply) => {
+  if (demoBlocked(reply)) return;
   const { pin } = request.body;
 
   if (!pin || typeof pin !== 'string') {
@@ -4051,15 +6174,23 @@ fastify.get('/api/system/backgroundTasks', async (request, reply) => {
 const start = async () => {
   try {
     db = await ConnectOrCreateDb();
-    // Wire Knex + Objection alongside the legacy better-sqlite3 connection. Routes
-    // still use `db` for now; domains are migrated onto Objection task by task.
-    knex = createKnex();
+    // Wire Knex + Objection alongside the legacy better-sqlite3 connection. The
+    // legacy handle exists only for the pre-v14 schema lift below; all runtime
+    // data access goes through Knex/Objection.
+    //
+    // The filename is passed explicitly: createKnex() would otherwise resolve
+    // DB_PATH (or server/data/tasks.db) on its own and a demo instance would
+    // persist visitor data to a real file while only the legacy handle was
+    // in-memory.
+    knex = createKnex({ filename: dbPath });
     Model.knex(knex);
 
     // Schema management: Knex (knex_migrations) is the source of truth.
     //  * Existing install (settings table present): lift any pre-baseline DB to
     //    v14 with the legacy schema migrations (Option A), then Knex adopts it.
-    //  * Fresh install: the Knex baseline migration builds v14 directly.
+    //  * Fresh install (including demo mode's in-memory DB, where the legacy
+    //    handle sees no schema at all): the Knex baseline migration builds v14
+    //    directly and the post-baseline migrations take it to the current level.
     if (doesTableExist('settings')) {
       const currentSchemaId = getCurrentSchemaVersion();
       if (currentSchemaId < BASELINE_SCHEMA_VERSION) {
@@ -4069,6 +6200,30 @@ const start = async () => {
     }
     const migrationResult = await adoptOrMigrate(knex);
     console.log(`Knex migrations: adopted=${migrationResult.adopted}, applied=[${migrationResult.applied.join(', ')}]`);
+
+    if (DEMO_MODE) {
+      const { resetDemoData } = require('./utils/demoSeed');
+      console.log(`DEMO MODE enabled: in-memory database, PIN disabled, sample data resets every ${DEMO_RESET_HOURS}h`);
+      await resetDemoData();
+      setInterval(() => {
+        // resetDemoData is async: an un-awaited rejection here would be a fatal
+        // unhandledRejection, so the promise is handled inside the callback.
+        (async () => {
+          try {
+            await resetDemoData();
+            // Reseeding assigns new source ids, so the running sync jobs point
+            // at rows that no longer exist. Restart them (this also kicks off an
+            // immediate syncAllSources to refill the wiped event cache).
+            if (calendarSyncService && process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
+              calendarSyncService.stopAllSyncJobs();
+              calendarSyncService.startAllSyncJobs();
+            }
+          } catch (err) {
+            console.error('Demo reset failed:', err);
+          }
+        })();
+      }, DEMO_RESET_HOURS * 60 * 60 * 1000).unref();
+    }
 
     if (process.env.HOMEGLOW_DISABLE_BACKGROUND_JOBS !== '1') {
       startNightlyCronJob(); // Start the nightly chore pruning job
@@ -4082,9 +6237,27 @@ const start = async () => {
     await fs.mkdir(usersDir, { recursive: true });
     console.log('Uploads directories created');
 
-    // Initialize calendar sync service
-    if (process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
-      calendarSyncService = new CalendarSyncService(db, decryptPassword);
+    // Seed bundled default chore notification sounds into the persisted uploads volume
+    await seedDefaultSounds();
+
+    // Seed bundled default profile avatars (issue #132)
+    await seedDefaultAvatars();
+
+    // Initialize calendar sync service. Demo mode runs sync too, but ONLY for
+    // the curated feeds in demoSeed.js: every route that could add or edit a
+    // source URL is demo-blocked, so visitor-entered addresses are never
+    // fetched (SSRF guard). The seeded "Family Calendar" placeholder
+    // (.invalid host) is skipped by the service itself.
+    if (DEMO_MODE) {
+      calendarSyncService = new CalendarSyncService(null, decryptPassword);
+      if (process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
+        calendarSyncService.initialize();
+        console.log('Calendar sync enabled in demo mode (seeded demo feeds only; source management is demo-blocked)');
+      } else {
+        console.log('Calendar sync jobs disabled in demo mode by HOMEGLOW_DISABLE_CALENDAR_SYNC=1 (cached events only)');
+      }
+    } else if (process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
+      calendarSyncService = new CalendarSyncService(null, decryptPassword);
       calendarSyncService.initialize();
       console.log('Calendar sync service started');
     } else {

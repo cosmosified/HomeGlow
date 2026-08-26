@@ -6,10 +6,25 @@ import { Close } from '@mui/icons-material';
 import axios from 'axios';
 import PluginWidgetWrapper from './components/PluginWidgetWrapper.jsx';
 import WidgetContainer from './components/WidgetContainer.jsx';
+import MobileDashboard from './components/MobileDashboard.jsx';
 import TabBar from './components/TabBar.jsx';
 import ScreensaverCountdown from './components/ScreensaverCountdown.jsx';
 import { API_BASE_URL } from './utils/apiConfig.js';
 import { getDeviceApiBase } from './utils/deviceName.js';
+import { unlockAudio } from './utils/choreSound.js';
+import useChoreSoundScheduler from './hooks/useChoreSoundScheduler.js';
+import useFetchTabs from './hooks/useFetchTabs.js';
+import useIsMobile from './hooks/useIsMobile.js';
+import useScreenActivity from './hooks/useScreenActivity.js';
+import {
+  readLocalInterfaceColors,
+  readLocalScreensaverSettings,
+  readLocalAutoDarkModeSettings,
+  readLocalVacationModeSettings,
+  isVacationModeActiveToday,
+} from './utils/interfaceSettings.js';
+import { normalizeWidgetSettings, BASE_WIDGET_SETTINGS } from './utils/widgetSettings.js';
+import { buildMobileWidgetList } from './utils/mobileWidgets.js';
 import './index.css';
 
 const loadAdminPanel = () => import('./components/AdminPanel.jsx');
@@ -19,13 +34,12 @@ const loadWeatherWidget = () => import('./components/WeatherWidget.jsx');
 const loadChoreWidget = () => import('./components/ChoreWidget.jsx');
 const loadTabIconModal = () => import('./components/TabIconModal.jsx');
 const loadScreenSaver = () => import('./components/ScreenSaver.jsx');
+const loadVacationScreensaver = () => import('./components/VacationScreensaver.jsx');
 
 const MAX_IDLE_WARM_IMPORTS = 3;
 const WIDGETS_LOCKED_STORAGE_KEY = 'widgetsLocked';
 const THEME_STORAGE_KEY = 'theme';
 const THEME_MODE_STORAGE_KEY = 'themeMode';
-const INTERFACE_COLORS_STORAGE_KEY = 'interfaceColors';
-const SCREENSAVER_SETTINGS_STORAGE_KEY = 'screensaverSettings';
 
 const shouldSkipWarmupForConnection = () => {
   if (typeof navigator === 'undefined') return false;
@@ -61,9 +75,9 @@ const WeatherWidget = lazy(loadWeatherWidget);
 const ChoreWidget = lazy(loadChoreWidget);
 const TabIconModal = lazy(loadTabIconModal);
 const ScreenSaver = lazy(loadScreenSaver);
+const VacationScreensaver = lazy(loadVacationScreensaver);
 
 // region #98 - expected to get removed in the future (localStorage migration bridge)
-const AUTO_DARK_MODE_STORAGE_KEY = 'autoDarkModeSettings';
 const DEVICE_SETTINGS_UPDATED_EVENT = 'homeglow:device-settings-updated';
 const INTERFACE_SETTINGS_UPDATED_EVENT = 'homeglow:interface-settings-updated';
 const DEVICE_SETTINGS_MIGRATION_KEY_PATTERN = /^(enabledWidgets|widgetSettings|pluginSettings|weatherZipCode|weatherTempUnit)$/;
@@ -71,24 +85,8 @@ const DEVICE_SETTINGS_MIGRATION_KEY_PATTERN = /^(enabledWidgets|widgetSettings|p
 const isAllowedDeviceSettingsMigrationKey = (key) => DEVICE_SETTINGS_MIGRATION_KEY_PATTERN.test(key);
 // endRegion #98
 
-const DEFAULT_SCREENSAVER_SETTINGS = {
-  enabled: false,
-  mode: 'tabs',
-  timeout: 5,
-  slideshowInterval: 10,
-};
-
-const DEFAULT_INTERFACE_COLORS = {
-  primary: '#f5f5f5',
-  secondary: '#38bdf8',
-  accent: '#f472b6',
-};
-
 const DEFAULT_WIDGET_SETTINGS = {
-  chores: { enabled: false, transparent: false },
-  calendar: { enabled: false, transparent: false },
-  photos: { enabled: false, transparent: false },
-  weather: { enabled: false, transparent: false },
+  ...BASE_WIDGET_SETTINGS,
   lightGradientStart: '#00ddeb',
   lightGradientEnd: '#ff6b6b',
   darkGradientStart: '#2e2767',
@@ -98,47 +96,6 @@ const DEFAULT_WIDGET_SETTINGS = {
   darkButtonGradientStart: '#2e2767',
   darkButtonGradientEnd: '#620808',
 };
-
-const normalizeWidgetSettings = (raw) => ({
-  ...DEFAULT_WIDGET_SETTINGS,
-  ...(raw && typeof raw === 'object' ? raw : {}),
-  chores: { ...DEFAULT_WIDGET_SETTINGS.chores, ...(raw?.chores || {}) },
-  calendar: { ...DEFAULT_WIDGET_SETTINGS.calendar, ...(raw?.calendar || {}) },
-  photos: { ...DEFAULT_WIDGET_SETTINGS.photos, ...(raw?.photos || {}) },
-  weather: { ...DEFAULT_WIDGET_SETTINGS.weather, ...(raw?.weather || {}) },
-});
-
-const normalizeScreensaverSettings = (raw) => ({
-  ...DEFAULT_SCREENSAVER_SETTINGS,
-  ...(raw && typeof raw === 'object' ? raw : {}),
-});
-const DEFAULT_AUTO_DARK_MODE_SETTINGS = {
-  enabled: false,
-  locationQuery: '',
-  lat: null,
-  lon: null,
-  resolvedName: '',
-};
-
-const normalizeAutoDarkModeSettings = (raw) => {
-  if (!raw || typeof raw !== 'object') {
-    return { ...DEFAULT_AUTO_DARK_MODE_SETTINGS };
-  }
-
-  return {
-    ...DEFAULT_AUTO_DARK_MODE_SETTINGS,
-    ...raw,
-    locationQuery: (raw.locationQuery || '').trim(),
-    lat: typeof raw.lat === 'number' ? raw.lat : null,
-    lon: typeof raw.lon === 'number' ? raw.lon : null,
-    resolvedName: raw.resolvedName || '',
-  };
-};
-
-const normalizeInterfaceColors = (raw) => ({
-  ...DEFAULT_INTERFACE_COLORS,
-  ...(raw && typeof raw === 'object' ? raw : {}),
-});
 
 const readLocalTheme = () => {
   const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
@@ -152,36 +109,6 @@ const readLocalThemeMode = (fallbackTheme) => {
   }
 
   return fallbackTheme === 'dark' ? 'dark' : 'light';
-};
-
-const readLocalInterfaceColors = () => {
-  try {
-    const raw = localStorage.getItem(INTERFACE_COLORS_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_INTERFACE_COLORS };
-    return normalizeInterfaceColors(JSON.parse(raw));
-  } catch {
-    return { ...DEFAULT_INTERFACE_COLORS };
-  }
-};
-
-const readLocalScreensaverSettings = () => {
-  try {
-    const raw = localStorage.getItem(SCREENSAVER_SETTINGS_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_SCREENSAVER_SETTINGS };
-    return normalizeScreensaverSettings(JSON.parse(raw));
-  } catch {
-    return { ...DEFAULT_SCREENSAVER_SETTINGS };
-  }
-};
-
-const readLocalAutoDarkModeSettings = () => {
-  try {
-    const raw = localStorage.getItem(AUTO_DARK_MODE_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_AUTO_DARK_MODE_SETTINGS };
-    return normalizeAutoDarkModeSettings(JSON.parse(raw));
-  } catch {
-    return { ...DEFAULT_AUTO_DARK_MODE_SETTINGS };
-  }
 };
 
 const readLocalWidgetsLocked = () => {
@@ -216,6 +143,7 @@ const WidgetLoadingFallback = ({ label }) => (
 
 const App = () => {
   const API_DEVICE_URL = getDeviceApiBase(API_BASE_URL);
+  const isMobile = useIsMobile();
   const [theme, setTheme] = useState(readLocalTheme);
   const [themeMode, setThemeMode] = useState(() => readLocalThemeMode(readLocalTheme()));
   const [autoDarkModeSettings, setAutoDarkModeSettings] = useState(readLocalAutoDarkModeSettings);
@@ -223,23 +151,29 @@ const App = () => {
   const [widgetsLocked, setWidgetsLocked] = useState(readLocalWidgetsLocked);
   const [screensaverActive, setScreensaverActive] = useState(false);
   const [screensaverSettings, setScreensaverSettings] = useState(readLocalScreensaverSettings);
+  const [vacationModeSettings, setVacationModeSettings] = useState(readLocalVacationModeSettings);
+  // Range-aware (issue #121 v2): with dates set, vacation activates/expires on
+  // its own; recomputed each render, which the kiosk's periodic refreshes keep
+  // current across midnight.
+  const vacationActiveToday = isVacationModeActiveToday(vacationModeSettings);
   const inactivityTimerRef = useRef(null);
   const lastActivityRef = useRef(Date.now());
   const [widgetSettings, setWidgetSettings] = useState({ ...DEFAULT_WIDGET_SETTINGS });
   const [pluginSettings, setPluginSettings] = useState({});
   const [showAdminPanel, setShowAdminPanel] = useState(false);
-  const [apiKeys, setApiKeys] = useState({
-    WEATHER_API_KEY: '',
-    ICS_CALENDAR_URL: '',
-  });
-  const [apiKeysLoaded, setApiKeysLoaded] = useState(false);
+  // Household settings the dashboard reads directly (chore sound preferences).
+  // Credentials are no longer among them — GET /api/settings redacts secrets,
+  // and weather is fetched server-side.
+  const [householdSettings, setHouseholdSettings] = useState({});
   const [installedPlugins, setInstalledPlugins] = useState([]);
   const [activeTab, setActiveTab] = useState(1);
-  const [tabs, setTabs] = useState([]);
+  const { tabs, fetchTabs } = useFetchTabs(API_DEVICE_URL);
   const [widgetAssignments, setWidgetAssignments] = useState({});
   const [showTabIconModal, setShowTabIconModal] = useState(false);
   const [deviceSettingsLoaded, setDeviceSettingsLoaded] = useState(false);
   const [isFirstRunClient, setIsFirstRunClient] = useState(false);
+  const [choreSoundDeviceEnabled, setChoreSoundDeviceEnabled] = useState(true);
+  const [demoStatus, setDemoStatus] = useState({ demo: false, resetHours: null });
 
   const fetchInstalledPlugins = async () => {
     try {
@@ -256,13 +190,14 @@ const App = () => {
   }, []);
 
   const hydrateFromDeviceSettings = useCallback((settings) => {
-    const widgetSettingsFromServer = normalizeWidgetSettings(settings?.widgetSettings);
+    const widgetSettingsFromServer = normalizeWidgetSettings(settings?.widgetSettings, DEFAULT_WIDGET_SETTINGS);
     const pluginSettingsFromServer = settings?.pluginSettings && typeof settings.pluginSettings === 'object'
       ? settings.pluginSettings
       : {};
 
     setWidgetSettings(widgetSettingsFromServer);
     setPluginSettings(pluginSettingsFromServer);
+    setChoreSoundDeviceEnabled(settings?.choreWidgetSettings?.soundEnabled !== false);
 
     const hasKnownDeviceSettings = [
       'widgetSettings',
@@ -304,7 +239,7 @@ const App = () => {
       if (Object.prototype.hasOwnProperty.call(sanitizedWidgetSettings, 'widgetGallery')) {
         delete sanitizedWidgetSettings.widgetGallery;
       }
-      localPayload.widgetSettings = normalizeWidgetSettings(sanitizedWidgetSettings);
+      localPayload.widgetSettings = normalizeWidgetSettings(sanitizedWidgetSettings, DEFAULT_WIDGET_SETTINGS);
     }
 
     const pluginSettingsRaw = parseJsonKey('pluginSettings');
@@ -381,41 +316,109 @@ const App = () => {
 
   // region #98 - expected to get removed in the future (invoke migration bridge during bootstrap)
   useEffect(() => {
-    const fetchApiKeys = async () => {
+    const fetchHouseholdSettings = async () => {
       try {
         const response = await axios.get(`${API_BASE_URL}/api/settings`);
-        setApiKeys(response.data);
+        setHouseholdSettings(response.data || {});
       } catch (error) {
-        console.error('Error fetching API keys:', error);
-      } finally {
-        setApiKeysLoaded(true);
+        console.error('Error fetching household settings:', error);
+      }
+    };
+
+    const fetchDemoStatus = async () => {
+      try {
+        const response = await axios.get(`${API_BASE_URL}/api/demo`);
+        if (response.data?.demo) setDemoStatus(response.data);
+      } catch {
+        // Older servers have no /api/demo; treat as non-demo.
       }
     };
 
     const initialize = async () => {
       await migrateLocalDeviceSettingsToServer();
+      await fetchDemoStatus();
       await fetchDeviceSettings();
       await Promise.all([
         fetchTabs(),
         fetchWidgetAssignments(),
         fetchInstalledPlugins(),
       ]);
-      await fetchApiKeys();
+      await fetchHouseholdSettings();
     };
 
     void initialize();
   }, [fetchDeviceSettings, migrateLocalDeviceSettingsToServer]);
   // endRegion #98
 
-  const fetchTabs = async () => {
-    try {
-      const response = await axios.get(`${API_DEVICE_URL}/tabs`);
-      setTabs(Array.isArray(response.data) ? response.data : []);
-    } catch (error) {
-      console.error('Error fetching tabs:', error);
-      setTabs([]);
-    }
-  };
+  // Demo mode: each visitor's browser is a fresh "device", which normally
+  // lands on the empty first-run welcome screen. Seed this device with the
+  // chore + calendar widgets on the Home tab so the demo is instantly alive.
+  useEffect(() => {
+    if (!demoStatus.demo || !isFirstRunClient || !deviceSettingsLoaded) return;
+
+    const seedDemoDevice = async () => {
+      try {
+        await axios.patch(`${API_DEVICE_URL}/settings`, {
+          widgetSettings: {
+            chores: { enabled: true },
+            calendar: { enabled: true },
+            photos: { enabled: false },
+            // Weather renders from the server's static demo snapshot
+            // (/api/demo/weather) — no OpenWeatherMap key needed.
+            weather: { enabled: true },
+          },
+        });
+        for (const widgetName of ['chores', 'calendar', 'weather']) {
+          await axios.post(`${API_DEVICE_URL}/widget-assignments`, {
+            widget_name: widgetName,
+            tabNumber: 1,
+          });
+        }
+        await fetchDeviceSettings();
+        await fetchTabs();
+        await fetchWidgetAssignments();
+      } catch (error) {
+        console.error('Error seeding demo device:', error);
+      }
+    };
+
+    void seedDemoDevice();
+  }, [demoStatus.demo, isFirstRunClient, deviceSettingsLoaded]);
+
+  // Mobile first-run (issue #118): a phone's first visit is its own fresh
+  // device and would land on the empty welcome screen. Seed it with chores +
+  // calendar + weather on the Home tab so the phone is instantly useful; the
+  // user can adjust everything in Settings afterward. Demo mode has its own
+  // seeding above; the kiosk (≥600px) first-run flow is unchanged.
+  useEffect(() => {
+    if (!isMobile || demoStatus.demo || !isFirstRunClient || !deviceSettingsLoaded) return;
+
+    const seedMobileDevice = async () => {
+      try {
+        await axios.patch(`${API_DEVICE_URL}/settings`, {
+          widgetSettings: {
+            chores: { enabled: true },
+            calendar: { enabled: true },
+            weather: { enabled: true },
+            photos: { enabled: false },
+          },
+        });
+        for (const widgetName of ['chores', 'calendar', 'weather']) {
+          await axios.post(`${API_DEVICE_URL}/widget-assignments`, {
+            widget_name: widgetName,
+            tabNumber: 1,
+          });
+        }
+        await fetchDeviceSettings();
+        await fetchTabs();
+        await fetchWidgetAssignments();
+      } catch (error) {
+        console.error('Error seeding mobile device defaults:', error);
+      }
+    };
+
+    void seedMobileDevice();
+  }, [isMobile, demoStatus.demo, isFirstRunClient, deviceSettingsLoaded]);
 
   const fetchWidgetAssignments = async () => {
     try {
@@ -443,23 +446,29 @@ const App = () => {
     }
   };
 
+  // Sunrise and sunset are computed from coordinates server-side, so auto dark
+  // mode no longer needs an OpenWeatherMap key — it works with Home Assistant
+  // or with no weather provider configured at all.
   const resolveAutoTheme = useCallback(async () => {
     const hasCoordinates = typeof autoDarkModeSettings.lat === 'number' && typeof autoDarkModeSettings.lon === 'number';
-    if (!autoDarkModeSettings.enabled || !apiKeys.WEATHER_API_KEY || !hasCoordinates) {
+    if (!autoDarkModeSettings.enabled || !hasCoordinates) {
       return null;
     }
 
     try {
-      const response = await axios.get('https://api.openweathermap.org/data/2.5/weather', {
+      const response = await axios.get(`${API_BASE_URL}/api/sun`, {
         params: {
           lat: autoDarkModeSettings.lat,
           lon: autoDarkModeSettings.lon,
-          appid: apiKeys.WEATHER_API_KEY,
         },
       });
 
-      const sunrise = response?.data?.sys?.sunrise;
-      const sunset = response?.data?.sys?.sunset;
+      const { sunrise, sunset, alwaysUp, alwaysDown } = response?.data || {};
+
+      // Above the polar circles the sun may not cross the horizon at all.
+      if (alwaysUp) return 'light';
+      if (alwaysDown) return 'dark';
+
       if (typeof sunrise !== 'number' || typeof sunset !== 'number') {
         return null;
       }
@@ -470,7 +479,7 @@ const App = () => {
       console.error('Error resolving auto theme:', error);
       return null;
     }
-  }, [autoDarkModeSettings, apiKeys.WEATHER_API_KEY]);
+  }, [autoDarkModeSettings]);
 
   const applyAutoThemeNow = useCallback(async () => {
     const resolvedTheme = await resolveAutoTheme();
@@ -504,6 +513,7 @@ const App = () => {
       setInterfaceColors(readLocalInterfaceColors());
       setScreensaverSettings(readLocalScreensaverSettings());
       setAutoDarkModeSettings(readLocalAutoDarkModeSettings());
+      setVacationModeSettings(readLocalVacationModeSettings());
 
       const localTheme = readLocalTheme();
       const localThemeMode = readLocalThemeMode(localTheme);
@@ -559,18 +569,19 @@ const App = () => {
   }, [themeMode, resolveAutoTheme, applyTheme]);
 
   useEffect(() => {
-    if (!apiKeysLoaded || themeMode !== 'auto') {
+    if (themeMode !== 'auto') {
       return;
     }
 
+    // Auto mode needs only coordinates now — sunrise is computed, not fetched.
     const hasCoordinates = typeof autoDarkModeSettings.lat === 'number' && typeof autoDarkModeSettings.lon === 'number';
-    const autoModeAvailable = autoDarkModeSettings.enabled && Boolean(apiKeys.WEATHER_API_KEY) && hasCoordinates;
+    const autoModeAvailable = autoDarkModeSettings.enabled && hasCoordinates;
     if (!autoModeAvailable) {
       const fallbackMode = theme === 'dark' ? 'dark' : 'light';
       setThemeMode(fallbackMode);
       localStorage.setItem(THEME_MODE_STORAGE_KEY, fallbackMode);
     }
-  }, [apiKeysLoaded, themeMode, autoDarkModeSettings, apiKeys.WEATHER_API_KEY, theme]);
+  }, [themeMode, autoDarkModeSettings, theme]);
 
   useEffect(() => {
     document.documentElement.style.setProperty('--light-gradient-start', widgetSettings.lightGradientStart);
@@ -592,7 +603,7 @@ const App = () => {
       !!widgetSettings?.chores?.enabled && loadChoreWidget,
       !!widgetSettings?.weather?.enabled && loadWeatherWidget,
       !!widgetSettings?.photos?.enabled && loadPhotoWidget,
-      !!screensaverSettings?.enabled && loadScreenSaver,
+      !!screensaverSettings?.enabled && (vacationModeSettings?.enabled ? loadVacationScreensaver : loadScreenSaver),
     ]
       .filter(Boolean)
       .slice(0, MAX_IDLE_WARM_IMPORTS);
@@ -610,6 +621,7 @@ const App = () => {
     widgetSettings?.weather?.enabled,
     widgetSettings?.photos?.enabled,
     screensaverSettings?.enabled,
+    vacationModeSettings?.enabled,
   ]);
 
   const screensaverActiveRef = useRef(false);
@@ -641,7 +653,9 @@ const App = () => {
   }, []);
 
   useEffect(() => {
-    if (!screensaverSettings.enabled) {
+    // The screensaver is a kiosk ambient feature — phones lock themselves, so
+    // on mobile the inactivity timers never start (issue #118).
+    if (!screensaverSettings.enabled || isMobile) {
       if (inactivityTimerRef.current) {
         clearTimeout(inactivityTimerRef.current);
       }
@@ -670,7 +684,7 @@ const App = () => {
         clearTimeout(inactivityTimerRef.current);
       }
     };
-  }, [screensaverSettings.enabled, screensaverSettings.timeout, startInactivityTimer]);
+  }, [screensaverSettings.enabled, screensaverSettings.timeout, startInactivityTimer, isMobile]);
 
   const handleExitScreensaver = useCallback(() => {
     screensaverActiveRef.current = false;
@@ -685,9 +699,19 @@ const App = () => {
     setActiveTab(tabNumber);
   }, []);
 
+  // "Could someone plausibly be looking at the widgets right now?" Combines
+  // the Page Visibility API with app state the browser can't see on its own.
+  // In photos-mode the screensaver fully covers the dashboard, so widget
+  // refreshes are pure waste; tabs-mode displays the widgets, so they stay
+  // active. Future signals (e.g. Home Assistant presence, issue #57) plug in
+  // here as additional entries.
+  const widgetsActive = useScreenActivity({
+    widgetsVisible: !(screensaverActive && screensaverSettings.mode === 'photos'),
+  });
+
   const toggleTheme = () => {
     const hasCoordinates = typeof autoDarkModeSettings.lat === 'number' && typeof autoDarkModeSettings.lon === 'number';
-    const includeAutoMode = autoDarkModeSettings.enabled && hasCoordinates && (Boolean(apiKeys.WEATHER_API_KEY) || !apiKeysLoaded);
+    const includeAutoMode = autoDarkModeSettings.enabled && hasCoordinates;
     const themeModes = includeAutoMode ? ['light', 'dark', 'auto'] : ['light', 'dark'];
 
     const currentIndex = themeModes.includes(themeMode) ? themeModes.indexOf(themeMode) : 0;
@@ -790,9 +814,6 @@ const App = () => {
         content: (
           <Suspense fallback={<WidgetLoadingFallback label="calendar" />}>
             <CalendarWidget
-              transparentBackground={widgetSettings.calendar.transparent}
-              icsCalendarUrl={apiKeys.ICS_CALENDAR_URL}
-              refreshInterval={widgetSettings.calendar.refreshInterval || 0}
               activeTab={activeTab}
               activeTabConfigJson={tabs.find((tab) => tab.number === activeTab)?.config_json || null}
             />
@@ -813,8 +834,6 @@ const App = () => {
         content: (
           <Suspense fallback={<WidgetLoadingFallback label="weather" />}>
             <WeatherWidget
-              transparentBackground={widgetSettings.weather.transparent}
-              weatherApiKey={apiKeys.WEATHER_API_KEY}
               refreshInterval={widgetSettings.weather.refreshInterval || 0}
               activeTab={activeTab}
               activeTabConfigJson={tabs.find((tab) => tab.number === activeTab)?.config_json || null}
@@ -836,10 +855,7 @@ const App = () => {
         savedLayout: dbLayout,
         content: (
           <Suspense fallback={<WidgetLoadingFallback label="chores" />}>
-            <ChoreWidget
-              transparentBackground={widgetSettings.chores.transparent}
-              refreshInterval={widgetSettings.chores.refreshInterval || 0}
-            />
+            <ChoreWidget />
           </Suspense>
         ),
       });
@@ -856,10 +872,7 @@ const App = () => {
         savedLayout: dbLayout,
         content: (
           <Suspense fallback={<WidgetLoadingFallback label="photos" />}>
-            <PhotoWidget
-              transparentBackground={widgetSettings.photos.transparent}
-              refreshInterval={widgetSettings.photos.refreshInterval || 0}
-            />
+            <PhotoWidget />
           </Suspense>
         ),
       });
@@ -885,12 +898,20 @@ const App = () => {
           name={plugin.name}
           theme={theme}
           transparentBackground={pSettings.transparent || false}
+          events={plugin.manifest?.events || []}
         />,
       });
     });
 
     return result;
-  }, [widgetSettings, pluginSettings, activeTab, apiKeys, widgetAssignments, installedPlugins, theme]);
+  }, [widgetSettings, pluginSettings, activeTab, widgetAssignments, installedPlugins, theme, demoStatus.demo]);
+
+  // Mobile stack (issue #118): same widget content nodes, fixed order, photos
+  // excluded, grid metadata ignored.
+  const mobileWidgets = useMemo(
+    () => (isMobile ? buildMobileWidgetList(widgets) : []),
+    [isMobile, widgets]
+  );
 
   const activeTabId = useMemo(() => {
     const active = tabs.find(tab => tab.number === activeTab);
@@ -899,13 +920,87 @@ const App = () => {
 
   const shouldRunWeatherBackgroundPrefetch =
     widgetSettings.weather.enabled &&
-    !!apiKeys.WEATHER_API_KEY &&
     !isWidgetAssignedToTab('weather', activeTab);
+
+  // Unlock audio on the first user interaction (kiosk autoplay policy).
+  useEffect(() => {
+    unlockAudio();
+  }, []);
+
+  // Chore due-time notification sounds: fire regardless of the active tab.
+  // Gated by the global master switch AND this device not being muted AND the
+  // chores feature being enabled.
+  const choreSoundGlobalEnabled =
+    householdSettings.CHORE_SOUND_ENABLED === 'true' || householdSettings.CHORE_SOUND_ENABLED === true;
+  const parsedSoundVolume = Number(householdSettings.CHORE_SOUND_VOLUME);
+  useChoreSoundScheduler({
+    enabled:
+      widgetSettings.chores.enabled &&
+      choreSoundGlobalEnabled &&
+      choreSoundDeviceEnabled &&
+      // Vacation mode (issue #121) mutes chore due-time sounds while active.
+      !(vacationActiveToday && vacationModeSettings.muteSounds),
+    defaultSound: householdSettings.CHORE_SOUND_DEFAULT || null,
+    volume: Number.isFinite(parsedSoundVolume) ? parsedSoundVolume / 100 : 1,
+  });
 
   return (
     <>
       <Box sx={{ width: '100%', minHeight: '100vh', position: 'relative', pb: '80px' }}>
-        {widgets.length > 0 && (
+        {demoStatus.demo && (
+          <Box
+            sx={{
+              position: 'fixed',
+              top: 8,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 1200,
+              px: 2,
+              py: 0.5,
+              borderRadius: '16px',
+              backgroundColor: 'var(--accent)',
+              color: '#fff',
+              fontSize: '0.8rem',
+              fontWeight: 600,
+              boxShadow: '0 2px 8px rgba(0, 0, 0, 0.3)',
+              pointerEvents: 'none',
+            }}
+          >
+            Demo Mode — sample data resets every {demoStatus.resetHours || 6} hours
+          </Box>
+        )}
+        {vacationActiveToday && (
+          <Box
+            aria-label="Vacation mode active"
+            sx={{
+              position: 'fixed',
+              top: 8,
+              right: 8,
+              zIndex: 1200,
+              px: 1.5,
+              py: 0.5,
+              borderRadius: '16px',
+              backgroundColor: 'var(--card-bg)',
+              border: '1px solid var(--card-border)',
+              color: 'var(--text-color)',
+              fontSize: '0.8rem',
+              fontWeight: 600,
+              boxShadow: 'var(--shadow)',
+              pointerEvents: 'none',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 0.5,
+            }}
+          >
+            🏖️ Vacation Mode
+          </Box>
+        )}
+        {/* The one mobile/kiosk fork (issue #118): below 600px the grid —
+            react-grid-layout, drag/resize, lock — never mounts. */}
+        {isMobile && mobileWidgets.length > 0 && (
+          <MobileDashboard widgets={mobileWidgets} />
+        )}
+        {!isMobile && widgets.length > 0 && (
           <WidgetContainer
             widgets={widgets}
             locked={widgetsLocked}
@@ -913,19 +1008,19 @@ const App = () => {
             activeTabId={activeTabId}
             deviceWidgetSettings={widgetSettings}
             devicePluginSettings={pluginSettings}
+            isActive={widgetsActive}
           />
         )}
         {shouldRunWeatherBackgroundPrefetch && (
           <Box sx={{ display: 'none' }}>
             <Suspense fallback={null}>
               <WeatherWidget
-                transparentBackground={widgetSettings.weather.transparent}
-                weatherApiKey={apiKeys.WEATHER_API_KEY}
                 refreshInterval={widgetSettings.weather.refreshInterval || 0}
                 activeTab={activeTab}
                 activeTabConfigJson={tabs.find((tab) => tab.number === activeTab)?.config_json || null}
                 allTabConfigs={tabs}
                 prefetchOnly
+                isActive={widgetsActive}
               />
             </Suspense>
           </Box>
@@ -969,8 +1064,8 @@ const App = () => {
         )}
       </Box>
 
-      <Dialog open={showAdminPanel} onClose={toggleAdminPanel} maxWidth="lg">
-        <DialogContent sx={{ position: 'relative' }}>
+      <Dialog open={showAdminPanel} onClose={toggleAdminPanel} maxWidth="lg" fullScreen={isMobile}>
+        <DialogContent sx={{ position: 'relative', '@media (max-width:599.95px)': { p: 1.5 } }}>
           <IconButton
             onClick={toggleAdminPanel}
             sx={{
@@ -999,7 +1094,10 @@ const App = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Floating Dock TabBar */}
+      {/* Floating Dock TabBar. The dock renders above MUI dialogs, so hide it
+          while the Admin Panel is open full-screen on mobile — otherwise it
+          covers the bottom action buttons of the panel's dialogs. */}
+      {!(isMobile && showAdminPanel) && (
       <TabBar
         tabs={tabs}
         activeTab={activeTab}
@@ -1014,14 +1112,18 @@ const App = () => {
         theme={theme}
         themeMode={themeMode}
         screensaverCountdown={
-          <ScreensaverCountdown
-            enabled={screensaverSettings.enabled}
-            timeoutMinutes={screensaverSettings.timeout}
-            lastActivityRef={lastActivityRef}
-            screensaverActive={screensaverActive}
-          />
+          // No screensaver on mobile — don't show a countdown that never fires.
+          isMobile ? null : (
+            <ScreensaverCountdown
+              enabled={screensaverSettings.enabled}
+              timeoutMinutes={screensaverSettings.timeout}
+              lastActivityRef={lastActivityRef}
+              screensaverActive={screensaverActive}
+            />
+          )
         }
       />
+      )}
 
       <Suspense fallback={null}>
         <TabIconModal
@@ -1031,15 +1133,21 @@ const App = () => {
         />
       </Suspense>
 
-      {screensaverActive && screensaverSettings.enabled && (
+      {!isMobile && screensaverActive && screensaverSettings.enabled && (
         <Suspense fallback={null}>
-          <ScreenSaver
-            mode={screensaverSettings.mode}
-            slideshowInterval={screensaverSettings.slideshowInterval}
-            tabs={tabs}
-            onExit={handleExitScreensaver}
-            onTabChange={handleScreensaverTabChange}
-          />
+          {vacationActiveToday ? (
+            // Vacation mode (issue #121) replaces the standard screensaver
+            // with the popcorn vacation-emoji one.
+            <VacationScreensaver onExit={handleExitScreensaver} />
+          ) : (
+            <ScreenSaver
+              mode={screensaverSettings.mode}
+              slideshowInterval={screensaverSettings.slideshowInterval}
+              tabs={tabs}
+              onExit={handleExitScreensaver}
+              onTabChange={handleScreensaverTabChange}
+            />
+          )}
         </Suspense>
       )}
     </>

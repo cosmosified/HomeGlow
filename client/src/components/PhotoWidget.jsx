@@ -1,10 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Typography, Box, IconButton, Popover, Dialog, DialogTitle, DialogContent, DialogActions, Button, TextField, Switch, FormControlLabel, Select, MenuItem, FormControl, InputLabel, List, ListItem, ListItemText, ListItemSecondaryAction, CircularProgress, Alert, Chip } from '@mui/material';
 import { Settings, Add, Delete, Edit, Refresh, ChevronLeft, ChevronRight, PlayArrow, Pause, CloudUpload } from '@mui/icons-material';
 import axios from 'axios';
+import { useTranslation } from 'react-i18next';
 import { API_BASE_URL } from '../utils/apiConfig.js';
 
-const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
+const PhotoWidget = ({ refreshNonce = 0, isActive = true }) => {
+  const { t } = useTranslation(['photos', 'common']);
   const [photos, setPhotos] = useState([]);
   const [currentPhotoIndex, setCurrentPhotoIndex] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -28,6 +30,7 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
   const [slideshowInterval, setSlideshowInterval] = useState(5000);
   const [photosPerView, setPhotosPerView] = useState(1);
   const [transitionType, setTransitionType] = useState('none');
+  const [photoHeight, setPhotoHeight] = useState('auto');
 
   useEffect(() => {
     fetchPhotoSources();
@@ -50,6 +53,10 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
       if (settings.PHOTO_WIDGET_SLIDESHOW_INTERVAL) {
         setSlideshowInterval(parseInt(settings.PHOTO_WIDGET_SLIDESHOW_INTERVAL));
       }
+      if (settings.PHOTO_WIDGET_PHOTO_SIZE) {
+        const storedSize = settings.PHOTO_WIDGET_PHOTO_SIZE;
+        setPhotoHeight(storedSize === 'auto' ? 'auto' : parseInt(storedSize));
+      }
     } catch (error) {
       console.error('Error loading photo widget preferences:', error);
     }
@@ -66,33 +73,26 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
     }
   };
 
-  // Auto-refresh functionality
+  // Auto/manual refresh: WidgetContainer's countdown ring owns the schedule
+  // and bumps refreshNonce; refetch in place instead of remounting.
+  const lastRefreshNonceRef = useRef(refreshNonce);
   useEffect(() => {
-    if (refreshInterval > 0) {
-      console.log(`PhotoWidget: Auto-refresh enabled (${refreshInterval}ms)`);
+    if (refreshNonce === lastRefreshNonceRef.current) return;
+    lastRefreshNonceRef.current = refreshNonce;
+    fetchPhotos();
+  }, [refreshNonce]);
 
-      const intervalId = setInterval(() => {
-        console.log('PhotoWidget: Auto-refreshing data...');
-        fetchPhotos();
-      }, refreshInterval);
-
-      return () => {
-        console.log('PhotoWidget: Clearing auto-refresh interval');
-        clearInterval(intervalId);
-      };
-    }
-  }, [refreshInterval]);
-
-  // Slideshow timer
+  // Slideshow timer — paused while nobody can see the widget (hidden tab or
+  // photos-mode screensaver covering the dashboard).
   useEffect(() => {
-    if (!isPlaying || photos.length <= photosPerView) return;
+    if (!isActive || !isPlaying || photos.length <= photosPerView) return;
 
     const timer = setInterval(() => {
       setCurrentPhotoIndex((prev) => (prev + photosPerView) % photos.length);
     }, slideshowInterval);
 
     return () => clearInterval(timer);
-  }, [isPlaying, photos.length, slideshowInterval, currentPhotoIndex, photosPerView]);
+  }, [isActive, isPlaying, photos.length, slideshowInterval, currentPhotoIndex, photosPerView]);
 
   const fetchPhotoSources = async () => {
     try {
@@ -166,7 +166,7 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
   };
 
   const handleDeleteSource = async (sourceId) => {
-    if (window.confirm('Are you sure you want to delete this photo source?')) {
+    if (window.confirm(t('photos:confirm.deleteSource'))) {
       try {
         await axios.delete(`${API_BASE_URL}/api/photo-sources/${sourceId}`);
         await fetchPhotoSources();
@@ -189,7 +189,7 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
         setTestingConnection(false);
       }
     } else {
-      setTestResult({ success: false, message: 'Please save the photo source before testing' });
+      setTestResult({ success: false, message: t('photos:errors.saveBeforeTesting') });
     }
   };
 
@@ -206,7 +206,7 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
       setShowSourceDialog(false);
     } catch (error) {
       console.error('Error saving photo source:', error);
-      alert('Failed to save photo source. Please try again.');
+      alert(t('photos:errors.saveFailed'));
     } finally {
       setSavingSource(false);
     }
@@ -278,13 +278,19 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
 
       {!loading && !error && photos.length === 0 && (
         <Box sx={{ textAlign: 'center', py: 4 }}>
-          <Typography sx={{ color: 'var(--text-color)', opacity: 0.6 }}>No photos available. Add a photo source in settings.</Typography>
+          <Typography sx={{ color: 'var(--text-color)', opacity: 0.6 }}>{t('photos:widget.noPhotos')}</Typography>
         </Box>
       )}
 
       {!loading && !error && photos.length > 0 && currentPhotos.length > 0 && (
-        <Box>
-          <Box sx={{ position: 'relative', height: 400, overflow: 'hidden', borderRadius: 2, mb: 2 }}>
+        <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <Box sx={{
+            position: 'relative',
+            ...(photoHeight === 'auto' ? { flex: 1, minHeight: 0 } : { height: photoHeight }),
+            overflow: 'hidden',
+            borderRadius: 2,
+            mb: 2
+          }}>
             <Box
               key={currentPhotoIndex}
               sx={{
@@ -318,7 +324,7 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
                 <Box key={`${photo.id}-${index}`} sx={{ height: '100%', overflow: 'hidden', borderRadius: 1 }}>
                   <img
                     src={`${API_BASE_URL}${photo.url}`}
-                    alt="Photo"
+                    alt={t('photos:widget.photoAlt')}
                     style={{
                       width: '100%',
                       height: '100%',
@@ -399,20 +405,20 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
       >
         <Box sx={{ p: 2, minWidth: 300, maxWidth: 400 }}>
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-            <Typography variant="subtitle1" fontWeight="bold">Photo Sources</Typography>
+            <Typography variant="subtitle1" fontWeight="bold">{t('photos:settings.sources')}</Typography>
             <Button
               startIcon={<Add />}
               onClick={handleAddSource}
               size="small"
               variant="outlined"
             >
-              Add Source
+              {t('photos:settings.addSource')}
             </Button>
           </Box>
 
           <Box sx={{ mb: 2 }}>
             <Typography variant="caption" color="text.secondary" gutterBottom display="block">
-              Photos Per View
+              {t('photos:settings.photosPerView')}
             </Typography>
             <Select
               fullWidth
@@ -432,7 +438,30 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
 
           <Box sx={{ mb: 2 }}>
             <Typography variant="caption" color="text.secondary" gutterBottom display="block">
-              Transition Effect
+              {t('photos:settings.photoSize')}
+            </Typography>
+            <Select
+              fullWidth
+              size="small"
+              value={photoHeight}
+              onChange={(e) => {
+                const value = e.target.value;
+                setPhotoHeight(value);
+                savePreference('PHOTO_WIDGET_PHOTO_SIZE', value);
+              }}
+            >
+              <MenuItem value="auto">{t('photos:size.auto')}</MenuItem>
+              <MenuItem value={880}>{t('photos:size.extraLarge')}</MenuItem>
+              <MenuItem value={720}>{t('photos:size.large')}</MenuItem>
+              <MenuItem value={580}>{t('photos:size.medium')}</MenuItem>
+              <MenuItem value={450}>{t('photos:size.small')}</MenuItem>
+              <MenuItem value={300}>{t('photos:size.extraSmall')}</MenuItem>
+            </Select>
+          </Box>
+
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="caption" color="text.secondary" gutterBottom display="block">
+              {t('photos:settings.transitionEffect')}
             </Typography>
             <Select
               fullWidth
@@ -445,14 +474,14 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
               }}
             >
               <MenuItem value="none">None</MenuItem>
-              <MenuItem value="fade">Fade</MenuItem>
-              <MenuItem value="slide">Slide</MenuItem>
+              <MenuItem value="fade">{t('photos:transition.fade')}</MenuItem>
+              <MenuItem value="slide">{t('photos:transition.slide')}</MenuItem>
             </Select>
           </Box>
 
           <Box sx={{ mb: 2 }}>
             <Typography variant="caption" color="text.secondary" gutterBottom display="block">
-              Slideshow Speed
+              {t('photos:settings.slideshowSpeed')}
             </Typography>
             <Select
               fullWidth
@@ -464,10 +493,10 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
                 savePreference('PHOTO_WIDGET_SLIDESHOW_INTERVAL', value);
               }}
             >
-              <MenuItem value={3000}>Fast (3s)</MenuItem>
-              <MenuItem value={5000}>Normal (5s)</MenuItem>
-              <MenuItem value={10000}>Slow (10s)</MenuItem>
-              <MenuItem value={30000}>Very Slow (30s)</MenuItem>
+              <MenuItem value={3000}>{t('photos:speed.fast')}</MenuItem>
+              <MenuItem value={5000}>{t('photos:speed.normal')}</MenuItem>
+              <MenuItem value={10000}>{t('photos:speed.slow')}</MenuItem>
+              <MenuItem value={30000}>{t('photos:speed.verySlow')}</MenuItem>
             </Select>
           </Box>
 
@@ -516,7 +545,7 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
             ))}
             {photoSources.length === 0 && (
               <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center', py: 2 }}>
-                No photo sources configured
+                {t('photos:settings.noSources')}
               </Typography>
             )}
           </List>
@@ -545,21 +574,21 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
         <DialogContent>
           <TextField
             fullWidth
-            label="Source Name"
+            label={t('photos:source.name')}
             value={sourceForm.name}
             onChange={(e) => setSourceForm({ ...sourceForm, name: e.target.value })}
             margin="normal"
           />
 
           <FormControl fullWidth margin="normal">
-            <InputLabel>Type</InputLabel>
+            <InputLabel>{t('photos:source.type')}</InputLabel>
             <Select
               value={sourceForm.type}
               onChange={(e) => setSourceForm({ ...sourceForm, type: e.target.value })}
-              label="Type"
+              label={t('photos:source.type')}
             >
-              <MenuItem value="Immich">Immich</MenuItem>
-              <MenuItem value="HomeGlowPhotos">HomeGlow Photos</MenuItem>
+              <MenuItem value="Immich">{t('photos:source.immich')}</MenuItem>
+              <MenuItem value="HomeGlowPhotos">{t('photos:source.homeglow')}</MenuItem>
             </Select>
           </FormControl>
 
@@ -567,29 +596,29 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
             <>
               <TextField
                 fullWidth
-                label="Immich Server URL"
+                label={t('photos:source.immichUrl')}
                 value={sourceForm.url}
                 onChange={(e) => setSourceForm({ ...sourceForm, url: e.target.value })}
                 margin="normal"
                 placeholder="https://immich.example.com"
-                helperText="Your Immich server URL"
+                helperText={t('photos:source.immichUrlPlaceholder')}
               />
               <TextField
                 fullWidth
-                label="API Key"
+                label={t('photos:source.apiKey')}
                 type="password"
                 value={sourceForm.api_key}
                 onChange={(e) => setSourceForm({ ...sourceForm, api_key: e.target.value })}
                 margin="normal"
-                helperText="Get from Immich Settings → API Keys"
+                helperText={t('photos:source.apiKeyHelp')}
               />
               <TextField
                 fullWidth
-                label="Album ID (Optional)"
+                label={t('photos:source.albumId')}
                 value={sourceForm.album_id}
                 onChange={(e) => setSourceForm({ ...sourceForm, album_id: e.target.value })}
                 margin="normal"
-                helperText="Leave empty to show all photos"
+                helperText={t('photos:source.albumIdHelp')}
               />
             </>
           )}
@@ -598,13 +627,12 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
             <Box sx={{ mt: 2 }}>
               {!editingSource ? (
                 <Alert severity="info">
-                  Save this source first, then open the upload page to add photos from your device.
+                  {t('photos:source.saveFirst')}
                 </Alert>
               ) : (
                 <>
                   <Typography variant="body2" sx={{ mb: 1 }}>
-                    Upload photos directly from your device. They will be stored on your HomeGlow
-                    server and displayed in this widget.
+                    {t('photos:source.uploadExplain')}
                   </Typography>
                   <Button
                     type="button"
@@ -614,11 +642,10 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
                       window.location.href = `/photos?source=${editingSource.id}`;
                     }}
                   >
-                    Open upload page
+                    {t('photos:source.openUploadPage')}
                   </Button>
                   <Alert severity="info" sx={{ mt: 2 }}>
-                    The upload page is mobile-friendly—open it on your phone to upload photos
-                    straight from your camera roll.
+                    {t('photos:source.mobileHint')}
                   </Alert>
                 </>
               )}
@@ -639,10 +666,10 @@ const PhotoWidget = ({ transparentBackground, refreshInterval = 0 }) => {
               disabled={testingConnection}
               startIcon={testingConnection ? <CircularProgress size={16} /> : <Refresh />}
             >
-              Test Connection
+              {t('photos:source.testConnection')}
             </Button>
           )}
-          <Button type="button" onClick={() => setShowSourceDialog(false)}>Cancel</Button>
+          <Button type="button" onClick={() => setShowSourceDialog(false)}>{t('common:actions.cancel')}</Button>
           <Button
             type="submit"
             variant="contained"

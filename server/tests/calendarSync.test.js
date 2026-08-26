@@ -140,3 +140,147 @@ test('getCachedEvents maps cached rows with source metadata', async () => {
         }
     }
 });
+
+test('parseEventColor extracts a valid hex and rejects anything else', () => {
+    const service = new CalendarSyncService({}, () => null);
+
+    assert.equal(service.parseEventColor(JSON.stringify({ eventColor: '#dc2127' })), '#dc2127');
+    assert.equal(service.parseEventColor(JSON.stringify({ eventColor: null })), null);
+    assert.equal(service.parseEventColor(JSON.stringify({ googleEventId: 'x' })), null);
+    assert.equal(service.parseEventColor(JSON.stringify({ eventColor: 'red' })), null);
+    assert.equal(service.parseEventColor('not json'), null);
+    assert.equal(service.parseEventColor(null), null);
+});
+
+test('getCachedEvents surfaces per-event color and leaves it null otherwise', async () => {
+    const path = require('node:path');
+    const fs = require('node:fs');
+    const { createKnex } = require('../db/knex');
+    const dbFile = path.join(__dirname, '.tmp', `calcolor-${process.pid}-${Date.now()}.db`);
+    fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+    const knex = createKnex({ engine: 'sqlite', filename: dbFile });
+    require('objection').Model.knex(knex);
+
+    await knex.schema.createTable('calendar_sources', (t) => {
+        t.integer('id').primary();
+        t.text('name');
+        t.text('color');
+        t.integer('enabled').defaultTo(1);
+    });
+    await knex.schema.createTable('calendar_events_cache', (t) => {
+        t.integer('source_id');
+        t.text('event_uid');
+        t.text('title');
+        t.text('start_time');
+        t.text('end_time');
+        t.text('description');
+        t.text('location');
+        t.integer('all_day');
+        t.text('raw_data');
+    });
+
+    await knex('calendar_sources').insert({ id: 1, name: 'Family', color: '#123456', enabled: 1 });
+    await knex('calendar_events_cache').insert([
+        {
+            source_id: 1, event_uid: 'recolored', title: 'Recolored',
+            start_time: '2026-05-01T13:00:00.000Z', end_time: '2026-05-01T14:00:00.000Z',
+            description: null, location: null, all_day: 0,
+            raw_data: JSON.stringify({ googleEventId: 'a', colorId: '11', eventColor: '#dc2127' }),
+        },
+        {
+            source_id: 1, event_uid: 'default-color', title: 'Default',
+            start_time: '2026-05-02T13:00:00.000Z', end_time: '2026-05-02T14:00:00.000Z',
+            description: null, location: null, all_day: 0,
+            raw_data: JSON.stringify({ googleEventId: 'b', colorId: null, eventColor: null }),
+        },
+    ]);
+
+    const service = new CalendarSyncService({}, () => null);
+
+    try {
+        const mapped = await service.getCachedEvents();
+
+        assert.equal(mapped.length, 2);
+        assert.equal(mapped[0].event_color, '#dc2127');
+        assert.equal(mapped[0].source_color, '#123456');
+        assert.equal(mapped[1].event_color, null);
+        assert.equal(mapped[1].source_color, '#123456');
+    } finally {
+        await knex.destroy();
+        for (const suffix of ['', '-wal', '-shm']) {
+            try { fs.rmSync(`${dbFile}${suffix}`, { force: true }); } catch (_) { /* ignore */ }
+        }
+    }
+});
+
+test('fetchGoogleEvents resolves colorId to a hex via the Google palette', async () => {
+    const googleCalendar = require('../services/googleCalendar');
+    const googleConnection = require('../services/googleConnection');
+
+    const originalGetAccount = googleConnection.getConnectedAccount;
+    const originalListEvents = googleCalendar.listEvents;
+    const originalListEventColors = googleCalendar.listEventColors;
+
+    googleConnection.getConnectedAccount = () => ({ id: 'acct-1' });
+    googleCalendar.listEventColors = async () => ({ '11': '#dc2127' });
+    googleCalendar.listEvents = async () => ([
+        {
+            id: 'evt-recolored', status: 'confirmed', summary: 'Recolored',
+            start: { dateTime: '2026-05-01T13:00:00Z' },
+            end: { dateTime: '2026-05-01T14:00:00Z' },
+            colorId: '11',
+        },
+        {
+            id: 'evt-default', status: 'confirmed', summary: 'Default',
+            start: { dateTime: '2026-05-02T13:00:00Z' },
+            end: { dateTime: '2026-05-02T14:00:00Z' },
+        },
+    ]);
+
+    try {
+        const service = new CalendarSyncService({}, () => null);
+        const events = await service.fetchGoogleEvents({ id: 1, url: 'primary' });
+
+        assert.equal(events.length, 2);
+        assert.equal(events[0].raw.colorId, '11');
+        assert.equal(events[0].raw.eventColor, '#dc2127');
+        assert.equal(events[1].raw.colorId, null);
+        assert.equal(events[1].raw.eventColor, null);
+    } finally {
+        googleConnection.getConnectedAccount = originalGetAccount;
+        googleCalendar.listEvents = originalListEvents;
+        googleCalendar.listEventColors = originalListEventColors;
+    }
+});
+
+test('fetchGoogleEvents leaves color null when the palette is unavailable', async () => {
+    const googleCalendar = require('../services/googleCalendar');
+    const googleConnection = require('../services/googleConnection');
+
+    const originalGetAccount = googleConnection.getConnectedAccount;
+    const originalListEvents = googleCalendar.listEvents;
+    const originalListEventColors = googleCalendar.listEventColors;
+
+    googleConnection.getConnectedAccount = () => ({ id: 'acct-1' });
+    googleCalendar.listEventColors = async () => ({});
+    googleCalendar.listEvents = async () => ([
+        {
+            id: 'evt-recolored', status: 'confirmed', summary: 'Recolored',
+            start: { dateTime: '2026-05-01T13:00:00Z' },
+            end: { dateTime: '2026-05-01T14:00:00Z' },
+            colorId: '11',
+        },
+    ]);
+
+    try {
+        const service = new CalendarSyncService({}, () => null);
+        const events = await service.fetchGoogleEvents({ id: 1, url: 'primary' });
+
+        assert.equal(events[0].raw.colorId, '11');
+        assert.equal(events[0].raw.eventColor, null);
+    } finally {
+        googleConnection.getConnectedAccount = originalGetAccount;
+        googleCalendar.listEvents = originalListEvents;
+        googleCalendar.listEventColors = originalListEventColors;
+    }
+});

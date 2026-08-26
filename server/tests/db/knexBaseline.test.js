@@ -6,11 +6,20 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { createKnex } = require('../../db/knex');
-const { adoptOrMigrate } = require('../../db/migrate');
+const { adoptOrMigrate, findPostBaselineMigrations, BASELINE_SCHEMA_VERSION } = require('../../db/migrate');
 const { tmpDir } = require('../helpers/serverHarness');
 const fs = require('node:fs');
 
 fs.mkdirSync(tmpDir, { recursive: true });
+
+// The schema level a fully-migrated database reports in settings.SYSTEM_SCHEMA_ID:
+// the highest schemaId among the post-baseline migrations, or the baseline itself
+// when there are none. Computed rather than hardcoded so adding a migration does
+// not silently rot this suite.
+const postBaseline = findPostBaselineMigrations();
+const LATEST_SCHEMA_VERSION = postBaseline.length > 0
+    ? postBaseline[postBaseline.length - 1].schemaId
+    : BASELINE_SCHEMA_VERSION;
 
 const SCHEMA_TABLES = [
     'users', 'chores', 'chore_schedules', 'chore_history', 'prizes', 'settings',
@@ -102,7 +111,8 @@ test('baseline ADOPTION stamps an existing schema-14 DB without re-running DDL o
         await setup.schema.dropTableIfExists('knex_migrations');
         await setup.schema.dropTableIfExists('knex_migrations_lock');
         await setup('users').insert({ username: 'sentinel', email: 's@example.com', profile_picture: '' });
-        // SYSTEM_SCHEMA_ID=14 is already seeded by the baseline migration.
+        // SYSTEM_SCHEMA_ID is seeded by the baseline and advanced by every
+        // post-baseline migration, so it now reads the latest level.
     } finally {
         await setup.destroy();
     }
@@ -123,7 +133,7 @@ test('baseline ADOPTION stamps an existing schema-14 DB without re-running DDL o
         const sentinel = await knex('users').where({ username: 'sentinel' }).first();
         assert.ok(sentinel, 'sentinel user preserved (no data loss)');
         const sv = await knex('settings').where({ key: 'SYSTEM_SCHEMA_ID' }).first();
-        assert.equal(sv.value, '14', 'schema version row preserved');
+        assert.equal(sv.value, String(LATEST_SCHEMA_VERSION), 'schema version row preserved');
 
         // Idempotent: a second startup does nothing destructive.
         const again = await adoptOrMigrate(knex);

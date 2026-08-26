@@ -1,12 +1,20 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { Suspense, useState, useEffect, useRef, useCallback } from 'react';
 import { Box, IconButton } from '@mui/material';
-import GridLayout from 'react-grid-layout';
+import GridLayout, { getCompactor } from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
 import axios from 'axios';
 import { API_BASE_URL } from '../utils/apiConfig.js';
 import { getDeviceApiBase } from '../utils/deviceName.js';
+import {
+  layoutItemFromNormalized,
+  layoutItemToNormalized,
+  scaleLayoutItem,
+} from '../utils/gridLayout.js';
 import CountdownCircle from './CountdownCircle';
+
+// No auto-compaction; block overlaps (same as compactType={null} + preventCollision).
+const GRID_COMPACTOR = getCompactor(null, false, true);
 
 const CORE_WIDGET_ID_TO_NAME = {
   'calendar-widget': 'calendar',
@@ -21,6 +29,16 @@ const resolveWidgetName = (widgetId) => {
   return null;
 };
 
+// Core widgets arrive Suspense-wrapped (they're lazy-loaded). Props cloned
+// onto a Suspense boundary are silently dropped, so inject them into the
+// widget element itself.
+const injectWidgetProps = (element, props) => {
+  if (React.isValidElement(element) && element.type === Suspense) {
+    return React.cloneElement(element, {}, React.cloneElement(element.props.children, props));
+  }
+  return React.cloneElement(element, props);
+};
+
 const WidgetContainer = ({
   children,
   widgets = [],
@@ -30,6 +48,7 @@ const WidgetContainer = ({
   activeTabId = 1,
   deviceWidgetSettings = {},
   devicePluginSettings = {},
+  isActive = true,
 }) => {
   const API_DEVICE_URL = getDeviceApiBase(API_BASE_URL);
   const [containerWidth, setContainerWidth] = useState(1200);
@@ -40,25 +59,30 @@ const WidgetContainer = ({
   const [refreshKeys, setRefreshKeys] = useState({});
   const containerRef = useRef(null);
   const prevWidgetIdsRef = useRef('');
+  const prevGridColsRef = useRef(null);
   const lockedRef = useRef(locked);
   const prevLockedRef = useRef(locked);
   const hasInitializedLockEffectRef = useRef(false);
   const saveTimerRef = useRef(null);
   const resizeTapGuardRef = useRef(new Map());
 
-  const saveLayoutsToApi = useCallback((layoutItems, tabNumber) => {
+  const saveLayoutsToApi = useCallback((layoutItems, tabNumber, cols) => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
+      // Persist in normalized (12-col) units so layouts round-trip across breakpoints.
       const layouts = layoutItems
         .filter(item => resolveWidgetName(item.i))
-        .map(item => ({
-          widget_name: resolveWidgetName(item.i),
-          tabNumber: tabNumber,
-          layout_x: item.x,
-          layout_y: item.y,
-          layout_w: item.w,
-          layout_h: item.h,
-        }));
+        .map(item => {
+          const stored = layoutItemToNormalized(item, cols);
+          return {
+            widget_name: resolveWidgetName(item.i),
+            tabNumber: tabNumber,
+            layout_x: stored.x,
+            layout_y: stored.y,
+            layout_w: stored.w,
+            layout_h: stored.h,
+          };
+        });
 
       if (layouts.length > 0) {
         axios.patch(`${API_DEVICE_URL}/widget-assignments/layout/bulk`, { layouts }).catch(() => { });
@@ -99,61 +123,102 @@ const WidgetContainer = ({
 
   useEffect(() => {
     const currentCacheKey = `${activeTab}:${widgets.map(w => w.id).sort().join(',')}`;
-    if (currentCacheKey === prevWidgetIdsRef.current) return;
-    prevWidgetIdsRef.current = currentCacheKey;
+    const widgetsChanged = currentCacheKey !== prevWidgetIdsRef.current;
+    const prevCols = prevGridColsRef.current;
+    const colsChanged = prevCols != null && prevCols !== gridCols;
 
-    const cols = gridCols;
-    const placed = [];
+    // First paint / widget-set changes rebuild from saved (12-col) layouts.
+    // Column-only changes rescale the live layout so resize affordances stay correct.
+    if (!widgetsChanged && !colsChanged) {
+      prevGridColsRef.current = gridCols;
+      return;
+    }
 
-    const collides = (x, y, w, h) => {
-      return placed.some(p =>
-        x < p.x + p.w && x + w > p.x && y < p.y + p.h && y + h > p.y
-      );
-    };
+    if (widgetsChanged) {
+      prevWidgetIdsRef.current = currentCacheKey;
 
-    const findFreePosition = (w, h) => {
-      for (let row = 0; row < 200; row++) {
-        for (let col = 0; col <= cols - w; col++) {
-          if (!collides(col, row, w, h)) return { x: col, y: row };
+      const cols = gridCols;
+      const placed = [];
+
+      const collides = (x, y, w, h) => {
+        return placed.some(p =>
+          x < p.x + p.w && x + w > p.x && y < p.y + p.h && y + h > p.y
+        );
+      };
+
+      const findFreePosition = (w, h) => {
+        for (let row = 0; row < 200; row++) {
+          for (let col = 0; col <= cols - w; col++) {
+            if (!collides(col, row, w, h)) return { x: col, y: row };
+          }
         }
-      }
-      return { x: 0, y: 0 };
-    };
+        return { x: 0, y: 0 };
+      };
 
-    const initialLayout = widgets.map((widget) => {
-      const w = widget.defaultSize.width;
-      const h = widget.defaultSize.height;
-      let item;
+      const initialLayout = widgets.map((widget) => {
+        const minW = widget.minWidth || 3;
+        const minH = widget.minHeight || 2;
+        let item;
 
-      if (widget.savedLayout) {
-        item = {
-          i: widget.id,
-          x: widget.savedLayout.x ?? widget.defaultPosition.x,
-          y: widget.savedLayout.y ?? widget.defaultPosition.y,
-          w: widget.savedLayout.w || w,
-          h: widget.savedLayout.h || h,
-          minW: widget.minWidth || 3,
-          minH: widget.minHeight || 2,
+        if (widget.savedLayout) {
+          const scaled = layoutItemFromNormalized(
+            {
+              x: widget.savedLayout.x ?? widget.defaultPosition.x,
+              y: widget.savedLayout.y ?? widget.defaultPosition.y,
+              w: widget.savedLayout.w || widget.defaultSize.width,
+              h: widget.savedLayout.h || widget.defaultSize.height,
+              minW,
+              minH,
+            },
+            cols
+          );
+          item = {
+            i: widget.id,
+            ...scaled,
+            static: lockedRef.current,
+          };
+        } else {
+          const scaledDefault = layoutItemFromNormalized(
+            {
+              x: widget.defaultPosition.x,
+              y: widget.defaultPosition.y,
+              w: widget.defaultSize.width,
+              h: widget.defaultSize.height,
+              minW,
+              minH,
+            },
+            cols
+          );
+          const pos = findFreePosition(scaledDefault.w, scaledDefault.h);
+          item = {
+            i: widget.id,
+            x: pos.x,
+            y: pos.y,
+            w: scaledDefault.w,
+            h: scaledDefault.h,
+            minW: scaledDefault.minW,
+            minH: scaledDefault.minH,
+            static: lockedRef.current,
+          };
+        }
+
+        placed.push({ x: item.x, y: item.y, w: item.w, h: item.h });
+        return item;
+      });
+      setLayout(initialLayout);
+    } else if (colsChanged) {
+      setLayout((currentLayout) => {
+        const nextLayout = currentLayout.map((item) => ({
+          ...scaleLayoutItem(item, prevCols, gridCols),
           static: lockedRef.current,
-        };
-      } else {
-        const pos = findFreePosition(w, h);
-        item = {
-          i: widget.id,
-          x: pos.x,
-          y: pos.y,
-          w,
-          h,
-          minW: widget.minWidth || 3,
-          minH: widget.minHeight || 2,
-          static: lockedRef.current,
-        };
-      }
+        }));
+        const calendarBefore = currentLayout.find((item) => item.i === 'calendar-widget');
+        const calendarAfter = nextLayout.find((item) => item.i === 'calendar-widget');
+        return nextLayout;
+      });
+    }
 
-      placed.push({ x: item.x, y: item.y, w: item.w, h: item.h });
-      return item;
-    });
-    setLayout(initialLayout);
+    prevGridColsRef.current = gridCols;
   }, [widgets, activeTab, gridCols]);
 
   useEffect(() => {
@@ -170,7 +235,7 @@ const WidgetContainer = ({
 
       const shouldPersistLockedLayouts = hasInitializedLockEffectRef.current && !wasLocked && locked;
       if (shouldPersistLockedLayouts) {
-        saveLayoutsToApi(updatedLayout, activeTab);
+        saveLayoutsToApi(updatedLayout, activeTab, gridCols);
       }
 
       return updatedLayout;
@@ -194,16 +259,10 @@ const WidgetContainer = ({
     }
   }, [locked]);
 
-  const layoutRef = useRef(layout);
-  useEffect(() => {
-    layoutRef.current = layout;
-  }, [layout]);
-
   const handleLayoutChange = (newLayout) => {
     if (locked) return;
 
-    const currentLayout = layoutRef.current;
-    const currentLayoutById = new Map(currentLayout.map(item => [item.i, item]));
+    const currentLayoutById = new Map(layout.map(item => [item.i, item]));
     const safeLayout = newLayout.map((item) => {
       const existing = currentLayoutById.get(item.i);
       const minW = existing?.minW ?? item.minW ?? 2;
@@ -218,7 +277,7 @@ const WidgetContainer = ({
     });
 
     const hasChanged = safeLayout.some(item => {
-      const existing = currentLayout.find(l => l.i === item.i);
+      const existing = currentLayoutById.get(item.i);
       if (!existing) return true;
       return existing.x !== item.x || existing.y !== item.y || existing.w !== item.w || existing.h !== item.h;
     });
@@ -231,9 +290,8 @@ const WidgetContainer = ({
     }));
 
     setLayout(updatedLayout);
-    layoutRef.current = updatedLayout;
 
-    saveLayoutsToApi(updatedLayout, activeTab);
+    saveLayoutsToApi(updatedLayout, activeTab, gridCols);
 
     if (onLayoutChangeCallback) {
       onLayoutChangeCallback(updatedLayout);
@@ -306,24 +364,19 @@ const WidgetContainer = ({
               break;
           }
 
-          const layoutData = {
-            x: updatedItem.x,
-            y: updatedItem.y,
-            w: updatedItem.w,
-            h: updatedItem.h,
-          };
-
           return updatedItem;
         }
         return { ...item, static: locked };
       });
 
+      const before = currentLayout.find((item) => item.i === widgetId);
+      const after = newLayout.find((item) => item.i === widgetId);
+
       if (onLayoutChangeCallback) {
         onLayoutChangeCallback(newLayout);
       }
 
-      saveLayoutsToApi(newLayout, activeTab);
-      layoutRef.current = newLayout;
+      saveLayoutsToApi(newLayout, activeTab, gridCols);
       return newLayout;
     });
   };
@@ -428,12 +481,15 @@ const WidgetContainer = ({
     return 0;
   };
 
-  const handleWidgetRefresh = (widgetId) => {
+  // Bumping the nonce tells the widget to refetch in place. It must NOT be
+  // used as a React key — that force-remounts the widget, re-running its
+  // mount fetch and restarting its timers (the churn bug in issue #75).
+  const handleWidgetRefresh = useCallback((widgetId) => {
     setRefreshKeys(prev => ({
       ...prev,
       [widgetId]: (prev[widgetId] || 0) + 1
     }));
-  };
+  }, []);
 
   const resizeButtonBaseStyle = {
     fontSize: '1.5rem',
@@ -475,32 +531,39 @@ const WidgetContainer = ({
       {layout.length > 0 && (
         <GridLayout
           className="layout"
-          layout={layout}
-          cols={gridCols}
-          rowHeight={100}
           width={containerWidth}
+          layout={layout}
+          gridConfig={{
+            cols: gridCols,
+            rowHeight: 100,
+            margin: [16, 16],
+            containerPadding: [0, 0],
+          }}
+          dragConfig={{
+            enabled: !locked,
+            handle: '.drag-handle',
+            cancel: '.widget-content',
+          }}
+          resizeConfig={{ enabled: false }}
+          compactor={GRID_COMPACTOR}
           onLayoutChange={handleLayoutChange}
-          isDraggable={!locked}
-          isResizable={false}
-          compactType={null}
-          preventCollision={true}
-          margin={[16, 16]}
-          containerPadding={[0, 0]}
-          useCSSTransforms={true}
-          draggableHandle=".drag-handle"
-          draggableCancel=".widget-content"
         >
           {widgets.map((widget) => {
             const isSelected = !locked && selectedWidget === widget.id;
             const currentLayout = layout.find(l => l.i === widget.id);
             const fallbackLayout = {
               i: widget.id,
-              x: widget.defaultPosition.x,
-              y: widget.defaultPosition.y,
-              w: widget.defaultSize.width,
-              h: widget.defaultSize.height,
-              minW: widget.minWidth || 3,
-              minH: widget.minHeight || 2,
+              ...layoutItemFromNormalized(
+                {
+                  x: widget.defaultPosition.x,
+                  y: widget.defaultPosition.y,
+                  w: widget.defaultSize.width,
+                  h: widget.defaultSize.height,
+                  minW: widget.minWidth || 3,
+                  minH: widget.minHeight || 2,
+                },
+                gridCols
+              ),
               static: locked,
             };
             const effectiveLayout = currentLayout || fallbackLayout;
@@ -510,11 +573,36 @@ const WidgetContainer = ({
             const canIncreaseLeft = currentLayout && currentLayout.x > 0;
             const canIncreaseTop = currentLayout && currentLayout.y > 0;
 
+            // One resize handle: a ➖/➕ box that dispatches a resize on pointer-down.
+            // `enabled` gates the affordance — grayed out and not-allowed when the
+            // widget can't resize further in that direction.
+            const renderResizeButton = ({ direction, decrement, enabled, symbol }) => (
+              <Box
+                className="resize-button"
+                onPointerDown={handleResizePointerDown(widget.id, direction, decrement)}
+                sx={{
+                  ...resizeButtonBaseStyle,
+                  cursor: enabled ? 'pointer' : 'not-allowed',
+                  opacity: enabled ? 1 : 0.3,
+                  '&:hover': {
+                    transform: enabled ? 'scale(1.2)' : 'none',
+                    filter: enabled
+                      ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))'
+                      : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
+                  },
+                  '&:active': {
+                    transform: enabled ? 'scale(1.1)' : 'none',
+                  },
+                }}
+              >
+                {symbol}
+              </Box>
+            );
+
             return (
               <Box
                 key={widget.id}
                 className={`widget-wrapper ${isSelected ? 'selected' : ''}`}
-                data-grid={{ ...effectiveLayout }}
                 onPointerDownCapture={(e) => {
                   if (!locked && !isSelected && !e.target.closest('.drag-handle') && !e.target.closest('.resize-button')) {
                     if (isInteractiveTarget(e.target)) {
@@ -596,42 +684,8 @@ const WidgetContainer = ({
                         pointerEvents: 'auto',
                       }}
                     >
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'top', true)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canDecreaseHeight ? 'pointer' : 'not-allowed',
-                          opacity: canDecreaseHeight ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canDecreaseHeight ? 'scale(1.2)' : 'none',
-                            filter: canDecreaseHeight ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canDecreaseHeight ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➖
-                      </Box>
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'top', false)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canIncreaseTop ? 'pointer' : 'not-allowed',
-                          opacity: canIncreaseTop ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canIncreaseTop ? 'scale(1.2)' : 'none',
-                            filter: canIncreaseTop ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canIncreaseTop ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➕
-                      </Box>
+                      {renderResizeButton({ direction: 'top', decrement: true, enabled: canDecreaseHeight, symbol: '➖' })}
+                      {renderResizeButton({ direction: 'top', decrement: false, enabled: canIncreaseTop, symbol: '➕' })}
                     </Box>
 
                     {/* Right Resize Buttons */}
@@ -648,42 +702,8 @@ const WidgetContainer = ({
                         pointerEvents: 'auto',
                       }}
                     >
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'right', true)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canDecreaseWidth ? 'pointer' : 'not-allowed',
-                          opacity: canDecreaseWidth ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canDecreaseWidth ? 'scale(1.2)' : 'none',
-                            filter: canDecreaseWidth ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canDecreaseWidth ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➖
-                      </Box>
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'right', false)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canIncreaseWidth ? 'pointer' : 'not-allowed',
-                          opacity: canIncreaseWidth ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canIncreaseWidth ? 'scale(1.2)' : 'none',
-                            filter: canIncreaseWidth ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canIncreaseWidth ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➕
-                      </Box>
+                      {renderResizeButton({ direction: 'right', decrement: true, enabled: canDecreaseWidth, symbol: '➖' })}
+                      {renderResizeButton({ direction: 'right', decrement: false, enabled: canIncreaseWidth, symbol: '➕' })}
                     </Box>
 
                     {/* Bottom Resize Buttons */}
@@ -699,41 +719,8 @@ const WidgetContainer = ({
                         pointerEvents: 'auto',
                       }}
                     >
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'bottom', true)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canDecreaseHeight ? 'pointer' : 'not-allowed',
-                          opacity: canDecreaseHeight ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canDecreaseHeight ? 'scale(1.2)' : 'none',
-                            filter: canDecreaseHeight ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canDecreaseHeight ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➖
-                      </Box>
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'bottom', false)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: 'pointer',
-                          '&:hover': {
-                            transform: 'scale(1.2)',
-                            filter: 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))',
-                          },
-                          '&:active': {
-                            transform: 'scale(1.1)',
-                          }
-                        }}
-                      >
-                        ➕
-                      </Box>
+                      {renderResizeButton({ direction: 'bottom', decrement: true, enabled: canDecreaseHeight, symbol: '➖' })}
+                      {renderResizeButton({ direction: 'bottom', decrement: false, enabled: true, symbol: '➕' })}
                     </Box>
 
                     {/* Left Resize Buttons */}
@@ -750,42 +737,8 @@ const WidgetContainer = ({
                         pointerEvents: 'auto',
                       }}
                     >
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'left', true)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canDecreaseWidth ? 'pointer' : 'not-allowed',
-                          opacity: canDecreaseWidth ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canDecreaseWidth ? 'scale(1.2)' : 'none',
-                            filter: canDecreaseWidth ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canDecreaseWidth ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➖
-                      </Box>
-                      <Box
-                        className="resize-button"
-                        onPointerDown={handleResizePointerDown(widget.id, 'left', false)}
-                        sx={{
-                          ...resizeButtonBaseStyle,
-                          cursor: canIncreaseLeft ? 'pointer' : 'not-allowed',
-                          opacity: canIncreaseLeft ? 1 : 0.3,
-                          '&:hover': {
-                            transform: canIncreaseLeft ? 'scale(1.2)' : 'none',
-                            filter: canIncreaseLeft ? 'drop-shadow(0 4px 8px rgba(0, 0, 0, 0.4))' : 'drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3))',
-                          },
-                          '&:active': {
-                            transform: canIncreaseLeft ? 'scale(1.1)' : 'none',
-                          }
-                        }}
-                      >
-                        ➕
-                      </Box>
+                      {renderResizeButton({ direction: 'left', decrement: true, enabled: canDecreaseWidth, symbol: '➖' })}
+                      {renderResizeButton({ direction: 'left', decrement: false, enabled: canIncreaseLeft, symbol: '➕' })}
                     </Box>
 
                     {/* Invisible Drag Handle - Covers entire widget when selected and unlocked */}
@@ -807,11 +760,13 @@ const WidgetContainer = ({
                   </>
                 )}
 
-                {/* Countdown Circle Indicator */}
+                {/* Countdown ring: the per-widget refresh scheduler. Paused
+                    (no ticking, no refreshes) while the screen is inactive;
+                    fires an immediate catch-up refresh on resume if overdue. */}
                 <CountdownCircle
-                  key={refreshKeys[widget.id] || 0}
                   refreshInterval={getWidgetRefreshInterval(widget.id)}
                   onRefresh={() => handleWidgetRefresh(widget.id)}
+                  isActive={isActive}
                 />
 
                 {/* Widget Content */}
@@ -826,10 +781,10 @@ const WidgetContainer = ({
                     flexDirection: 'column',
                   }}
                 >
-                  {React.cloneElement(widget.content, {
-                    key: refreshKeys[widget.id] || 0,
+                  {injectWidgetProps(widget.content, {
                     widgetId: widget.id,
                     refreshNonce: refreshKeys[widget.id] || 0,
+                    isActive,
                     activeTabId,
                     widgetSize: {
                       width: effectiveLayout.w,

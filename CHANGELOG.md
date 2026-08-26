@@ -1,3 +1,468 @@
+# HomeGlow v 1.7 Changelog
+
+## 🎉 Recent Updates
+
+The biggest release yet: a full plugin platform with its own API, storage, and
+event stream; a real spending mechanism for the clam economy (prize store,
+request queue, splitting, celebrations); a complete mobile experience;
+vacation mode; metrics-ready chore history; and a bank of built-in avatars.
+
+---
+
+## Security
+
+### Certificate verification is no longer disabled process-wide (#139)
+- The CORS proxy used to set `NODE_TLS_REJECT_UNAUTHORIZED=0` the first time it
+  saw any `https://` URL. That turned off certificate verification for the
+  **entire backend process** — including the Google OAuth token exchange, iCloud
+  CalDAV, and every calendar and photo fetch — and never turned it back on.
+- Verification is now decided per request from the target's address. Public
+  hosts are **always** verified.
+- **Self-hosted setups got better, not worse.** A LAN service with a self-signed
+  certificate — Immich, Home Assistant, a NAS serving an ICS feed — previously
+  worked only *after* something tripped that global switch, so it failed on a
+  fresh boot and started working later. Private addresses (RFC1918, loopback,
+  `.local`, `.lan`, `.internal`) now accept a self-signed certificate reliably,
+  and it's logged when they do.
+- Installs running entirely over plain HTTP, on a LAN or on localhost, are
+  unaffected — no TLS is involved in those requests at all.
+
+### Calendar and photo credentials no longer use a published key
+- Apple app-specific passwords, CalDAV passwords, Immich API keys, and photo
+  source passwords and refresh tokens were encrypted with a key **hardcoded in
+  this repository** unless you set `ENCRYPTION_KEY`. Because the stock
+  `docker-compose.yml` never passed that variable to the backend, setting it had
+  no effect — so in practice every install was using the published key, and
+  anyone with a copy of `tasks.db` could read those credentials.
+- They now use the same auto-generated AES-256-GCM key as the Google and Home
+  Assistant credentials. **Existing values are re-encrypted automatically on
+  first start after upgrading. No action is required.**
+- **You still don't need to configure an encryption key.** One is generated on
+  first start and kept at `data/.encryption-key` inside the mounted volume, so
+  it survives restarts and upgrades. Worth including `homeglow/data` in your
+  backups — losing it means re-entering stored credentials.
+- `ENCRYPTION_KEY` now actually works if you do want to supply your own, and is
+  written to the key file the first time it's seen, so removing it later no
+  longer strands your data.
+
+## New Features
+
+### Chore Icons (#141)
+- A chore can now carry an **emoji**, picked from a grouped bank (bedroom,
+  bathroom, cleaning, kitchen, living areas, pets, outdoors, school) when you
+  create or edit it. Especially useful for kids who aren't reading yet.
+- **It costs no space on the dashboard.** The icon takes the place of the
+  checkmark while the chore is pending and flips back to the usual undo arrow
+  once it's done — so the per-user column, which is only 180–250px wide, doesn't
+  give up any room for the chore title. Chores without an icon look exactly as
+  they do today.
+- Emoji rather than an icon font: it covers the whole requested set (toothbrush,
+  broom, rake, litter box, snow shovel…), renders in colour, and adds nothing to
+  the bundle. Two have no Unicode equivalent and use the nearest sensible stand-in
+  — a cyclone for the vacuum and a chair for the table.
+- The icon belongs to the chore, so every schedule of it shows the same picture,
+  and it appears beside the title in Admin Panel → Chores → Schedules.
+
+### Chore Completion Celebration (#140)
+- Finishing your **last chore of the day** now sets off confetti and a chime on
+  every display, not just the one it was tapped on.
+- The confetti **pops up from the bottom of the screen**, using the same popcorn
+  physics as the vacation screensaver. It's wordless and names nobody — the
+  panel turning green and the clam total already say who and what — and it draws
+  no backdrop, so the dashboard stays visible and usable while it plays.
+- It works even if the event stream doesn't reach a display. The screen that
+  completed the chore reacts to its own state rather than waiting for a server
+  push; the push is what lets *other* screens in the house join in.
+- Fires once per person per day, at the same moment the daily bonus is earned —
+  whether the last chore was completed, handed over by a parent, or snoozed out
+  of today. Undoing it and redoing it celebrates again, because the bonus is
+  genuinely re-earned.
+- **Toggle in Admin Panel → Chores → Settings**, on by default. Turning it off is
+  a display preference: plugins still receive the underlying event.
+- Respects `prefers-reduced-motion` — the message stays, the flying pieces don't.
+- Plugin authors get a new catalog event, `chore.allCompleted`
+  (`{ userId, username, date, reward }`).
+
+### Home Assistant as a Weather Source (#57)
+- **Home Assistant can now supply the weather**, so households already running it
+  no longer need an OpenWeatherMap API key. Pick the source in Admin Panel →
+  Connections, point HomeGlow at your instance, and choose a `weather.*` entity
+  (Test Connection populates a picker).
+- **Weather is now fetched server-side.** Credentials never reach a browser, and
+  one upstream call is cached for the whole house instead of every tab on every
+  display fetching its own — noticeably kinder to the OpenWeatherMap free tier.
+- **Secrets are redacted from the settings API.** `GET /api/settings` is
+  unauthenticated and previously handed out the OpenWeatherMap key (and Google's
+  stored client secret) to every browser and plugin iframe. Those are now
+  filtered server-side and edited write-only; saving a form with the field left
+  blank keeps the stored value rather than wiping it.
+- **Auto dark mode no longer needs a weather provider.** Sunrise and sunset are
+  computed from your coordinates, so the theme switches on schedule with Home
+  Assistant, with OpenWeatherMap, or with nothing configured at all. Polar day
+  and night are handled.
+- Where Home Assistant carries less than OpenWeatherMap the widget hides those
+  sections rather than showing blanks — air quality above all, which Home
+  Assistant has no equivalent for. The
+  [feature reference](docs/reference/features.md#weather) documents exactly what
+  each source provides.
+
+### Fixed along the way
+- **Forecast day names and chart times now follow the display language.** They
+  were hardcoded to US English, so a Spanish dashboard still read "Wed / Thu /
+  Fri". Several weather strings the translation pass had missed ("Feels like",
+  "3-Day Forecast", "Humidity", "Wind") are translated too.
+- **Wind speed is labelled correctly in metric.** It read "mph" regardless of the
+  selected unit, while the underlying value was in m/s.
+
+### Plugin Platform (#105)
+- Custom widgets grow into **manifest-based plugins**: an embedded manifest
+  declares an id, settings, and event subscriptions while plain HTML widgets
+  keep working unchanged.
+- New **Plugin API v1** (`/api/plugin/v1`): namespaced **persistent storage**
+  (survives app upgrades — plugins now live in the database, not on disk),
+  **declared settings** (household- or device-scoped, validated against the
+  manifest), and a **live event stream** (SSE) covering clams, chores, and
+  prizes.
+- **Server-side reactions**: a plugin can declare clam side-effects (e.g. a
+  savings siphon) that run even when its widget isn't on screen.
+- A tiny **plugin SDK** (`/plugin-sdk/v1.js`), a new
+  [Plugin Development guide](docs/guides/plugin-development.md) with a curated
+  API reference, and demo-mode support so plugins can be tried on the demo.
+- The **Chore Metrics** plugin (issue #72) is the first enhanced-plugin
+  showcase — stat tiles, streaks, activity heatmap, top chores, and
+  earned-vs-spent, published via
+  [HomeGlowPlugins](https://github.com/jherforth/HomeGlowPlugins).
+
+### The Prize Store: a real spending mechanism
+- `Prize Management` definitions can now be **stocked into a store** kids
+  browse right on the dashboard (🛍️ button on the chore widget).
+- **Request queue**: a kid requests a prize; a parent approves or declines on
+  the spot (PIN-gated when a PIN is set). Approval deducts clams as a named
+  ledger entry and fires a **full-screen confetti celebration + chime** on
+  every display.
+- **Repeatable prizes** (🔁 toggle): approval returns the offer to the shelf
+  instead of consuming it — perfect for "movie night".
+- **Cost splitting**: kids sharing a prize each pay an even
+  `floor(cost / N)` share (the odd clam is silently discounted) and the
+  celebration names everyone.
+- **Avatar quick-spend**: tap a kid's profile picture to record off-store
+  spending with an optional note — now with a **touch-friendly number pad**.
+- Spending is **non-destructive**: reducing clams writes a negative `spent`
+  ledger row instead of deleting earned history, so metrics never shrink.
+
+### Full Mobile Experience (#118)
+- The dashboard becomes a **single-column, touch-first layout** on phones:
+  stacked widgets, mobile-friendly admin tables, no drag grid, and no
+  screensaver (phones lock themselves).
+
+### Vacation Mode (#121)
+- A per-display toggle that mutes chore chimes and swaps the screensaver for a
+  playful vacation animation, with a subtle 🏖️ badge while active.
+- **Optional date range** with automatic activation and expiry.
+- **Metrics-aware**: while active, the nightly job skips missed-chore logging
+  and the Chore Metrics plugin bridges streaks across vacation days.
+
+### Metrics-Ready Chore History (#72)
+- Every history row now carries a **kind** (completion, daily bonus, transfer
+  bonus, adjustment, missed, spent), the nightly job **logs missed chores**,
+  and a long-standing bonus-revoke bug tied to reward-setting changes is
+  fixed.
+
+### Default Avatar Bank (#132)
+- Pick a profile picture from **29 built-in flat avatars** instead of
+  uploading: mom, dad, girl, and boy in **five skin tones each**, plus cat,
+  dog, fish, alpaca, chicken, dino, robot, unicorn, and frog.
+- Choose from the Admin Panel's user rows or the add-user form; the demo
+  family wears them out of the box.
+
+### Calendar Improvements
+- **Cross-calendar dedupe pie dot** (#125): an event synced from several
+  calendars shows a pie-colored bullet naming each source.
+- **Start calendar with current week** (#127): the month view can anchor to
+  the current week and show a configurable 1–8 weeks.
+- **Big performance fix** (#130): the calendar widget now always requests a
+  date range, so the server no longer serializes its entire multi-year cache
+  on every load.
+
+---
+
+## Fixes & Community Contributions
+- Grid layout configuration corrected (#128).
+- Vacation screensaver composition stops promptly when dismissed (#129).
+- Color picker no longer clipped inside widget cells (#131).
+- Calendar events endpoint stall fixed (#130).
+
+---
+
+## Summary
+A platform release: plugins become first-class citizens with storage,
+settings, events, and reactions; the clam economy gets a real store with
+requests, splitting, and celebrations; and the whole app works beautifully on
+phones — plus vacation mode, richer metrics, calendar polish, and built-in
+avatars.
+
+---
+
+## 📝 Notes
+
+For questions or issues, please visit our [GitHub Issues](https://github.com/jherforth/HomeGlow/issues) page.
+
+---
+
+# HomeGlow v 1.6.2 Changelog
+
+## 🎉 Recent Updates
+
+A chores-focused release: reassigning and snoozing chores moves to a long-press
+context menu right on the dashboard card, with new admin controls to gate that
+per chore. Demo mode also grows a weather widget and real multi-calendar sync.
+
+---
+
+## New Features
+
+### Chore Long-Press Menu: Transfer & Snooze (#122)
+- The dashboard reassign button is replaced by a **long-press (or right-click)
+  context menu** on each chore card, freeing up space on the card itself and
+  matching how the swap felt clunky before.
+- **Transfer** a chore to someone else, choosing whether the mover keeps credit
+  for today (a "transfer bonus" that pays out when the new assignee completes
+  it) or the chore simply moves with no bonus.
+- **Snooze** a chore for a day or a week — snoozed chores are hidden from the
+  dashboard and excluded from the daily-completion bonus until they resurface.
+- New **Chore Settings** sub-tab in the Admin Panel (alongside Chores and
+  History) holds the reward configuration, plus new **Transferable** and
+  **Can snooze** toggles on each schedule so specific chores can opt out of
+  dashboard reassignment or snoozing entirely — useful behind a PIN-gated
+  admin panel.
+- Fixed the due-time sound label overlapping its "(none)" placeholder text.
+
+### Demo Mode: Weather Widget & Live Multi-Calendar Sync
+- The demo now seeds a **weather widget** with a static real-conditions
+  snapshot of Chili, NY (current temp, 3-day outlook, hourly chart, air
+  quality) served from `GET /api/demo/weather`, since the demo has no
+  OpenWeatherMap API key.
+- Calendar sync now runs for real in demo mode against **four curated public
+  feeds** — US Federal Holidays, the Arizona Diamondbacks schedule, and two
+  overlapping Town of Chili feeds — giving visitors a live look at
+  cross-calendar event deduplication. Visitor-supplied calendar URLs remain
+  blocked entirely (SSRF guard); only the seeded feeds are ever fetched.
+- See the updated [Demo Mode guide](docs/guides/demo-mode.md) for the full
+  breakdown of what's seeded and how sync behaves.
+
+---
+
+## Summary
+A chore-workflow rework (long-press transfer/snooze menu, per-chore admin
+gates) plus a richer, more alive demo mode (live weather and multi-calendar
+sync).
+
+---
+
+## 📝 Notes
+
+For questions or issues, please visit our [GitHub Issues](https://github.com/jherforth/HomeGlow/issues) page.
+
+---
+
+# HomeGlow v 1.6.1 Changelog
+
+## 🎉 Recent Updates
+
+A small follow-up to v1.6 that polishes calendar deduplication and rounds out the
+demo experience with proper documentation and a richer sample set.
+
+## New Features
+
+### Calendar Deduplication On by Default (#123)
+Merging the same event across multiple calendars is now **enabled by default** —
+the feature proved reliable in v1.6, so new and existing installs get cleaner
+calendars out of the box. You can still turn it off anytime in the calendar
+widget settings; anyone who had explicitly disabled it keeps their choice.
+
+### Demo Mode Documentation & Richer Sample Data (#124)
+- A dedicated [Demo Mode guide](docs/guides/demo-mode.md) (plus a wiki page)
+  explains what demo mode does, what it seeds, and how to run your own.
+- The demo sample set is more robust: a third family member and a wider mix of
+  chores — including everyday routines with **no clam value** (make your bed,
+  brush teeth) alongside the reward chores — to show that clams are optional
+  per chore.
+
+---
+
+## Summary
+A polish release: calendar dedup defaults on, and demo mode is now documented and
+seeded with a more illustrative sample household.
+
+---
+
+## 📝 Notes
+
+For questions or issues, please visit our [GitHub Issues](https://github.com/jherforth/HomeGlow/issues) page.
+
+---
+
+# HomeGlow v 1.6 Changelog
+
+## 🎉 Recent Updates
+
+This release focuses on reliability and data efficiency: widgets now refresh on a predictable timestamp-based schedule instead of stacking multiple uncoordinated timers, and pause entirely when nobody can see them. It also brings Apple iCloud calendar support, a richer chores/due-date system, and a demo mode for trying HomeGlow without committing real data.
+
+---
+
+## New Features
+
+### Data Churn Reduction & Refresh Consolidation (#75)
+Widgets previously ran their own `setInterval` refresh timer *and* were force-remounted by the countdown ring on the same cadence — meaning every visible widget refetched twice as often as configured, tearing down UI state (open dialogs, scroll position) each time. Refresh is now driven by a single timestamp-based scheduler per widget that refetches in place. Widgets also pause entirely — no ticking, no fetches — while the tab is backgrounded or the photos-mode screensaver is covering the dashboard, and catch up with exactly one refresh when the screen becomes active again. The scheduler is also built to accept future "is anyone watching" signals, such as a Home Assistant presence sensor (#57).
+
+### Calendar Event Deduping (#74)
+Events that appear on multiple synced calendars (e.g. shared/subscribed calendars) are now deduplicated instead of showing duplicate entries.
+
+### Apple iCloud Calendar Integration
+Added CalDAV support for Apple iCloud calendars, including proper XML/CDATA parsing (fixing crashes on certain calendar feeds) and support for shared/subscribed iCloud calendars that were previously dropped from the listing.
+
+### Chore Due Dates & Sound Chimes (#108)
+Chore due-date and chore-schedule tracking were consolidated into a single table, enabling due-time offsets for recurring chores and an optional sound chime that rings when a chore becomes due. Includes a new modal for editing clam values directly (#111) and chore swap improvements.
+
+### Configurable Photo Widget Sizing
+The Photos widget now supports an "Auto (fit widget)" sizing mode, set as the new default, alongside the existing fixed-size options.
+
+### Demo Mode
+A new opt-in `DEMO_MODE` flag seeds each new device with sample chores and calendar data automatically, and resets on a timer — useful for public demos and trying HomeGlow before committing real data.
+
+### In-App Version Display (#94)
+The admin panel now shows the running frontend/backend version, sourced from the Docker build metadata.
+
+### Docker & Platform Improvements
+- **arm64 frontend support** (#104): the frontend image now builds for `linux/arm64` alongside `linux/amd64`, matching the backend.
+- Image build optimization and dependency hardening in response to `npm audit` findings (#62).
+- Proxmox helper script support and documentation for running HomeGlow outside Docker.
+
+### Mobile-Friendly Admin Panel — Phase 1 (#99)
+Groundwork and phase-1 implementation for a mobile-responsive admin panel, gated behind device detection. Phase 2 (mobile-friendly main dashboard) is planned as a follow-up.
+
+## 🐛 Bug Fixes
+
+- Immich v3 compatibility: album assets are now fetched via the search/metadata endpoint.
+- Widget resize consolidated into a single function with an existence check, preventing errors when resizing a widget that's no longer present in the DOM.
+- Various dedup/refactor passes (AdminPanel page routing, Google API fetch helpers, `normalizeWidgetSettings`, calendar multi-day-span detection, prizes endpoint handlers) reducing duplicated logic without changing behavior.
+
+## 📄 Licensing
+
+HomeGlow's license changed from MIT to AGPL v3.0.
+
+---
+
+## Summary
+This release trades ad hoc, overlapping refresh timers for a single predictable scheduler that respects screen activity, adds Apple iCloud calendar support and a more capable chores/due-date system, and rounds out platform support with arm64 images and a demo mode.
+
+---
+
+## 📝 Notes
+
+For questions or issues, please visit our [GitHub Issues](https://github.com/jherforth/HomeGlow/issues) page.
+
+---
+
+# HomeGlow v 1.5 Changelog
+
+## 🎉 Recent Updates
+
+This release reworks tab navigation around a new dock-style UI, adds two-way Google Calendar sync and Google/HomeGlow Photos integration, and introduces the project's first automated test suite.
+
+---
+
+## New Features
+
+### New Dock-Style TabBar
+Replaced the previous tab bar with a dock-style UI, and made tabs the default navigation model for organizing widgets (#79), including a device widget settings rework (#98) to support per-tab configuration cleanly.
+
+### Calendar Improvements
+- **2-Week View** (#90) and a **default calendar view setting** (#96) — choose month, week, or 2-week as your starting view.
+- **Non-US location support in the weather widget** (#80) via geocoding, instead of requiring a US ZIP code.
+
+### Day/Night Auto Theme Mode (#60)
+The interface can automatically switch between light and dark themes based on time of day / location.
+
+### Google Calendar 2-Way Sync
+Events created or edited in HomeGlow can now sync back to Google Calendar, not just pull from it.
+
+### Google Photos & HomeGlow Photos
+Added Google Photos Picker integration for the Photos widget, plus a dedicated HomeGlow Photos upload page for hosting your own images without a third-party service.
+
+### Chore Scheduling: "Once Completed" (#82)
+Chores can now be scheduled to recur only after they've been marked completed, rather than strictly on a calendar cadence.
+
+### First Automated Test Suite (#93)
+Added the project's first tests, plus lazy-loaded widget bundles and package upgrades to improve initial load performance.
+
+## 🐛 Bug Fixes
+
+- Calendar feeds that previously crashed the widget on certain `.ics` files now parse correctly (#92).
+- Weather widget no longer bleeds cached data across inactive tabs.
+- Settings values now serialize to JSON correctly instead of silently corrupting on save.
+- Grid layout no longer renders offset to the right on load (#88).
+- Plugin widgets can be moved and resized again (#89).
+- Newly created users now immediately appear as assignable when adding a chore (#85).
+- Calendar text color no longer becomes unreadable against light custom backgrounds (#91).
+- Input forms now save correctly when submitted via Enter.
+
+---
+
+## Summary
+This release centers on navigation (dock-style tabs, tabs-by-default) and calendar/photo integrations (Google 2-way sync, Google Photos, HomeGlow Photos), backed by the project's first test suite.
+
+---
+
+## 📝 Notes
+
+For questions or issues, please visit our [GitHub Issues](https://github.com/jherforth/HomeGlow/issues) page.
+
+---
+
+# HomeGlow v 1.4 Changelog
+
+## 🎉 Recent Updates
+
+This release overhauls tab and device management — tabs can now be created and managed dynamically, with widget layouts and settings persisted per device — alongside weather widget improvements and a new calendar view.
+
+---
+
+## New Features
+
+### Dynamic Tab & Device Management
+Tabs can now be created, renamed, and managed directly from the UI, with widget assignments and layouts saved per tab. Device-scoped settings replace the previous single-device model, backed by new database migrations for a smoother upgrade path.
+
+### Calendar View (#73)
+Added a dedicated calendar month/week view for browsing events beyond the widget's compact display.
+
+### Weather Widget Settings (#76, #77)
+Added a Celsius/Fahrenheit toggle and dedicated weather widget settings panel.
+
+### Get Settings by Key (#37)
+New API endpoint for fetching individual settings by key, used throughout the admin panel.
+
+## 🐛 Bug Fixes
+
+- Widget drag/resize controls no longer get stuck ("fail to release properly").
+- Widgets now correctly use local (in-memory) settings when switching tabs instead of re-fetching stale data.
+- Widget positions now save against the correct tab ID instead of leaking across tabs.
+- Fixed a bug where completing a bonus chore could also mark an unrelated regular chore complete (#53).
+- Docker CI workflow reliability fixes for image builds.
+
+---
+
+## Summary
+This release focused on making tabs and devices first-class, dynamically managed concepts, while polishing the weather widget and calendar with a dedicated view and unit toggle.
+
+---
+
+## 📝 Notes
+
+For questions or issues, please visit our [GitHub Issues](https://github.com/jherforth/HomeGlow/issues) page.
+
+---
+
 # HomeGlow v 1.3 Changelog
 
 ## 🎉 Recent Updates
