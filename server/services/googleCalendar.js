@@ -3,12 +3,12 @@ const googleConnection = require('./googleConnection');
 const API_BASE = 'https://www.googleapis.com/calendar/v3';
 const googleFetch = googleConnection.createGoogleFetch(API_BASE, 'Google Calendar API');
 
-async function listCalendars(db, accountId) {
+async function listCalendars(accountId) {
     const items = [];
     let pageToken;
     do {
         const qs = pageToken ? `?pageToken=${encodeURIComponent(pageToken)}` : '';
-        const data = await googleFetch(db, accountId, 'GET', `/users/me/calendarList${qs}`);
+        const data = await googleFetch(accountId, 'GET', `/users/me/calendarList${qs}`);
         if (data && Array.isArray(data.items)) items.push(...data.items);
         pageToken = data && data.nextPageToken;
     } while (pageToken);
@@ -33,7 +33,7 @@ const eventColorCache = new Map();
 // Maps Google's per-event colorId ('1'...'11') to its background hex. Returns
 // an empty map if the palette can't be fetched, which leaves events falling
 // back to their calendar's color rather than showing a wrong one.
-async function listEventColors(db, accountId) {
+async function listEventColors(accountId) {
     const cached = eventColorCache.get(accountId);
     if (cached && Date.now() - cached.fetchedAt < EVENT_COLOR_CACHE_TTL_MS) {
         return cached.colors;
@@ -41,7 +41,7 @@ async function listEventColors(db, accountId) {
 
     try {
         const colors = {};
-        const data = await googleFetch(db, accountId, 'GET', '/colors');
+        const data = await googleFetch(accountId, 'GET', '/colors');
         if (data && data.event) {
             for (const [colorId, value] of Object.entries(data.event)) {
                 if (value && value.background) colors[colorId] = value.background;
@@ -71,7 +71,7 @@ function parseEventDate(dt) {
     return null;
 }
 
-async function listEvents(db, accountId, calendarId, { timeMin, timeMax } = {}) {
+async function listEvents(accountId, calendarId, { timeMin, timeMax } = {}) {
     const out = [];
     let pageToken;
     const base = `/calendars/${encodeURIComponent(calendarId)}/events`;
@@ -84,7 +84,7 @@ async function listEvents(db, accountId, calendarId, { timeMin, timeMax } = {}) 
         if (timeMin) params.set('timeMin', new Date(timeMin).toISOString());
         if (timeMax) params.set('timeMax', new Date(timeMax).toISOString());
         if (pageToken) params.set('pageToken', pageToken);
-        const data = await googleFetch(db, accountId, 'GET', `${base}?${params.toString()}`);
+        const data = await googleFetch(accountId, 'GET', `${base}?${params.toString()}`);
         if (data && Array.isArray(data.items)) out.push(...data.items);
         pageToken = data && data.nextPageToken;
     } while (pageToken);
@@ -111,15 +111,14 @@ function eventToBody({ title, description, location, start, end, allDay, timeZon
     return body;
 }
 
-async function createEvent(db, accountId, calendarId, event) {
+async function createEvent(accountId, calendarId, event) {
     const body = eventToBody(event);
-    return await googleFetch(db, accountId, 'POST', `/calendars/${encodeURIComponent(calendarId)}/events`, body);
+    return await googleFetch(accountId, 'POST', `/calendars/${encodeURIComponent(calendarId)}/events`, body);
 }
 
-async function updateEvent(db, accountId, calendarId, eventId, event) {
+async function updateEvent(accountId, calendarId, eventId, event) {
     const body = eventToBody(event);
     return await googleFetch(
-        db,
         accountId,
         'PATCH',
         `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
@@ -127,9 +126,8 @@ async function updateEvent(db, accountId, calendarId, eventId, event) {
     );
 }
 
-async function deleteEvent(db, accountId, calendarId, eventId) {
+async function deleteEvent(accountId, calendarId, eventId) {
     return await googleFetch(
-        db,
         accountId,
         'DELETE',
         `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,

@@ -5,14 +5,33 @@
 // Assistant over real HTTP — no live OpenWeatherMap or Home Assistant instance
 // is involved, so the suite runs offline and in CI.
 const test = require('node:test');
+const { describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const http = require('node:http');
+const path = require('node:path');
+
+const tmpDir = path.resolve(__dirname, '.tmp');
+const stamp = `${process.pid}-${Date.now()}`;
+fs.mkdirSync(tmpDir, { recursive: true });
+
+// Provider status reports whether encryption is configured, and the Home
+// Assistant connection encrypts its token for real. Pin the key and the key file
+// (resolved at require time) into the temp directory so a run never writes into
+// server/data/.
+process.env.ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
+process.env.ENCRYPTION_KEY_FILE = path.join(tmpDir, `weather-providers-${stamp}.key`);
 
 const payload = require('../services/weather/payload');
 const demoProvider = require('../services/weather/demo');
 const owm = require('../services/weather/openweathermap');
 const haProvider = require('../services/weather/homeassistant');
 const { computeSunTimes, isDaytime } = require('../services/weather/sun');
+const weatherService = require('../services/weather');
+const homeAssistant = require('../services/homeAssistant');
+const { Model } = require('objection');
+const { createKnex } = require('../db/knex');
+const { Setting } = require('../db/models');
 
 // --- the contract ----------------------------------------------------------
 
@@ -199,9 +218,10 @@ test('the Home Assistant adapter maps an entity plus forecast service response',
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const port = server.address().port;
 
-    // A minimal stand-in for services/homeAssistant, pointed at the stub.
+    // A minimal stand-in for services/homeAssistant, pointed at the stub. The
+    // transport takes no `db` handle any more.
     const stubHomeAssistant = {
-        async homeAssistantFetch(_db, method, apiPath, body) {
+        async homeAssistantFetch(method, apiPath, body) {
             const res = await fetch(`http://127.0.0.1:${port}${apiPath}`, {
                 method,
                 headers: { 'Content-Type': 'application/json' },
@@ -209,14 +229,13 @@ test('the Home Assistant adapter maps an entity plus forecast service response',
             });
             return await res.json();
         },
-        async getState(db, entityId) {
-            return await this.homeAssistantFetch(db, 'GET', `/api/states/${entityId}`);
+        async getState(entityId) {
+            return await this.homeAssistantFetch('GET', `/api/states/${entityId}`);
         },
     };
 
     try {
         const result = await haProvider.fetchWeather({
-            db: {},
             homeAssistant: stubHomeAssistant,
             entityId: 'weather.home',
             coordinates: { lat: 43.08, lon: -77.75 },
@@ -258,7 +277,7 @@ test('the Home Assistant adapter maps an entity plus forecast service response',
 test('a Home Assistant without the forecast service falls back to the legacy attribute', async () => {
     // Pre-2024 instances 400 on get_forecasts but carry forecast in attributes.
     const legacyHomeAssistant = {
-        async homeAssistantFetch(_db, method, apiPath) {
+        async homeAssistantFetch(method, apiPath) {
             if (apiPath.includes('get_forecasts')) {
                 const err = new Error('Service not found.');
                 err.status = 400;
@@ -270,7 +289,6 @@ test('a Home Assistant without the forecast service falls back to the legacy att
 
     const forecast = await haProvider.fetchForecast(
         legacyHomeAssistant,
-        {},
         'weather.home',
         'daily',
         { forecast: [{ datetime: '2026-07-08T00:00:00+00:00', condition: 'sunny', temperature: 25, templow: 15 }] },
@@ -285,7 +303,6 @@ test('a missing entity is a 404, not a crash', async () => {
 
     await assert.rejects(
         () => haProvider.fetchWeather({
-            db: {},
             homeAssistant: emptyHomeAssistant,
             entityId: 'weather.nope',
             coordinates: { lat: 0, lon: 0 },
@@ -334,4 +351,172 @@ test('polar day and night resolve instead of returning nonsense', () => {
     const polarNight = computeSunTimes(69.6492, 18.9553, new Date('2026-12-21T12:00:00Z'));
     assert.equal(polarNight.alwaysDown, true);
     assert.equal(isDaytime(69.6492, 18.9553, new Date('2026-12-21T12:00:00Z')), false);
+});
+
+
+// --- provider selection and status -----------------------------------------
+//
+// The selection layer reads its settings through Objection, so these run against
+// a real temp SQLite database rather than a stubbed `db` handle.
+
+describe('provider selection and status', () => {
+    const dbFile = path.join(tmpDir, `weather-providers-${stamp}.db`);
+    let knex;
+    let fakeHomeAssistant;
+    let fakeHomeAssistantUrl;
+
+    const HA_TOKEN = 'stub-long-lived-token';
+
+    before(async () => {
+        knex = createKnex({ engine: 'sqlite', filename: dbFile });
+        Model.knex(knex);
+        await knex.schema.createTable('settings', (t) => {
+            t.text('key').primary();
+            t.text('value');
+        });
+
+        // Enough of a Home Assistant to serve one weather entity end to end.
+        fakeHomeAssistant = http.createServer((req, res) => {
+            res.setHeader('Content-Type', 'application/json');
+            if (req.headers.authorization !== `Bearer ${HA_TOKEN}`) {
+                res.statusCode = 401;
+                return res.end(JSON.stringify({ message: 'Unauthorized' }));
+            }
+            if (req.url.startsWith('/api/states/weather.home')) {
+                return res.end(JSON.stringify({
+                    entity_id: 'weather.home',
+                    state: 'sunny',
+                    attributes: {
+                        friendly_name: 'Home',
+                        temperature: 20,
+                        temperature_unit: '°C',
+                        humidity: 50,
+                        wind_speed: 36,
+                        wind_speed_unit: 'km/h',
+                    },
+                }));
+            }
+            if (req.url.startsWith('/api/services/weather/get_forecasts')) {
+                let body = '';
+                req.on('data', (chunk) => { body += chunk; });
+                return req.on('end', () => {
+                    const { type } = JSON.parse(body);
+                    const forecast = type === 'daily'
+                        ? [{ datetime: '2026-07-08T00:00:00+00:00', condition: 'sunny', temperature: 25, templow: 15, precipitation: 0 }]
+                        : [{ datetime: '2026-07-08T00:00:00+00:00', condition: 'sunny', temperature: 18, precipitation: 0 }];
+                    res.end(JSON.stringify({ changed_states: [], service_response: { 'weather.home': { forecast } } }));
+                });
+            }
+            res.statusCode = 404;
+            res.end(JSON.stringify({ message: 'not found' }));
+        });
+        await new Promise((resolve) => fakeHomeAssistant.listen(0, '127.0.0.1', resolve));
+        fakeHomeAssistantUrl = `http://127.0.0.1:${fakeHomeAssistant.address().port}`;
+    });
+
+    after(async () => {
+        if (fakeHomeAssistant) await new Promise((resolve) => fakeHomeAssistant.close(resolve));
+        if (knex) await knex.destroy();
+        for (const suffix of ['', '-wal', '-shm']) {
+            try { fs.rmSync(`${dbFile}${suffix}`, { force: true }); } catch (_) { /* ignore */ }
+        }
+        try { fs.rmSync(process.env.ENCRYPTION_KEY_FILE, { force: true }); } catch (_) { /* ignore */ }
+    });
+
+    beforeEach(async () => {
+        await Setting.query().delete();
+        weatherService.clearCache();
+    });
+
+    const setSetting = (key, value) => Setting.query().insert({ key, value }).onConflict('key').merge();
+
+    test('OpenWeatherMap is the provider until a valid one is stored', async () => {
+        assert.equal(await weatherService.getConfiguredProvider(), weatherService.DEFAULT_PROVIDER);
+
+        await setSetting(weatherService.PROVIDER_SETTING_KEY, 'homeassistant');
+        assert.equal(await weatherService.getConfiguredProvider(), weatherService.PROVIDERS.HOMEASSISTANT);
+
+        // Anything unrecognized falls back rather than being trusted.
+        await setSetting(weatherService.PROVIDER_SETTING_KEY, 'accuweather');
+        assert.equal(await weatherService.getConfiguredProvider(), weatherService.DEFAULT_PROVIDER);
+    });
+
+    test('status says what is missing for OpenWeatherMap', async () => {
+        const missing = await weatherService.getProviderStatus();
+        assert.equal(missing.provider, 'openweathermap');
+        assert.equal(missing.configured, false);
+        assert.match(missing.reason, /No OpenWeatherMap API key/);
+
+        await setSetting('WEATHER_API_KEY', 'owm-secret-key-abc123');
+        const present = await weatherService.getProviderStatus();
+        assert.equal(present.configured, true);
+        assert.equal(present.reason, null);
+    });
+
+    test('status says what is missing for Home Assistant', async () => {
+        await setSetting(weatherService.PROVIDER_SETTING_KEY, 'homeassistant');
+
+        const cleared = await weatherService.getProviderStatus();
+        assert.equal(cleared.provider, 'homeassistant');
+        assert.equal(cleared.configured, false);
+        assert.match(cleared.reason, /Home Assistant/);
+
+        await homeAssistant.saveConfig({ url: fakeHomeAssistantUrl, token: HA_TOKEN });
+        const configured = await weatherService.getProviderStatus();
+        assert.equal(configured.provider, 'homeassistant');
+        assert.equal(configured.configured, true);
+        assert.equal(configured.reason, null);
+    });
+
+    test('status reports the stored provider separately from the effective one', async () => {
+        // The Admin Panel's Weather Source selector binds to configured_provider.
+        // In demo mode the *effective* provider is "demo", which is not one of the
+        // selector's options — binding to it leaves the control blank, which is
+        // exactly what happened before this field existed.
+        await setSetting(weatherService.PROVIDER_SETTING_KEY, 'homeassistant');
+
+        const demo = await weatherService.getProviderStatus({ demoMode: true });
+        assert.equal(demo.provider, 'demo');
+        assert.equal(demo.configured_provider, 'homeassistant');
+        assert.equal(demo.configured, true);
+        assert.ok(
+            ['openweathermap', 'homeassistant'].includes(demo.configured_provider),
+            'configured_provider must always be a selectable option',
+        );
+
+        await setSetting(weatherService.PROVIDER_SETTING_KEY, 'openweathermap');
+        const back = await weatherService.getProviderStatus({ demoMode: true });
+        assert.equal(back.configured_provider, 'openweathermap');
+    });
+
+    test('getWeather serves the demo snapshot and caches it', async () => {
+        const first = await weatherService.getWeather({ demoMode: true, units: 'metric' });
+        assert.deepEqual(payload.validatePayload(first), []);
+        assert.equal(first.provider, 'demo');
+
+        const cached = await weatherService.getWeather({ demoMode: true, units: 'metric' });
+        assert.equal(cached, first, 'a second request re-fetched instead of serving the cache');
+
+        const refreshed = await weatherService.getWeather({ demoMode: true, units: 'metric', forceRefresh: true });
+        assert.notEqual(refreshed, first, 'forceRefresh served the cached payload');
+        assert.deepEqual(payload.validatePayload(refreshed), []);
+    });
+
+    test('getWeather routes through the stored Home Assistant connection', async () => {
+        await setSetting(weatherService.PROVIDER_SETTING_KEY, 'homeassistant');
+        await homeAssistant.saveConfig({
+            url: fakeHomeAssistantUrl,
+            token: HA_TOKEN,
+            weatherEntity: 'weather.home',
+        });
+
+        const result = await weatherService.getWeather({ lat: 43.08, lon: -77.75, units: 'imperial' });
+
+        assert.deepEqual(payload.validatePayload(result), []);
+        assert.equal(result.provider, 'homeassistant');
+        assert.equal(result.resolvedName, 'Home');
+        // 20°C -> 68°F through the real connection, token and all.
+        assert.equal(Math.round(result.current.temp), 68);
+        assert.equal(result.coordinates.lat, 43.08);
+    });
 });

@@ -3,13 +3,13 @@ const googleConnection = require('./googleConnection');
 const API_BASE = 'https://photoslibrary.googleapis.com/v1';
 const googleFetch = googleConnection.createGoogleFetch(API_BASE, 'Google Photos API');
 
-async function listAlbumsFrom(db, accountId, endpoint, collection) {
+async function listAlbumsFrom(accountId, endpoint, collection) {
     const out = [];
     let pageToken;
     do {
         const params = new URLSearchParams({ pageSize: '50' });
         if (pageToken) params.set('pageToken', pageToken);
-        const data = await googleFetch(db, accountId, 'GET', `/${endpoint}?${params.toString()}`);
+        const data = await googleFetch(accountId, 'GET', `/${endpoint}?${params.toString()}`);
         const items = Array.isArray(data[collection]) ? data[collection] : [];
         for (const a of items) {
             out.push({
@@ -25,10 +25,10 @@ async function listAlbumsFrom(db, accountId, endpoint, collection) {
     return out;
 }
 
-async function listAlbums(db, accountId) {
+async function listAlbums(accountId) {
     const [owned, shared] = await Promise.all([
-        listAlbumsFrom(db, accountId, 'albums', 'albums').catch(() => []),
-        listAlbumsFrom(db, accountId, 'sharedAlbums', 'sharedAlbums').catch(() => []),
+        listAlbumsFrom(accountId, 'albums', 'albums').catch(() => []),
+        listAlbumsFrom(accountId, 'sharedAlbums', 'sharedAlbums').catch(() => []),
     ]);
     const seen = new Set();
     const merged = [];
@@ -41,13 +41,13 @@ async function listAlbums(db, accountId) {
     return merged;
 }
 
-async function searchAlbumMedia(db, accountId, albumId, { limit = 200 } = {}) {
+async function searchAlbumMedia(accountId, albumId, { limit = 200 } = {}) {
     const out = [];
     let pageToken;
     while (out.length < limit) {
         const body = { albumId, pageSize: 100 };
         if (pageToken) body.pageToken = pageToken;
-        const data = await googleFetch(db, accountId, 'POST', '/mediaItems:search', body);
+        const data = await googleFetch(accountId, 'POST', '/mediaItems:search', body);
         const items = Array.isArray(data.mediaItems) ? data.mediaItems : [];
         out.push(...items);
         pageToken = data.nextPageToken;
@@ -56,13 +56,13 @@ async function searchAlbumMedia(db, accountId, albumId, { limit = 200 } = {}) {
     return out.slice(0, limit);
 }
 
-async function listRecentMedia(db, accountId, { limit = 200 } = {}) {
+async function listRecentMedia(accountId, { limit = 200 } = {}) {
     const out = [];
     let pageToken;
     while (out.length < limit) {
         const params = new URLSearchParams({ pageSize: '100' });
         if (pageToken) params.set('pageToken', pageToken);
-        const data = await googleFetch(db, accountId, 'GET', `/mediaItems?${params.toString()}`);
+        const data = await googleFetch(accountId, 'GET', `/mediaItems?${params.toString()}`);
         const items = Array.isArray(data.mediaItems) ? data.mediaItems : [];
         out.push(...items);
         pageToken = data.nextPageToken;
@@ -71,8 +71,8 @@ async function listRecentMedia(db, accountId, { limit = 200 } = {}) {
     return out.slice(0, limit);
 }
 
-async function getMediaItem(db, accountId, mediaItemId) {
-    return await googleFetch(db, accountId, 'GET', `/mediaItems/${encodeURIComponent(mediaItemId)}`);
+async function getMediaItem(accountId, mediaItemId) {
+    return await googleFetch(accountId, 'GET', `/mediaItems/${encodeURIComponent(mediaItemId)}`);
 }
 
 module.exports = {

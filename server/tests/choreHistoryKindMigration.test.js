@@ -9,6 +9,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const Database = require('better-sqlite3');
+const { rollbackToSchema } = require('./helpers/schemaRollback');
 
 const serverDir = path.resolve(__dirname, '..');
 const tmpDir = path.resolve(__dirname, '.tmp');
@@ -90,13 +91,16 @@ test('migration 20 backfills kind from the magic-string heuristics', async () =>
     db.exec('DROP INDEX IF EXISTS idx_chore_history_missed_unique');
     db.exec('DROP INDEX IF EXISTS idx_chore_history_kind');
     db.exec('ALTER TABLE chore_history DROP COLUMN kind');
-    db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('19', 'SYSTEM_SCHEMA_ID');
+    db.close();
+    // Knex's ledger, not the settings row, decides what replays — retract both.
+    rollbackToSchema(testDbPath, 19);
 
-    const userId = db.prepare("INSERT INTO users (username, email) VALUES ('fixture-kid', 'f@example.com')").run().lastInsertRowid;
-    const choreId = db.prepare("INSERT INTO chores (title, clam_value) VALUES ('Dishes', 0)").run().lastInsertRowid;
-    const scheduleId = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, visible) VALUES (?, ?, 1)').run(choreId, userId).lastInsertRowid;
+    const db2 = new Database(testDbPath);
+    const userId = db2.prepare("INSERT INTO users (username, email) VALUES ('fixture-kid', 'f@example.com')").run().lastInsertRowid;
+    const choreId = db2.prepare("INSERT INTO chores (title, clam_value) VALUES ('Dishes', 0)").run().lastInsertRowid;
+    const scheduleId = db2.prepare('INSERT INTO chore_schedules (chore_id, user_id, visible) VALUES (?, ?, 1)').run(choreId, userId).lastInsertRowid;
 
-    const insert = db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title) VALUES (?, ?, ?, ?, ?)');
+    const insert = db2.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title) VALUES (?, ?, ?, ?, ?)');
     const fixtures = [
         // [schedule, title, clam, expectedKind]
         [scheduleId, 'Dishes', 0, 'completion'],            // real completion
@@ -109,7 +113,7 @@ test('migration 20 backfills kind from the magic-string heuristics', async () =>
     const ids = fixtures.map(([schedule, title, clam]) =>
         insert.run(userId, schedule, '2026-07-01', clam, title).lastInsertRowid
     );
-    db.close();
+    db2.close();
 
     // Phase 3: boot again — migration 20 re-runs against the fixture data.
     await startServer();

@@ -1,6 +1,7 @@
 const axios = require('axios');
 const ICAL = require('ical.js');
 const node_ical = require('node-ical');
+const { Model } = require('objection');
 const googleConnection = require('./googleConnection');
 const googleCalendar = require('./googleCalendar');
 const appleCalDAV = require('./appleCalDAV');
@@ -8,6 +9,9 @@ const { dedupeCalendarEvents } = require('../utils/calendarDedup');
 
 class CalendarSyncService {
   constructor(db, decryptPassword) {
+    // `db` is retained for constructor-signature compatibility but is no longer
+    // used for data access; all DB work goes through the globally-bound Knex
+    // instance (Model.knex()).
     this.db = db;
     this.decryptPassword = decryptPassword;
     this.syncIntervals = new Map();
@@ -15,7 +19,9 @@ class CalendarSyncService {
   }
 
   initialize() {
-    this.startAllSyncJobs();
+    this.startAllSyncJobs().catch(err => {
+      console.error('Failed to start calendar sync jobs:', err.message);
+    });
     console.log('Calendar sync service initialized');
   }
 
@@ -49,9 +55,10 @@ class CalendarSyncService {
     }
 
     this.isSyncing.set(sourceId, true);
+    const knex = Model.knex();
 
     try {
-      const source = this.db.prepare('SELECT * FROM calendar_sources WHERE id = ? AND enabled = 1').get(sourceId);
+      const source = await knex('calendar_sources').where({ id: sourceId, enabled: 1 }).first();
       if (!source) {
         console.log(`Source ${sourceId} not found or disabled`);
         return { success: false, error: 'Source not found or disabled' };
@@ -80,38 +87,39 @@ class CalendarSyncService {
         events = await this.fetchAppleCalDAVEvents(source);
       }
 
-      this.db.prepare('DELETE FROM calendar_events_cache WHERE source_id = ?').run(sourceId);
+      await knex('calendar_events_cache').where('source_id', sourceId).del();
 
-      const insertStmt = this.db.prepare(`
-        INSERT OR REPLACE INTO calendar_events_cache
-        (source_id, event_uid, title, start_time, end_time, description, location, all_day, raw_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      const insertMany = this.db.transaction((events) => {
+      await knex.transaction(async (trx) => {
         for (const event of events) {
-          insertStmt.run(
-            sourceId,
-            event.uid,
-            event.title,
-            event.start.toISOString(),
-            event.end.toISOString(),
-            event.description || null,
-            event.location || null,
-            event.all_day ? 1 : 0,
-            JSON.stringify(event.raw || {})
-          );
+          await trx('calendar_events_cache')
+            .insert({
+              source_id: sourceId,
+              event_uid: event.uid,
+              title: event.title,
+              start_time: event.start.toISOString(),
+              end_time: event.end.toISOString(),
+              description: event.description || null,
+              location: event.location || null,
+              all_day: event.all_day ? 1 : 0,
+              raw_data: JSON.stringify(event.raw || {}),
+            })
+            .onConflict(['source_id', 'event_uid', 'start_time'])
+            .merge();
         }
       });
 
-      insertMany(events);
-
       const duration = Date.now() - startTime;
 
-      this.db.prepare(`
-        INSERT OR REPLACE INTO calendar_sync_status (source_id, last_sync_at, last_sync_status, last_sync_message, event_count)
-        VALUES (?, datetime('now'), 'success', ?, ?)
-      `).run(sourceId, `Synced ${events.length} events in ${duration}ms`, events.length);
+      await knex('calendar_sync_status')
+        .insert({
+          source_id: sourceId,
+          last_sync_at: knex.raw("datetime('now')"),
+          last_sync_status: 'success',
+          last_sync_message: `Synced ${events.length} events in ${duration}ms`,
+          event_count: events.length,
+        })
+        .onConflict('source_id')
+        .merge();
 
       console.log(`Synced ${events.length} events for ${source.name} in ${duration}ms`);
 
@@ -119,10 +127,15 @@ class CalendarSyncService {
     } catch (error) {
       console.error(`Error syncing calendar source ${sourceId}:`, error.message);
 
-      this.db.prepare(`
-        INSERT OR REPLACE INTO calendar_sync_status (source_id, last_sync_at, last_sync_status, last_sync_message)
-        VALUES (?, datetime('now'), 'error', ?)
-      `).run(sourceId, error.message);
+      await knex('calendar_sync_status')
+        .insert({
+          source_id: sourceId,
+          last_sync_at: knex.raw("datetime('now')"),
+          last_sync_status: 'error',
+          last_sync_message: error.message,
+        })
+        .onConflict('source_id')
+        .merge();
 
       return { success: false, error: error.message };
     } finally {
@@ -219,7 +232,7 @@ class CalendarSyncService {
   }
 
   async fetchGoogleEvents(source) {
-    const account = googleConnection.getConnectedAccount(this.db);
+    const account = await googleConnection.getConnectedAccount();
     if (!account) {
       throw new Error('No Google account connected. Authorize Google in Connections.');
     }
@@ -230,8 +243,8 @@ class CalendarSyncService {
     const now = Date.now();
     const timeMin = new Date(now - 13 * 30 * 24 * 60 * 60 * 1000);
     const timeMax = new Date(now + 13 * 30 * 24 * 60 * 60 * 1000);
-    const items = await googleCalendar.listEvents(this.db, account.id, calendarId, { timeMin, timeMax });
-    const eventColors = await googleCalendar.listEventColors(this.db, account.id);
+    const items = await googleCalendar.listEvents(account.id, calendarId, { timeMin, timeMax });
+    const eventColors = await googleCalendar.listEventColors(account.id);
 
     const out = [];
     for (const item of items) {
@@ -277,7 +290,8 @@ class CalendarSyncService {
   }
 
   async syncAllSources() {
-    const sources = this.db.prepare('SELECT id FROM calendar_sources WHERE enabled = 1').all();
+    const knex = Model.knex();
+    const sources = await knex('calendar_sources').select('id').where('enabled', 1);
     const results = [];
 
     for (const source of sources) {
@@ -301,31 +315,24 @@ class CalendarSyncService {
     }
   }
 
-  getCachedEvents(startDate, endDate) {
-    const sources = this.db.prepare(`
-      SELECT id, name, color FROM calendar_sources WHERE enabled = 1
-    `).all();
+  async getCachedEvents(startDate, endDate) {
+    const knex = Model.knex();
+    const sources = await knex('calendar_sources').select('id', 'name', 'color').where('enabled', 1);
 
     const sourceMap = new Map(sources.map(s => [s.id, s]));
 
-    let query = `
-      SELECT * FROM calendar_events_cache
-      WHERE source_id IN (SELECT id FROM calendar_sources WHERE enabled = 1)
-    `;
-    const params = [];
+    let query = knex('calendar_events_cache');
 
     if (startDate) {
-      query += ' AND end_time >= ?';
-      params.push(new Date(startDate).toISOString());
+      query = query.where('end_time', '>=', new Date(startDate).toISOString());
     }
     if (endDate) {
-      query += ' AND start_time <= ?';
-      params.push(new Date(endDate).toISOString());
+      query = query.where('start_time', '<=', new Date(endDate).toISOString());
     }
 
-    query += ' ORDER BY start_time ASC';
+    query = query.orderBy('start_time', 'asc');
 
-    const rows = this.db.prepare(query).all(...params);
+    const rows = await query;
 
     const events = rows.map(row => {
       const source = sourceMap.get(row.source_id);
@@ -348,15 +355,16 @@ class CalendarSyncService {
 
     // On by default: merge the same event synced from multiple calendars.
     // Users can opt out by explicitly setting CALENDAR_DEDUP_ENABLED='false'.
-    if (this.isDedupEnabled()) {
+    if (await this.isDedupEnabled()) {
       return dedupeCalendarEvents(events);
     }
     return events;
   }
 
-  isDedupEnabled() {
+  async isDedupEnabled() {
     try {
-      const row = this.db.prepare("SELECT value FROM settings WHERE key = 'CALENDAR_DEDUP_ENABLED'").get();
+      const knex = Model.knex();
+      const row = await knex('settings').select('value').where('key', 'CALENDAR_DEDUP_ENABLED').first();
       // Absent setting means default (enabled); only an explicit 'false' disables.
       return row?.value !== 'false';
     } catch {
@@ -364,34 +372,37 @@ class CalendarSyncService {
     }
   }
 
-  getSyncStatus(sourceId) {
+  async getSyncStatus(sourceId) {
+    const knex = Model.knex();
     if (sourceId) {
-      return this.db.prepare('SELECT * FROM calendar_sync_status WHERE source_id = ?').get(sourceId);
+      return await knex('calendar_sync_status').where('source_id', sourceId).first();
     }
-    return this.db.prepare(`
-      SELECT css.*, cs.name as source_name
-      FROM calendar_sync_status css
-      JOIN calendar_sources cs ON css.source_id = cs.id
-    `).all();
+    return await knex('calendar_sync_status as css')
+      .select('css.*', 'cs.name as source_name')
+      .join('calendar_sources as cs', 'css.source_id', 'cs.id');
   }
 
-  setSyncInterval(sourceId, intervalMinutes) {
-    this.db.prepare(`
-      INSERT OR REPLACE INTO calendar_sync_status (source_id, sync_interval_minutes)
-      VALUES (?, ?)
-      ON CONFLICT(source_id) DO UPDATE SET sync_interval_minutes = excluded.sync_interval_minutes
-    `).run(sourceId, intervalMinutes);
+  async setSyncInterval(sourceId, intervalMinutes) {
+    const knex = Model.knex();
+    await knex('calendar_sync_status')
+      .insert({ source_id: sourceId, sync_interval_minutes: intervalMinutes })
+      .onConflict('source_id')
+      .merge({ sync_interval_minutes: intervalMinutes });
 
-    this.restartSyncJob(sourceId);
+    await this.restartSyncJob(sourceId);
   }
 
-  getSyncInterval(sourceId) {
-    const row = this.db.prepare('SELECT sync_interval_minutes FROM calendar_sync_status WHERE source_id = ?').get(sourceId);
+  async getSyncInterval(sourceId) {
+    const knex = Model.knex();
+    const row = await knex('calendar_sync_status')
+      .select('sync_interval_minutes')
+      .where('source_id', sourceId)
+      .first();
     return row?.sync_interval_minutes || 15;
   }
 
-  startSyncJob(sourceId) {
-    const interval = this.getSyncInterval(sourceId);
+  async startSyncJob(sourceId) {
+    const interval = await this.getSyncInterval(sourceId);
 
     if (this.syncIntervals.has(sourceId)) {
       clearInterval(this.syncIntervals.get(sourceId));
@@ -414,19 +425,20 @@ class CalendarSyncService {
     console.log(`Started sync job for source ${sourceId} every ${interval} minutes`);
   }
 
-  restartSyncJob(sourceId) {
+  async restartSyncJob(sourceId) {
     if (this.syncIntervals.has(sourceId)) {
       clearInterval(this.syncIntervals.get(sourceId));
       this.syncIntervals.delete(sourceId);
     }
-    this.startSyncJob(sourceId);
+    await this.startSyncJob(sourceId);
   }
 
-  startAllSyncJobs() {
-    const sources = this.db.prepare('SELECT id FROM calendar_sources WHERE enabled = 1').all();
+  async startAllSyncJobs() {
+    const knex = Model.knex();
+    const sources = await knex('calendar_sources').select('id').where('enabled', 1);
 
     for (const source of sources) {
-      this.startSyncJob(source.id);
+      await this.startSyncJob(source.id);
     }
 
     setTimeout(() => {
@@ -446,12 +458,16 @@ class CalendarSyncService {
 
   onSourceCreated(sourceId) {
     this.syncSource(sourceId).then(() => {
-      this.startSyncJob(sourceId);
+      return this.startSyncJob(sourceId);
+    }).catch(err => {
+      console.error(`onSourceCreated failed for source ${sourceId}:`, err.message);
     });
   }
 
   onSourceUpdated(sourceId) {
-    this.syncSource(sourceId);
+    this.syncSource(sourceId).catch(err => {
+      console.error(`onSourceUpdated failed for source ${sourceId}:`, err.message);
+    });
   }
 
   onSourceDeleted(sourceId) {
@@ -464,7 +480,9 @@ class CalendarSyncService {
   onSourceToggled(sourceId, enabled) {
     if (enabled) {
       this.syncSource(sourceId).then(() => {
-        this.startSyncJob(sourceId);
+        return this.startSyncJob(sourceId);
+      }).catch(err => {
+        console.error(`onSourceToggled failed for source ${sourceId}:`, err.message);
       });
     } else {
       if (this.syncIntervals.has(sourceId)) {

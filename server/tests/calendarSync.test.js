@@ -69,12 +69,34 @@ test('fetchICSEvents normalizes SUMMARY/DESCRIPTION/LOCATION to strings', async 
     }
 });
 
-test('getCachedEvents maps cached rows with source metadata', () => {
-    const sources = [
-        { id: 1, name: 'Family', color: '#123456' },
-    ];
+test('getCachedEvents maps cached rows with source metadata', async () => {
+    const path = require('node:path');
+    const fs = require('node:fs');
+    const { createKnex } = require('../db/knex');
+    const dbFile = path.join(__dirname, '.tmp', `calsync-${process.pid}-${Date.now()}.db`);
+    fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+    const knex = createKnex({ engine: 'sqlite', filename: dbFile });
+    require('objection').Model.knex(knex);
 
-    const rows = [
+    await knex.schema.createTable('calendar_sources', (t) => {
+        t.integer('id').primary();
+        t.text('name');
+        t.text('color');
+        t.integer('enabled').defaultTo(1);
+    });
+    await knex.schema.createTable('calendar_events_cache', (t) => {
+        t.integer('source_id');
+        t.text('event_uid');
+        t.text('title');
+        t.text('start_time');
+        t.text('end_time');
+        t.text('description');
+        t.text('location');
+        t.integer('all_day');
+    });
+
+    await knex('calendar_sources').insert({ id: 1, name: 'Family', color: '#123456', enabled: 1 });
+    await knex('calendar_events_cache').insert([
         {
             source_id: 1,
             event_uid: 'evt-1',
@@ -95,44 +117,28 @@ test('getCachedEvents maps cached rows with source metadata', () => {
             location: null,
             all_day: 1,
         },
-    ];
+    ]);
 
-    let capturedQuery = '';
-    let capturedParams = [];
+    const service = new CalendarSyncService({}, () => null);
 
-    const fakeDb = {
-        prepare(query) {
-            if (query.includes('SELECT id, name, color FROM calendar_sources')) {
-                return { all: () => sources };
-            }
-            if (query.includes('SELECT * FROM calendar_events_cache')) {
-                return {
-                    all: (...params) => {
-                        capturedQuery = query;
-                        capturedParams = params;
-                        return rows;
-                    },
-                };
-            }
-            throw new Error(`Unexpected query: ${query}`);
-        },
-    };
+    try {
+        const mapped = await service.getCachedEvents('2026-05-01', '2026-05-03');
 
-    const service = new CalendarSyncService(fakeDb, () => null);
-    const mapped = service.getCachedEvents('2026-05-01', '2026-05-03');
+        assert.equal(mapped.length, 2);
 
-    assert.equal(mapped.length, 2);
-    assert.ok(capturedQuery.includes('end_time >= ?'));
-    assert.ok(capturedQuery.includes('start_time <= ?'));
-    assert.equal(capturedParams.length, 2);
+        assert.equal(mapped[0].source_name, 'Family');
+        assert.equal(mapped[0].source_color, '#123456');
+        assert.equal(mapped[0].all_day, false);
 
-    assert.equal(mapped[0].source_name, 'Family');
-    assert.equal(mapped[0].source_color, '#123456');
-    assert.equal(mapped[0].all_day, false);
-
-    assert.equal(mapped[1].source_name, 'Unknown');
-    assert.equal(mapped[1].source_color, '#6e44ff');
-    assert.equal(mapped[1].all_day, true);
+        assert.equal(mapped[1].source_name, 'Unknown');
+        assert.equal(mapped[1].source_color, '#6e44ff');
+        assert.equal(mapped[1].all_day, true);
+    } finally {
+        await knex.destroy();
+        for (const suffix of ['', '-wal', '-shm']) {
+            try { fs.rmSync(`${dbFile}${suffix}`, { force: true }); } catch (_) { /* ignore */ }
+        }
+    }
 });
 
 test('parseEventColor extracts a valid hex and rejects anything else', () => {
@@ -146,8 +152,35 @@ test('parseEventColor extracts a valid hex and rejects anything else', () => {
     assert.equal(service.parseEventColor(null), null);
 });
 
-test('getCachedEvents surfaces per-event color and leaves it null otherwise', () => {
-    const rows = [
+test('getCachedEvents surfaces per-event color and leaves it null otherwise', async () => {
+    const path = require('node:path');
+    const fs = require('node:fs');
+    const { createKnex } = require('../db/knex');
+    const dbFile = path.join(__dirname, '.tmp', `calcolor-${process.pid}-${Date.now()}.db`);
+    fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+    const knex = createKnex({ engine: 'sqlite', filename: dbFile });
+    require('objection').Model.knex(knex);
+
+    await knex.schema.createTable('calendar_sources', (t) => {
+        t.integer('id').primary();
+        t.text('name');
+        t.text('color');
+        t.integer('enabled').defaultTo(1);
+    });
+    await knex.schema.createTable('calendar_events_cache', (t) => {
+        t.integer('source_id');
+        t.text('event_uid');
+        t.text('title');
+        t.text('start_time');
+        t.text('end_time');
+        t.text('description');
+        t.text('location');
+        t.integer('all_day');
+        t.text('raw_data');
+    });
+
+    await knex('calendar_sources').insert({ id: 1, name: 'Family', color: '#123456', enabled: 1 });
+    await knex('calendar_events_cache').insert([
         {
             source_id: 1, event_uid: 'recolored', title: 'Recolored',
             start_time: '2026-05-01T13:00:00.000Z', end_time: '2026-05-01T14:00:00.000Z',
@@ -160,30 +193,24 @@ test('getCachedEvents surfaces per-event color and leaves it null otherwise', ()
             description: null, location: null, all_day: 0,
             raw_data: JSON.stringify({ googleEventId: 'b', colorId: null, eventColor: null }),
         },
-    ];
+    ]);
 
-    const fakeDb = {
-        prepare(query) {
-            // The events query also mentions calendar_sources in a subselect,
-            // so match the cache table first.
-            if (query.includes('FROM calendar_events_cache')) {
-                return { all: () => rows };
-            }
-            if (query.includes('FROM calendar_sources')) {
-                return { all: () => [{ id: 1, name: 'Family', color: '#123456' }] };
-            }
-            throw new Error(`Unexpected query: ${query}`);
-        },
-    };
+    const service = new CalendarSyncService({}, () => null);
 
-    const service = new CalendarSyncService(fakeDb, () => null);
-    const mapped = service.getCachedEvents();
+    try {
+        const mapped = await service.getCachedEvents();
 
-    assert.equal(mapped.length, 2);
-    assert.equal(mapped[0].event_color, '#dc2127');
-    assert.equal(mapped[0].source_color, '#123456');
-    assert.equal(mapped[1].event_color, null);
-    assert.equal(mapped[1].source_color, '#123456');
+        assert.equal(mapped.length, 2);
+        assert.equal(mapped[0].event_color, '#dc2127');
+        assert.equal(mapped[0].source_color, '#123456');
+        assert.equal(mapped[1].event_color, null);
+        assert.equal(mapped[1].source_color, '#123456');
+    } finally {
+        await knex.destroy();
+        for (const suffix of ['', '-wal', '-shm']) {
+            try { fs.rmSync(`${dbFile}${suffix}`, { force: true }); } catch (_) { /* ignore */ }
+        }
+    }
 });
 
 test('fetchGoogleEvents resolves colorId to a hex via the Google palette', async () => {

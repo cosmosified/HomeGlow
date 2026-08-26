@@ -16,6 +16,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const Database = require('better-sqlite3');
+const { rollbackToSchema } = require('./helpers/schemaRollback');
 
 const serverDir = path.resolve(__dirname, '..');
 const tmpDir = path.resolve(__dirname, '.tmp');
@@ -169,8 +170,9 @@ test('credentials written under the old scheme are re-encrypted on upgrade', asy
         VALUES (?, 'Immich', 'http://immich.invalid', ?, ?)
     `).run('Legacy Immich', legacyEncrypt('legacy-immich-key'), legacyEncrypt('legacy-refresh-token'));
 
-    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('SYSTEM_SCHEMA_ID', '24')").run();
     db.close();
+    // Knex's ledger, not the settings row, decides what replays — retract both.
+    rollbackToSchema(testDbPath, 24);
 
     const calendarId = calendar.lastInsertRowid;
     const photoId = photo.lastInsertRowid;
@@ -199,9 +201,8 @@ test('replaying the migration does not double-encrypt', async () => {
     const before = readColumn('photo_sources', 'api_key', source.id);
 
     await stopServer();
-    const db = new Database(testDbPath);
-    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('SYSTEM_SCHEMA_ID', '24')").run();
-    db.close();
+    // Knex's ledger, not the settings row, decides what replays — retract both.
+    rollbackToSchema(testDbPath, 24);
     await startServer();
 
     const after = readColumn('photo_sources', 'api_key', source.id);
@@ -223,8 +224,9 @@ test('a credential that cannot be decrypted is skipped, not fatal', async () => 
         VALUES ('Recoverable', 'CalDAV', 'https://example.invalid', 'y', ?)
     `).run(legacyEncrypt('still-here'));
 
-    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('SYSTEM_SCHEMA_ID', '24')").run();
     db.close();
+    // Knex's ledger, not the settings row, decides what replays — retract both.
+    rollbackToSchema(testDbPath, 24);
 
     serverLogs = '';
     await startServer();

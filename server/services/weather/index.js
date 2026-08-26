@@ -16,6 +16,7 @@ const homeAssistantProvider = require('./homeassistant');
 const demoProvider = require('./demo');
 const homeAssistant = require('../homeAssistant');
 const { validatePayload } = require('./payload');
+const { Setting } = require('../../db/models');
 
 const PROVIDERS = {
     OPENWEATHERMAP: 'openweathermap',
@@ -64,13 +65,13 @@ function clearCache() {
     cache.clear();
 }
 
-function getSetting(db, key) {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+async function getSetting(key) {
+    const row = await Setting.query().findById(key);
     return row ? row.value : null;
 }
 
-function getConfiguredProvider(db) {
-    const stored = String(getSetting(db, PROVIDER_SETTING_KEY) || '').trim().toLowerCase();
+async function getConfiguredProvider() {
+    const stored = String((await getSetting(PROVIDER_SETTING_KEY)) || '').trim().toLowerCase();
     return stored === PROVIDERS.HOMEASSISTANT ? PROVIDERS.HOMEASSISTANT : DEFAULT_PROVIDER;
 }
 
@@ -79,13 +80,13 @@ function getConfiguredProvider(db) {
  * Admin Panel's status line so a half-configured provider is visible before the
  * widget shows an error.
  */
-function getProviderStatus(db, { demoMode = false } = {}) {
+async function getProviderStatus({ demoMode = false } = {}) {
     // `provider` is what will actually serve a request; `configured_provider` is
     // the stored setting. They differ in demo mode, where the demo snapshot
     // overrides the choice. The Admin Panel's selector binds to the stored
     // setting — binding it to the effective one leaves the control blank on a
     // demo instance, because "demo" is not one of its options.
-    const configuredProvider = getConfiguredProvider(db);
+    const configuredProvider = await getConfiguredProvider();
 
     if (demoMode) {
         return {
@@ -97,7 +98,7 @@ function getProviderStatus(db, { demoMode = false } = {}) {
     }
 
     if (configuredProvider === PROVIDERS.HOMEASSISTANT) {
-        const { has_url, has_token } = homeAssistant.getHomeAssistantStatus(db);
+        const { has_url, has_token } = await homeAssistant.getHomeAssistantStatus();
         if (!has_url || !has_token) {
             return {
                 provider: configuredProvider,
@@ -114,7 +115,7 @@ function getProviderStatus(db, { demoMode = false } = {}) {
         };
     }
 
-    const hasKey = !!getSetting(db, 'WEATHER_API_KEY');
+    const hasKey = !!(await getSetting('WEATHER_API_KEY'));
     return {
         provider: configuredProvider,
         configured_provider: configuredProvider,
@@ -126,7 +127,6 @@ function getProviderStatus(db, { demoMode = false } = {}) {
 /**
  * Fetch weather through the configured provider.
  *
- * @param {object} db
  * @param {object} options
  * @param {string} [options.locationQuery] e.g. "14818" or "Rochester,NY"
  * @param {number} [options.lat]
@@ -136,7 +136,7 @@ function getProviderStatus(db, { demoMode = false } = {}) {
  * @param {boolean} [options.demoMode]
  * @param {boolean} [options.forceRefresh]
  */
-async function getWeather(db, {
+async function getWeather({
     locationQuery,
     lat,
     lon,
@@ -146,7 +146,7 @@ async function getWeather(db, {
     forceRefresh = false,
 } = {}) {
     const normalizedUnits = units === 'metric' ? 'metric' : 'imperial';
-    const provider = demoMode ? 'demo' : getConfiguredProvider(db);
+    const provider = demoMode ? 'demo' : await getConfiguredProvider();
 
     const key = cacheKey({ provider, lat, lon, locationQuery, units: normalizedUnits, lang });
     if (!forceRefresh) {
@@ -159,9 +159,8 @@ async function getWeather(db, {
     if (provider === 'demo') {
         payload = demoProvider.fetchWeather({ units: normalizedUnits });
     } else if (provider === PROVIDERS.HOMEASSISTANT) {
-        const { weatherEntity } = homeAssistant.getConfig(db);
+        const { weatherEntity } = await homeAssistant.getConfig();
         payload = await homeAssistantProvider.fetchWeather({
-            db,
             homeAssistant,
             entityId: weatherEntity,
             // Home Assistant reports its own configured location, so the
@@ -175,7 +174,7 @@ async function getWeather(db, {
         });
     } else {
         payload = await openWeatherMap.fetchWeather({
-            apiKey: getSetting(db, 'WEATHER_API_KEY'),
+            apiKey: await getSetting('WEATHER_API_KEY'),
             locationQuery,
             coordinates: Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null,
             units: normalizedUnits,

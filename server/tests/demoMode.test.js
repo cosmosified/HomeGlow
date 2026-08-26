@@ -1,14 +1,22 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 // Boots a real server with DEMO_MODE=true and verifies the demo behaviors:
 // PIN disabled, sample data seeded, abuse-prone routes blocked, normal
-// interactive routes still working. Uses the in-memory DB demo mode forces,
-// so no test DB artifacts are created.
+// interactive routes still working.
+//
+// DB: demo mode points the (legacy) connection at :memory:, but the Knex/
+// Objection data layer resolves its own file from DB_PATH — so the test hands it
+// a throwaway file under tests/.tmp and removes it afterwards, the same way
+// helpers/serverHarness.js does. (The harness itself is not reused here because
+// this suite needs its own demo-specific env and readiness probe.)
 
 const serverDir = path.resolve(__dirname, '..');
+const tmpDir = path.resolve(__dirname, '.tmp');
+const dbPath = path.join(tmpDir, `demo-mode-${process.pid}-${Date.now()}.db`);
 const port = 5600 + Math.floor(Math.random() * 300);
 const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -62,12 +70,14 @@ async function api(pathname, options = {}) {
 }
 
 test.before(async () => {
+    fs.mkdirSync(tmpDir, { recursive: true });
     serverProcess = spawn('node', ['index.js'], {
         cwd: serverDir,
         env: {
             ...process.env,
             PORT: String(port),
             DEMO_MODE: 'true',
+            DB_PATH: dbPath,
             TZ: 'UTC',
             HOMEGLOW_DISABLE_BACKGROUND_JOBS: '1',
             // Demo mode syncs its curated calendar feeds; keep tests offline.
@@ -94,6 +104,15 @@ test.after(async () => {
             serverProcess.once('close', () => resolve());
             setTimeout(resolve, 5000);
         });
+    }
+    if (process.env.HOMEGLOW_TEST_KEEP_ARTIFACTS !== '1') {
+        for (const suffix of ['', '-wal', '-shm']) {
+            try {
+                fs.rmSync(`${dbPath}${suffix}`, { force: true });
+            } catch {
+                // best-effort cleanup
+            }
+        }
     }
 });
 

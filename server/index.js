@@ -22,6 +22,10 @@ process.env.TZ = APP_TIMEZONE;
 
 const fastify = require('fastify')({ logger: true });
 const Database = require('better-sqlite3');
+const { Model } = require('objection');
+const { createKnex } = require('./db/knex');
+const { adoptOrMigrate } = require('./db/migrate');
+const { Setting, AdminPin, Prize, PrizeOffer, User, Chore, ChoreSchedule, ChoreHistory, Event, CalendarSource, CalendarEventsCache, CalendarSyncStatus, PhotoSource, GooglePickedMedia, HomeglowPhoto, Device, Tab, Plugin, PluginStorage } = require('./db/models');
 const ical = require('ical-generator');
 const node_ical = require('node-ical');
 const path = require('path');
@@ -152,6 +156,9 @@ const migrateChoreHistoryTitle = require('./migrations/migrateChoreHistoryTitle'
 const migrateToDurationField = require('./migrations/migrateToDurationField');
 
 const SYSTEM_SCHEMA_ID_KEY = 'SYSTEM_SCHEMA_ID';
+// Schema level encoded by the Knex baseline migration. Existing DBs below this are
+// lifted to it by the legacy chain before Knex takes over (Option A).
+const BASELINE_SCHEMA_VERSION = 14;
 
 const schemaMigrations = [
   { schemaId: 6, migrationPath: './migrations/migrateDeviceSchemaV6', },
@@ -552,7 +559,7 @@ fastify.get('/widgets/:filename', async (request, reply) => {
   try {
     let content;
     let pluginId = null;
-    const row = db.prepare('SELECT content, plugin_id FROM plugins WHERE filename = ?').get(filename);
+    const row = await Plugin.query().select('content', 'plugin_id').where('filename', filename).first();
     if (row) {
       content = row.content;
       pluginId = row.plugin_id;
@@ -925,7 +932,7 @@ function extractPluginManifest(htmlContent) {
 
 // Shared by upload and GitHub install: validate any embedded manifest and
 // upsert the plugin row. Returns an { error, status } object on rejection.
-function installPluginRow({ filename, fallbackName, content, source, originalUrl = null }) {
+async function installPluginRow({ filename, fallbackName, content, source, originalUrl = null }) {
   const { manifest, errors } = extractPluginManifest(content);
   if (errors.length > 0) {
     return { error: `Invalid plugin manifest: ${errors.join(' ')}`, status: 400 };
@@ -933,8 +940,11 @@ function installPluginRow({ filename, fallbackName, content, source, originalUrl
 
   const pluginId = manifest ? manifest.id : null;
   if (pluginId) {
-    const conflict = db.prepare('SELECT filename FROM plugins WHERE plugin_id = ? AND filename != ?')
-      .get(pluginId, filename);
+    const conflict = await Plugin.query()
+      .select('filename')
+      .where('plugin_id', pluginId)
+      .whereNot('filename', filename)
+      .first();
     if (conflict) {
       return {
         error: `Plugin id "${pluginId}" is already used by ${conflict.filename}.`,
@@ -943,26 +953,26 @@ function installPluginRow({ filename, fallbackName, content, source, originalUrl
     }
   }
 
-  db.prepare(`
-    INSERT INTO plugins (filename, name, content, source, original_url, plugin_id, manifest_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(filename) DO UPDATE SET
-      content = excluded.content,
-      name = excluded.name,
-      source = excluded.source,
-      original_url = excluded.original_url,
-      plugin_id = excluded.plugin_id,
-      manifest_json = excluded.manifest_json,
-      updated_at = CURRENT_TIMESTAMP
-  `).run(
-    filename,
-    (manifest && manifest.name) || fallbackName,
-    content,
-    source,
-    originalUrl,
-    pluginId,
-    manifest ? JSON.stringify(manifest) : null
-  );
+  await Plugin.query()
+    .insert({
+      filename,
+      name: (manifest && manifest.name) || fallbackName,
+      content,
+      source,
+      original_url: originalUrl,
+      plugin_id: pluginId,
+      manifest_json: manifest ? JSON.stringify(manifest) : null,
+    })
+    .onConflict('filename')
+    .merge({
+      content,
+      name: (manifest && manifest.name) || fallbackName,
+      source,
+      original_url: originalUrl,
+      plugin_id: pluginId,
+      manifest_json: manifest ? JSON.stringify(manifest) : null,
+      updated_at: knex.fn.now(),
+    });
 
   return { pluginId };
 }
@@ -978,10 +988,11 @@ async function loadWidgetRegistry() {
 }
 
 // Helper: List installed plugins in the legacy registry response shape
-function listInstalledPlugins() {
-  return db.prepare(
-    'SELECT filename, name, source, original_url, plugin_id, manifest_json, installed_at FROM plugins ORDER BY installed_at, filename'
-  ).all().map((row) => ({
+async function listInstalledPlugins() {
+  const rows = await Plugin.query()
+    .select('filename', 'name', 'source', 'original_url', 'plugin_id', 'manifest_json', 'installed_at')
+    .orderBy([{ column: 'installed_at' }, { column: 'filename' }]);
+  return rows.map((row) => ({
     name: row.name,
     filename: row.filename,
     uploadedAt: row.installed_at,
@@ -1008,7 +1019,7 @@ fastify.post('/api/widgets/upload', async (request, reply) => {
 
     // Re-uploading the same filename replaces the content (matches the old
     // overwrite-the-file behavior); an embedded manifest is validated first.
-    const result = installPluginRow({
+    const result = await installPluginRow({
       filename: widgetName,
       fallbackName: widgetName.replace('.html', ''),
       content,
@@ -1028,7 +1039,7 @@ fastify.post('/api/widgets/upload', async (request, reply) => {
 // Endpoint: List widgets
 fastify.get('/api/widgets', async (request, reply) => {
   try {
-    return listInstalledPlugins();
+    return await listInstalledPlugins();
   } catch (err) {
     console.error('Error listing plugins:', err);
     reply.status(500).send({ error: 'Failed to load widget registry.' });
@@ -1046,24 +1057,24 @@ fastify.delete('/api/widgets/:filename', async (request, reply) => {
   const { filename } = request.params;
   const purgeData = request.query.purgeData === 'true';
   try {
-    const pluginRow = db.prepare('SELECT plugin_id FROM plugins WHERE filename = ?').get(filename);
-    const result = db.prepare('DELETE FROM plugins WHERE filename = ?').run(filename);
+    const pluginRow = await Plugin.query().select('plugin_id').where('filename', filename).first();
+    const result = { changes: await Plugin.query().delete().where('filename', filename) };
 
     if (purgeData && pluginRow?.plugin_id) {
       const pluginId = pluginRow.plugin_id;
-      db.prepare('DELETE FROM plugin_storage WHERE plugin_id = ?').run(pluginId);
-      db.prepare('DELETE FROM settings WHERE key = ?').run(pluginHouseholdSettingsKey(pluginId));
+      await PluginStorage.query().delete().where('plugin_id', pluginId);
+      await Setting.query().delete().where('key', pluginHouseholdSettingsKey(pluginId));
       // Sweep device-scoped values out of every device blob.
-      const devices = db.prepare('SELECT name, device_settings_json FROM devices').all();
+      const devices = await knex('devices').select('name', 'device_settings_json');
       for (const device of devices) {
         const deviceSettings = parseJsonObject(device.device_settings_json, {});
         const platformSettings = deviceSettings.pluginPlatformSettings;
         if (platformSettings && typeof platformSettings === 'object' && platformSettings[pluginId] !== undefined) {
           delete platformSettings[pluginId];
-          db.prepare('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(
-            JSON.stringify(deviceSettings),
-            device.name
-          );
+          await knex('devices').where('name', device.name).update({
+            device_settings_json: JSON.stringify(deviceSettings),
+            updateTime: knex.raw('CURRENT_TIMESTAMP'),
+          });
         }
       }
     }
@@ -1099,8 +1110,8 @@ const PLUGIN_STORAGE_KEY_REGEX = /^[A-Za-z0-9:_.-]{1,128}$/;
 
 // Guard: the pluginId must belong to an installed manifest plugin that declared
 // `"storage": true`. Sends the error reply and returns null on failure.
-function requireStoragePlugin(pluginId, reply) {
-  const row = db.prepare('SELECT manifest_json FROM plugins WHERE plugin_id = ?').get(pluginId);
+async function requireStoragePlugin(pluginId, reply) {
+  const row = await Plugin.query().select('manifest_json').where('plugin_id', pluginId).first();
   if (!row) {
     reply.status(403).send({ error: `Unknown plugin id "${pluginId}".` });
     return null;
@@ -1123,9 +1134,9 @@ function validStorageKey(key, reply) {
 
 fastify.get('/api/plugin/v1/storage/:pluginId', async (request, reply) => {
   const { pluginId } = request.params;
-  if (!requireStoragePlugin(pluginId, reply)) return;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
 
-  const rows = db.prepare('SELECT key, value_json FROM plugin_storage WHERE plugin_id = ? ORDER BY key').all(pluginId);
+  const rows = await PluginStorage.query().select('key', 'value_json').where('plugin_id', pluginId).orderBy('key');
   const values = {};
   for (const row of rows) {
     try {
@@ -1139,10 +1150,10 @@ fastify.get('/api/plugin/v1/storage/:pluginId', async (request, reply) => {
 
 fastify.get('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
   const { pluginId, key } = request.params;
-  if (!requireStoragePlugin(pluginId, reply)) return;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
   if (!validStorageKey(key, reply)) return;
 
-  const row = db.prepare('SELECT value_json FROM plugin_storage WHERE plugin_id = ? AND key = ?').get(pluginId, key);
+  const row = await PluginStorage.query().select('value_json').where({ plugin_id: pluginId, key }).first();
   if (!row) {
     return reply.status(404).send({ error: 'Key not found.' });
   }
@@ -1155,7 +1166,7 @@ fastify.get('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
 // visitors should be able to try plugins end-to-end.
 fastify.put('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
   const { pluginId, key } = request.params;
-  if (!requireStoragePlugin(pluginId, reply)) return;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
   if (!validStorageKey(key, reply)) return;
 
   const valueJson = JSON.stringify(request.body === undefined ? null : request.body);
@@ -1163,32 +1174,29 @@ fastify.put('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
     return reply.status(413).send({ error: `Value exceeds ${PLUGIN_STORAGE_MAX_VALUE_BYTES / 1024} KB limit.` });
   }
 
-  const exists = db.prepare('SELECT 1 FROM plugin_storage WHERE plugin_id = ? AND key = ?').get(pluginId, key);
+  const exists = await PluginStorage.query().select('plugin_id').where({ plugin_id: pluginId, key }).first();
   if (!exists) {
-    const { count } = db.prepare('SELECT COUNT(*) AS count FROM plugin_storage WHERE plugin_id = ?').get(pluginId);
+    const { count } = await knex('plugin_storage').where('plugin_id', pluginId).count({ count: '*' }).first();
     if (count >= PLUGIN_STORAGE_MAX_KEYS) {
       return reply.status(413).send({ error: `Plugin storage is limited to ${PLUGIN_STORAGE_MAX_KEYS} keys.` });
     }
   }
 
-  db.prepare(`
-    INSERT INTO plugin_storage (plugin_id, key, value_json)
-    VALUES (?, ?, ?)
-    ON CONFLICT(plugin_id, key) DO UPDATE SET
-      value_json = excluded.value_json,
-      updated_at = CURRENT_TIMESTAMP
-  `).run(pluginId, key, valueJson);
+  await PluginStorage.query()
+    .insert({ plugin_id: pluginId, key, value_json: valueJson })
+    .onConflict(['plugin_id', 'key'])
+    .merge({ value_json: valueJson, updated_at: knex.fn.now() });
 
   return { success: true };
 });
 
 fastify.delete('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) => {
   const { pluginId, key } = request.params;
-  if (!requireStoragePlugin(pluginId, reply)) return;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
   if (!validStorageKey(key, reply)) return;
 
-  const result = db.prepare('DELETE FROM plugin_storage WHERE plugin_id = ? AND key = ?').run(pluginId, key);
-  if (result.changes === 0) {
+  const changes = await PluginStorage.query().delete().where({ plugin_id: pluginId, key });
+  if (changes === 0) {
     return reply.status(404).send({ error: 'Key not found.' });
   }
   return { success: true };
@@ -1197,8 +1205,10 @@ fastify.delete('/api/plugin/v1/storage/:pluginId/:key', async (request, reply) =
 // Atomic numeric delta on a JSON path inside a stored document — the primitive
 // the clam-bucket siphon needs ("add N to the give pool") without a general
 // transaction API. Creates the key/path if missing. Body: { path, delta }.
-const incrementPluginStorage = (pluginId, key, pathSegments, delta) => {
-  const row = db.prepare('SELECT value_json FROM plugin_storage WHERE plugin_id = ? AND key = ?').get(pluginId, key);
+// `ex` is the Knex executor: callers pass a transaction so the read-modify-write
+// is one atomic unit.
+const incrementPluginStorage = async (pluginId, key, pathSegments, delta, ex = knex) => {
+  const row = await ex('plugin_storage').select('value_json').where({ plugin_id: pluginId, key }).first();
   let doc = {};
   if (row) {
     try {
@@ -1234,20 +1244,17 @@ const incrementPluginStorage = (pluginId, key, pathSegments, delta) => {
     throw Object.assign(new Error('Value exceeds size limit.'), { statusCode: 413 });
   }
 
-  db.prepare(`
-    INSERT INTO plugin_storage (plugin_id, key, value_json)
-    VALUES (?, ?, ?)
-    ON CONFLICT(plugin_id, key) DO UPDATE SET
-      value_json = excluded.value_json,
-      updated_at = CURRENT_TIMESTAMP
-  `).run(pluginId, key, valueJson);
+  await ex('plugin_storage')
+    .insert({ plugin_id: pluginId, key, value_json: valueJson })
+    .onConflict(['plugin_id', 'key'])
+    .merge({ value_json: valueJson, updated_at: ex.fn.now() });
 
   return { result: target[leaf], value: doc };
 };
 
 fastify.post('/api/plugin/v1/storage/:pluginId/:key/increment', async (request, reply) => {
   const { pluginId, key } = request.params;
-  if (!requireStoragePlugin(pluginId, reply)) return;
+  if (!(await requireStoragePlugin(pluginId, reply))) return;
   if (!validStorageKey(key, reply)) return;
 
   const { path: incrementPath, delta } = request.body || {};
@@ -1263,10 +1270,11 @@ fastify.post('/api/plugin/v1/storage/:pluginId/:key/increment', async (request, 
   }
 
   try {
-    // better-sqlite3 is synchronous and this transaction runs in one tick, so
-    // concurrent HTTP requests cannot interleave a read-modify-write here.
-    const applyIncrement = db.transaction(() => incrementPluginStorage(pluginId, key, pathSegments, delta));
-    const { result, value } = applyIncrement();
+    // The read-modify-write runs inside one transaction so concurrent HTTP
+    // requests cannot interleave and lose an increment.
+    const { result, value } = await knex.transaction(
+      (trx) => incrementPluginStorage(pluginId, key, pathSegments, delta, trx)
+    );
     return { success: true, result, value };
   } catch (error) {
     if (error.statusCode) {
@@ -1284,8 +1292,8 @@ fastify.post('/api/plugin/v1/storage/:pluginId/:key/increment', async (request, 
 // device_settings_json.pluginPlatformSettings[<id>]). GET returns the merged
 // effective values: manifest default <- stored value for the key's scope.
 
-function requireManifestPlugin(pluginId, reply) {
-  const row = db.prepare('SELECT manifest_json FROM plugins WHERE plugin_id = ?').get(pluginId);
+async function requireManifestPlugin(pluginId, reply) {
+  const row = await Plugin.query().select('manifest_json').where('plugin_id', pluginId).first();
   if (!row) {
     reply.status(403).send({ error: `Unknown plugin id "${pluginId}".` });
     return null;
@@ -1297,13 +1305,13 @@ function pluginHouseholdSettingsKey(pluginId) {
   return `plugin:${pluginId}:settings`;
 }
 
-function readHouseholdPluginSettings(pluginId) {
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(pluginHouseholdSettingsKey(pluginId));
+async function readHouseholdPluginSettings(pluginId) {
+  const row = await knex('settings').select('value').where('key', pluginHouseholdSettingsKey(pluginId)).first();
   return parseJsonObject(row?.value, {});
 }
 
-function readDevicePluginSettings(pluginId, deviceName) {
-  const row = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(deviceName);
+async function readDevicePluginSettings(pluginId, deviceName) {
+  const row = await knex('devices').select('device_settings_json').where('name', deviceName).first();
   const deviceSettings = parseJsonObject(row?.device_settings_json, {});
   const platformSettings = deviceSettings.pluginPlatformSettings;
   const values = platformSettings && typeof platformSettings === 'object' && !Array.isArray(platformSettings)
@@ -1340,10 +1348,10 @@ function validatePluginSettingValue(setting, value) {
 // The single source of truth for effective setting values (manifest default <-
 // stored value at the key's scope). Used by the GET route AND the declarative
 // reaction executor so the two can never drift.
-function resolveEffectiveSettings(pluginId, manifest, deviceName = null) {
+async function resolveEffectiveSettings(pluginId, manifest, deviceName = null) {
   const declared = Array.isArray(manifest.settings) ? manifest.settings : [];
-  const household = readHouseholdPluginSettings(pluginId);
-  const deviceValues = deviceName ? readDevicePluginSettings(pluginId, deviceName) : {};
+  const household = await readHouseholdPluginSettings(pluginId);
+  const deviceValues = deviceName ? await readDevicePluginSettings(pluginId, deviceName) : {};
 
   const merged = {};
   for (const setting of declared) {
@@ -1356,16 +1364,16 @@ function resolveEffectiveSettings(pluginId, manifest, deviceName = null) {
 
 fastify.get('/api/plugin/v1/settings/:pluginId', async (request, reply) => {
   const { pluginId } = request.params;
-  const manifest = requireManifestPlugin(pluginId, reply);
+  const manifest = await requireManifestPlugin(pluginId, reply);
   if (!manifest) return;
 
   const deviceName = typeof request.query.device === 'string' && request.query.device ? request.query.device : null;
-  return resolveEffectiveSettings(pluginId, manifest, deviceName);
+  return await resolveEffectiveSettings(pluginId, manifest, deviceName);
 });
 
 fastify.put('/api/plugin/v1/settings/:pluginId', async (request, reply) => {
   const { pluginId } = request.params;
-  const manifest = requireManifestPlugin(pluginId, reply);
+  const manifest = await requireManifestPlugin(pluginId, reply);
   if (!manifest) return;
 
   const body = request.body;
@@ -1400,26 +1408,27 @@ fastify.put('/api/plugin/v1/settings/:pluginId', async (request, reply) => {
   }
 
   if (Object.keys(householdUpdates).length > 0) {
-    const current = readHouseholdPluginSettings(pluginId);
-    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(
-      pluginHouseholdSettingsKey(pluginId),
-      JSON.stringify({ ...current, ...householdUpdates })
-    );
+    const current = await readHouseholdPluginSettings(pluginId);
+    const value = JSON.stringify({ ...current, ...householdUpdates });
+    await knex('settings')
+      .insert({ key: pluginHouseholdSettingsKey(pluginId), value })
+      .onConflict('key')
+      .merge({ value });
   }
 
   if (Object.keys(deviceUpdates).length > 0) {
-    db.prepare('INSERT OR IGNORE INTO devices (name, device_settings_json) VALUES (?, ?)').run(deviceName, '{}');
-    const row = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(deviceName);
+    await knex('devices').insert({ name: deviceName, device_settings_json: '{}' }).onConflict('name').ignore();
+    const row = await knex('devices').select('device_settings_json').where('name', deviceName).first();
     const deviceSettings = parseJsonObject(row?.device_settings_json, {});
     const platformSettings = (deviceSettings.pluginPlatformSettings && typeof deviceSettings.pluginPlatformSettings === 'object')
       ? deviceSettings.pluginPlatformSettings
       : {};
     platformSettings[pluginId] = { ...(platformSettings[pluginId] || {}), ...deviceUpdates };
     deviceSettings.pluginPlatformSettings = platformSettings;
-    db.prepare('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(
-      JSON.stringify(deviceSettings),
-      deviceName
-    );
+    await knex('devices').where('name', deviceName).update({
+      device_settings_json: JSON.stringify(deviceSettings),
+      updateTime: knex.raw('CURRENT_TIMESTAMP'),
+    });
   }
 
   return { success: true };
@@ -1469,7 +1478,7 @@ fastify.get('/api/plugin/v1/events/stream', (request, reply) => {
 // on the server, only the declared increment. Reaction failures are logged and
 // never break the core mutation or other plugins' reactions.
 
-function resolveReactionDelta(deltaSpec, manifest, pluginId, payload) {
+async function resolveReactionDelta(deltaSpec, manifest, pluginId, payload) {
   if (typeof deltaSpec === 'number' && Number.isFinite(deltaSpec)) {
     return deltaSpec;
   }
@@ -1477,7 +1486,7 @@ function resolveReactionDelta(deltaSpec, manifest, pluginId, payload) {
     if (typeof deltaSpec.setting === 'string') {
       // Same resolution the settings GET route serves — via the shared helper,
       // so Admin-Panel-visible values and reaction deltas can never disagree.
-      const value = resolveEffectiveSettings(pluginId, manifest)[deltaSpec.setting];
+      const value = (await resolveEffectiveSettings(pluginId, manifest))[deltaSpec.setting];
       return typeof value === 'number' && Number.isFinite(value) ? value : null;
     }
     if (typeof deltaSpec.payload === 'string') {
@@ -1488,27 +1497,27 @@ function resolveReactionDelta(deltaSpec, manifest, pluginId, payload) {
   return null;
 }
 
-function runDeclarativeReactions(message) {
+async function runDeclarativeReactions(message) {
   try {
-    const rows = db.prepare(
-      'SELECT plugin_id, manifest_json FROM plugins WHERE plugin_id IS NOT NULL AND manifest_json IS NOT NULL'
-    ).all();
+    const rows = await Plugin.query()
+      .select('plugin_id', 'manifest_json')
+      .whereNotNull('plugin_id')
+      .whereNotNull('manifest_json');
     for (const row of rows) {
       const manifest = parseJsonObject(row.manifest_json, {});
       const reactions = Array.isArray(manifest.reactions) ? manifest.reactions : [];
       for (const reaction of reactions) {
         if (reaction.on !== message.event) continue;
-        const resolved = resolveReactionDelta(reaction.delta, manifest, row.plugin_id, message.payload);
+        const resolved = await resolveReactionDelta(reaction.delta, manifest, row.plugin_id, message.payload);
         if (resolved === null) continue;
         const factor = typeof reaction.factor === 'number' && Number.isFinite(reaction.factor) ? reaction.factor : 1;
         const delta = resolved * factor;
         if (delta === 0) continue;
         try {
           const pathSegments = String(reaction.path).split('.');
-          const applyReaction = db.transaction(
-            () => incrementPluginStorage(row.plugin_id, reaction.key, pathSegments, delta)
+          await knex.transaction(
+            (trx) => incrementPluginStorage(row.plugin_id, reaction.key, pathSegments, delta, trx)
           );
-          applyReaction();
         } catch (error) {
           console.error(`Plugin reaction failed (${row.plugin_id} on ${message.event}):`, error.message);
         }
@@ -1519,9 +1528,22 @@ function runDeclarativeReactions(message) {
   }
 }
 
-// Subscribed at module load, before any SSE connection can attach, so
-// reactions run (and storage is up to date) before clients are notified.
-pluginEvents.subscribe(runDeclarativeReactions);
+// Reactions run before the event is broadcast (they used to be the
+// first-registered subscriber, back when the executor was synchronous), so
+// storage is up to date by the time any dashboard is notified — and by the time
+// the route that emitted answers. `pluginEvents.emit()` is synchronous and
+// discards return values, so an async executor can no longer be a plain
+// subscriber: it is invoked and awaited here instead.
+async function emitPluginEvent(event, payload) {
+  if (!pluginEvents.isKnownEvent(event)) {
+    // Mirrors emit()'s own guard so an unknown name is refused identically
+    // rather than silently running reactions for it.
+    pluginEvents.emit(event, payload);
+    return;
+  }
+  await runDeclarativeReactions({ event, payload, emittedAt: new Date().toISOString() });
+  pluginEvents.emit(event, payload);
+}
 
 // --- Chore notification sound bank ---
 
@@ -1627,11 +1649,18 @@ fastify.get('/api/widgets/debug', async (request, reply) => {
       fileDetails = [{ error: dirError.message }];
     }
 
-    const plugins = db.prepare(`
-      SELECT filename, name, source, original_url, LENGTH(content) AS content_length,
-             manifest_json IS NOT NULL AS has_manifest, installed_at, updated_at
-      FROM plugins ORDER BY installed_at, filename
-    `).all();
+    const plugins = await knex('plugins')
+      .select(
+        'filename',
+        'name',
+        'source',
+        'original_url',
+        knex.raw('LENGTH(content) AS content_length'),
+        knex.raw('manifest_json IS NOT NULL AS has_manifest'),
+        'installed_at',
+        'updated_at'
+      )
+      .orderBy([{ column: 'installed_at' }, { column: 'filename' }]);
 
     return {
       plugins,
@@ -1759,7 +1788,7 @@ fastify.post('/api/widgets/github/install', async (request, reply) => {
 
     // Reinstalling refreshes the content in place; provenance is kept so a
     // future "update available" check knows where the plugin came from.
-    const result = installPluginRow({
+    const result = await installPluginRow({
       filename: sanitizedFilename,
       fallbackName: name || sanitizedFilename.replace('.html', ''),
       content,
@@ -1801,7 +1830,13 @@ const dbPath = DEMO_MODE
     : path.resolve(__dirname, 'data', 'tasks.db'));
 console.log('Database path:', dbPath);
 let db; // Declare db variable outside to hold the single instance
+let knex; // Knex/Objection instance, wired alongside the legacy `db` during the ORM migration
 
+// === BEGIN LEGACY SCHEMA UPGRADE (Option A: retained ONLY to lift pre-v14 SQLite
+// databases up to the v14 baseline before Knex adopts them; not used at runtime.
+// Raw better-sqlite3 usage is permitted ONLY within this delimited block. The
+// grep-guard test (tests/db/noRawDb.test.js) enforces that no raw db.prepare/
+// db.exec/db.transaction/new Database usage exists OUTSIDE these markers.) ===
 async function ConnectOrCreateDb() {
   try {
     if (dbPath !== ':memory:') {
@@ -1809,7 +1844,7 @@ async function ConnectOrCreateDb() {
       await fs.chmod(path.dirname(dbPath), 0o777);
     }
 
-    const newDb = new Database(dbPath, { verbose: console.log });
+    const newDb = new Database(dbPath);
     newDb.pragma('foreign_keys = ON');
     // WAL lets readers proceed while a writer is active (better-sqlite3 is still
     // single-threaded, but this avoids POSIX lock stalls across connections).
@@ -1859,8 +1894,11 @@ function runSchemaMigrationModule(migration) {
 }
 
 async function applySchemaMigrations(currentSchemaId) {
+  // Capped at the baseline: Knex owns every schema above v14, and the
+  // post-baseline migrations in db/migrations reproduce 15.. Replaying the raw
+  // legacy modules for those would double-apply their DDL.
   const pendingMigrations = schemaMigrations
-    .filter(migration => migration.schemaId > currentSchemaId)
+    .filter(migration => migration.schemaId > currentSchemaId && migration.schemaId <= BASELINE_SCHEMA_VERSION)
     .sort((a, b) => a.schemaId - b.schemaId);
 
   if (pendingMigrations.length === 0) {
@@ -1873,6 +1911,7 @@ async function applySchemaMigrations(currentSchemaId) {
     runSchemaMigrationModule(migration);
   }
 }
+// === END LEGACY SCHEMA UPGRADE ===
 
 async function dailyBackgroundProcessing() {
   try {
@@ -1890,29 +1929,37 @@ async function dailyBackgroundProcessing() {
     // against completion rates or streaks.
     try {
       const missedDate = addDaysToDateOnly(today, -1);
-      if (isVacationActiveOn(missedDate)) {
+      if (await isVacationActiveOn(missedDate)) {
         console.log(`Vacation mode active for ${missedDate} — skipping missed-chore logging`);
         results = { ...results, missedLoggedCount: 0, missedSkippedForVacation: true };
       } else {
         const endOfMissedDay = parseDateOnlyToLocalDate(missedDate);
         endOfMissedDay.setHours(23, 59, 59, 999);
 
-        const insertMissed = db.prepare(
-          "INSERT OR IGNORE INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, ?, ?, 0, ?, 'missed')"
-        );
-
         let missedLoggedCount = 0;
         const missedRows = [];
-        const allUsers = db.prepare('SELECT id FROM users WHERE id != 0').all();
+        const allUsers = await knex('users').select('id').whereNot('id', 0);
         for (const user of allUsers) {
-          const dueChores = getTodaysRegularChoresForUser(user.id, missedDate, endOfMissedDay);
+          const dueChores = await getTodaysRegularChoresForUser(user.id, missedDate, endOfMissedDay);
           for (const schedule of dueChores) {
             if (schedule.completed_today) continue;
-            const info = insertMissed.run(user.id, schedule.id, missedDate, schedule.title);
-            if (info.changes > 0) {
-              missedLoggedCount++;
-              missedRows.push({ userId: user.id, scheduleId: schedule.id, title: schedule.title, date: missedDate });
-            }
+            // Idempotent, as the old INSERT OR IGNORE against the partial unique
+            // index on (user_id, chore_schedule_id, date) WHERE kind='missed'
+            // was: an already-logged miss is skipped and not counted.
+            const alreadyLogged = await knex('chore_history')
+              .where({ user_id: user.id, chore_schedule_id: schedule.id, date: missedDate, kind: 'missed' })
+              .first();
+            if (alreadyLogged) continue;
+            await knex('chore_history').insert({
+              user_id: user.id,
+              chore_schedule_id: schedule.id,
+              date: missedDate,
+              clam_value: 0,
+              title: schedule.title,
+              kind: 'missed',
+            });
+            missedLoggedCount++;
+            missedRows.push({ userId: user.id, scheduleId: schedule.id, title: schedule.title, date: missedDate });
           }
         }
         console.log(`Logged ${missedLoggedCount} missed chore(s) for ${missedDate}`);
@@ -1926,24 +1973,23 @@ async function dailyBackgroundProcessing() {
     // We want to delete schedules that are completed and will never run again to avoid clutter.
     // kind = 'completion' is load-bearing (issue #72): a 'missed' row must not
     // make an UNcompleted one-time chore look completed and get it pruned.
-    const schedulesToPrune = db.prepare(`
-      SELECT cs.id, cs.chore_id, cs.user_id, c.title
-      FROM chore_schedules cs
-      JOIN chores c ON cs.chore_id = c.id
-      WHERE cs.crontab IS NULL
-        AND cs.visible = 1
-        AND EXISTS (
-          SELECT 1 FROM chore_history ch
-          WHERE ch.chore_schedule_id = cs.id
-            AND ch.kind = 'completion'
-        )
-    `).all();
+    const schedulesToPrune = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.id', 'cs.chore_id', 'cs.user_id', 'c.title')
+      .whereNull('cs.crontab')
+      .where('cs.visible', 1)
+      .whereExists(
+        knex('chore_history as ch')
+          .select(knex.raw('1'))
+          .whereRaw('ch.chore_schedule_id = cs.id')
+          .where('ch.kind', 'completion')
+      );
     console.log(`Found ${schedulesToPrune.length} completed one-time chores to prune`);
 
     let prunedScheduleCount = 0;
     for (const schedule of schedulesToPrune) {
 
-      db.prepare('DELETE FROM chore_schedules WHERE id = ?').run(schedule.id);
+      await knex('chore_schedules').where('id', schedule.id).del();
       console.log(`Pruned schedule ID ${schedule.id}: "${schedule.title}" (user_id: ${schedule.user_id})`);
       prunedScheduleCount++;
     }
@@ -1954,20 +2000,14 @@ async function dailyBackgroundProcessing() {
     }
 
     // We should also delete chores that have no schedules to avoid clutter
-    const choresToPrune = db.prepare(`
-      SELECT c.id, c.title
-      FROM chores c
-      WHERE NOT EXISTS (
-          SELECT 1
-          FROM chore_schedules cs
-          WHERE cs.chore_id = c.id
-      );
-    `).all();
+    const choresToPrune = await knex('chores as c')
+      .select('c.id', 'c.title')
+      .whereRaw('NOT EXISTS (SELECT 1 FROM chore_schedules cs WHERE cs.chore_id = c.id)');
     console.log(`Found ${choresToPrune.length} orphaned chores to prune`);
 
     let prunedChoreCount = 0;
     for (const chore of choresToPrune) {
-      db.prepare('DELETE FROM chores WHERE id = ?').run(chore.id);
+      await knex('chores').where('id', chore.id).del();
       console.log(`Pruned chore ID ${chore.id}: "${chore.title}"`);
       prunedChoreCount++;
     }
@@ -1978,21 +2018,17 @@ async function dailyBackgroundProcessing() {
     }
 
     // bonus chores that persist from day to day should reset to unassigned
-    const choresToReset = db.prepare(`
-      SELECT cs.id,
-        cs.user_id,
-        c.title
-      FROM chore_schedules cs
-      JOIN chores c ON cs.chore_id = c.id
-      WHERE cs.crontab IS NULL
-        AND cs.visible = 1
-        AND cs.user_id IS NOT NULL
-        AND c.clam_value > 0;
-    `).all();
+    const choresToReset = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.id', 'cs.user_id', 'c.title')
+      .whereNull('cs.crontab')
+      .where('cs.visible', 1)
+      .whereNotNull('cs.user_id')
+      .where('c.clam_value', '>', 0);
     console.log(`Found ${choresToReset.length} bonus chores to reset`);
     let resetScheduleCount = 0;
     for (const schedule of choresToReset) {
-      db.prepare('UPDATE chore_schedules set user_id = NULL WHERE id = ?').run(schedule.id);
+      await knex('chore_schedules').where('id', schedule.id).update({ user_id: null });
       console.log(`Reset schedule ID ${schedule.id}: "${schedule.title}" (user_id: ${schedule.user_id})`);
       resetScheduleCount++;
     }
@@ -2004,30 +2040,35 @@ async function dailyBackgroundProcessing() {
 
 
     // Handle sticky schedules: create one-time children for until-completed and once-completed parents that trigger today.
-    const stickyParentSchedules = db.prepare(`
-      SELECT cs.id, cs.chore_id, cs.user_id, cs.crontab, cs.duration, cs.interval,
-             cs.created_at, cs.due_date, cs.due_time, cs.sound_enabled, cs.sound, cs.reminder_interval_minutes
-      FROM chore_schedules cs
-      WHERE cs.crontab IS NOT NULL
-        AND cs.duration IN ('until-completed', 'once-completed')
-        AND cs.visible = 1
-        AND NOT EXISTS (
-          SELECT 1 FROM chore_schedules child
-          WHERE child.crontab IS NULL
-            AND child.visible = 1
-            AND (
-              child.parent_schedule_id = cs.id
-              OR (
-                child.parent_schedule_id IS NULL
-                AND child.chore_id = cs.chore_id
-                AND (
-                  (child.user_id = cs.user_id)
-                  OR (child.user_id IS NULL AND cs.user_id IS NULL)
-                )
-              )
-            )
-        )
-    `).all();
+    const stickyParentSchedules = await knex('chore_schedules as cs')
+      .select(
+        'cs.id', 'cs.chore_id', 'cs.user_id', 'cs.crontab', 'cs.duration', 'cs.interval',
+        'cs.created_at', 'cs.due_date', 'cs.due_time', 'cs.sound_enabled', 'cs.sound',
+        'cs.reminder_interval_minutes'
+      )
+      .whereNotNull('cs.crontab')
+      .whereIn('cs.duration', ['until-completed', 'once-completed'])
+      .where('cs.visible', 1)
+      .whereNotExists(
+        knex('chore_schedules as child')
+          .select(knex.raw('1'))
+          .whereNull('child.crontab')
+          .where('child.visible', 1)
+          .where((builder) => {
+            builder
+              .whereRaw('child.parent_schedule_id = cs.id')
+              .orWhere((inner) => {
+                inner
+                  .whereNull('child.parent_schedule_id')
+                  .whereRaw('child.chore_id = cs.chore_id')
+                  .where((owner) => {
+                    owner
+                      .whereRaw('child.user_id = cs.user_id')
+                      .orWhereRaw('(child.user_id IS NULL AND cs.user_id IS NULL)');
+                  });
+              });
+          })
+      );
     console.log(`Found ${stickyParentSchedules.length} sticky schedules to check`);
 
     const startOfToday = new Date();
@@ -2055,23 +2096,23 @@ async function dailyBackgroundProcessing() {
           ? (schedule.due_date || null)
           : addDaysToDateOnly(today, dueDateOffset);
 
-        const scheduleResult = db.prepare(`
-          INSERT INTO chore_schedules (
-            chore_id, user_id, crontab, duration, visible, parent_schedule_id,
-            due_date, due_time, sound_enabled, sound, reminder_interval_minutes
-          )
-          VALUES (?, ?, NULL, 'day-of', 1, ?, ?, ?, ?, ?, ?)
-          RETURNING *
-        `).get(
-          schedule.chore_id,
-          schedule.user_id,
-          schedule.id,
-          childDueDate,
-          schedule.due_time || null,
-          schedule.sound_enabled ? 1 : 0,
-          schedule.sound || null,
-          schedule.reminder_interval_minutes || null
-        );
+        const [insertedChildId] = await knex('chore_schedules')
+          .insert({
+            chore_id: schedule.chore_id,
+            user_id: schedule.user_id,
+            crontab: null,
+            duration: 'day-of',
+            visible: 1,
+            parent_schedule_id: schedule.id,
+            due_date: childDueDate,
+            due_time: schedule.due_time || null,
+            sound_enabled: schedule.sound_enabled ? 1 : 0,
+            sound: schedule.sound || null,
+            reminder_interval_minutes: schedule.reminder_interval_minutes || null,
+          });
+        // Read the row back so the response carries every column (including the
+        // DB-side defaults), matching the old INSERT ... RETURNING *.
+        const scheduleResult = await knex('chore_schedules').where('id', insertedChildId).first();
 
         triggeredSchedules.push(scheduleResult);
         stickySchedulesCreated++;
@@ -2124,8 +2165,8 @@ function parseTabConfigJson(configJson) {
   return parseJsonObject(configJson, {});
 }
 
-function getDeviceUpdateTimeMs(deviceName) {
-  const row = db.prepare('SELECT updateTime FROM devices WHERE name = ?').get(deviceName);
+async function getDeviceUpdateTimeMs(deviceName) {
+  const row = await knex('devices').select('updateTime').where('name', deviceName).first();
   if (!row?.updateTime) return null;
   const timestamp = Date.parse(row.updateTime);
   return Number.isFinite(timestamp) ? timestamp : null;
@@ -2193,24 +2234,26 @@ function parseAssignmentId(assignmentId) {
   return { tabNumber, widgetName };
 }
 
-function getTabsForDevice(deviceName) {
-  return db
-    .prepare('SELECT id, device_name, number, label, icon, show_label, created_at, config_json FROM tabs WHERE device_name = ? ORDER BY number ASC')
-    .all(deviceName);
+async function getTabsForDevice(deviceName) {
+  return knex('tabs')
+    .select('id', 'device_name', 'number', 'label', 'icon', 'show_label', 'created_at', 'config_json')
+    .where('device_name', deviceName)
+    .orderBy('number', 'asc');
 }
 
-function getTabByNumber(deviceName, tabNumber) {
-  return db
-    .prepare('SELECT id, device_name, number, label, icon, show_label, created_at, config_json FROM tabs WHERE device_name = ? AND number = ?')
-    .get(deviceName, tabNumber);
+async function getTabByNumber(deviceName, tabNumber) {
+  return knex('tabs')
+    .select('id', 'device_name', 'number', 'label', 'icon', 'show_label', 'created_at', 'config_json')
+    .where({ device_name: deviceName, number: tabNumber })
+    .first();
 }
 
-function saveTabConfigById(tabId, layoutMap) {
-  db.prepare('UPDATE tabs SET config_json = ? WHERE id = ?').run(JSON.stringify(layoutMap), tabId);
+async function saveTabConfigById(tabId, layoutMap) {
+  await knex('tabs').where('id', tabId).update({ config_json: JSON.stringify(layoutMap) });
 }
 
-function listWidgetAssignmentsFromTabLayouts(deviceName) {
-  const tabs = getTabsForDevice(deviceName);
+async function listWidgetAssignmentsFromTabLayouts(deviceName) {
+  const tabs = await getTabsForDevice(deviceName);
   const rows = [];
 
   tabs.forEach((tab) => {
@@ -2233,12 +2276,12 @@ function listWidgetAssignmentsFromTabLayouts(deviceName) {
   return rows;
 }
 
-function ensureHomeTabExists(deviceName) {
+async function ensureHomeTabExists(deviceName, ex = knex) {
   // Insert default home tab if it doesn't exist
   try {
-    const homeTab = db.prepare('SELECT id FROM tabs WHERE number = 1 AND device_name = ?').get(deviceName);
+    const homeTab = await ex('tabs').select('id').where({ number: 1, device_name: deviceName }).first();
     if (!homeTab) {
-      db.prepare('INSERT INTO tabs (label, icon, show_label, number, device_name, config_json) VALUES (?, ?, ?, ?, ?, ?)').run('Home', 'home', 1, 1, deviceName, '{}');
+      await ex('tabs').insert({ label: 'Home', icon: 'home', show_label: 1, number: 1, device_name: deviceName, config_json: '{}' });
       console.log('Default home tab created');
     }
   } catch (error) {
@@ -2246,8 +2289,8 @@ function ensureHomeTabExists(deviceName) {
   }
 }
 
-function doesDeviceExist(deviceName) {
-  const device = db.prepare('SELECT name FROM devices WHERE name = ?').get(deviceName);
+async function doesDeviceExist(deviceName) {
+  const device = await knex('devices').select('name').where('name', deviceName).first();
   return !!device;
 }
 
@@ -2266,20 +2309,20 @@ function buildDefaultHomeTab(deviceName) {
   // endRegion #98
 }
 
-function ensureDeviceExists(deviceName) {
-  db.prepare('INSERT OR IGNORE INTO devices (name, updateTime) VALUES (?, CURRENT_TIMESTAMP)').run(deviceName);
-  ensureHomeTabExists(deviceName);
+async function ensureDeviceExists(deviceName, ex = knex) {
+  await ex('devices').insert({ name: deviceName, updateTime: ex.raw('CURRENT_TIMESTAMP') }).onConflict('name').ignore();
+  await ensureHomeTabExists(deviceName, ex);
 }
-function touchDeviceUpdateTime(deviceName) {
-  db.prepare('UPDATE devices SET updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(deviceName);
+async function touchDeviceUpdateTime(deviceName, ex = knex) {
+  await ex('devices').where('name', deviceName).update({ updateTime: ex.raw('CURRENT_TIMESTAMP') });
 }
 
 // Devices API Endpoints
 fastify.get('/api/devices', async (request, reply) => {
   try {
-    const devices = db.prepare('SELECT name, updateTime FROM devices ORDER BY updateTime DESC').all();
-    return devices.map((device) => {
-      const tabs = getTabsForDevice(device.name);
+    const devices = await knex('devices').select('name', 'updateTime').orderBy('updateTime', 'desc');
+    return Promise.all(devices.map(async (device) => {
+      const tabs = await getTabsForDevice(device.name);
       const widgetCount = tabs.reduce((count, tab) => {
         const layoutMap = parseTabConfigJson(tab.config_json);
         return count + Object.keys(layoutMap).length;
@@ -2289,7 +2332,7 @@ fastify.get('/api/devices', async (request, reply) => {
         ...device,
         widgets: widgetCount,
       };
-    });
+    }));
   } catch (error) {
     console.error('Error fetching devices:', error);
     reply.status(500).send({ error: 'Failed to fetch devices' });
@@ -2303,8 +2346,8 @@ fastify.get('/api/devices/:deviceName/settings', async (request, reply) => {
   }
 
   try {
-    const row = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(deviceName);
-    const lastModifiedMs = getDeviceUpdateTimeMs(deviceName);
+    const row = await knex('devices').select('device_settings_json').where('name', deviceName).first();
+    const lastModifiedMs = await getDeviceUpdateTimeMs(deviceName);
     if (!row) {
       return sendJsonWithConditionalCache(request, reply, {}, null);
     }
@@ -2328,15 +2371,12 @@ const upsertDeviceSettings = async (request, reply) => {
   }
 
   try {
-    ensureDeviceExists(deviceName);
-    const row = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(deviceName);
+    await ensureDeviceExists(deviceName);
+    const row = await knex('devices').select('device_settings_json').where('name', deviceName).first();
     const existingSettings = parseJsonObject(row?.device_settings_json, {});
     const merged = { ...existingSettings, ...incoming };
 
-    db.prepare('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(
-      JSON.stringify(merged),
-      deviceName
-    );
+    await knex('devices').where('name', deviceName).update({ device_settings_json: JSON.stringify(merged), updateTime: knex.raw('CURRENT_TIMESTAMP') });
 
     return merged;
   } catch (error) {
@@ -2368,17 +2408,17 @@ fastify.patch('/api/devices/:deviceName', async (request, reply) => {
   }
 
   try {
-    const existingDevice = db.prepare('SELECT name FROM devices WHERE name = ?').get(deviceName);
+    const existingDevice = await knex('devices').select('name').where('name', deviceName).first();
     if (!existingDevice) {
       return reply.status(404).send({ error: 'Device not found' });
     }
 
-    const alreadyUsed = db.prepare('SELECT name FROM devices WHERE name = ?').get(trimmedNewName);
+    const alreadyUsed = await knex('devices').select('name').where('name', trimmedNewName).first();
     if (alreadyUsed) {
       return reply.status(409).send({ error: 'A device with that name already exists' });
     }
 
-    db.prepare('UPDATE devices SET name = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(trimmedNewName, deviceName);
+    await knex('devices').where('name', deviceName).update({ name: trimmedNewName, updateTime: knex.raw('CURRENT_TIMESTAMP') });
     return { success: true, name: trimmedNewName, message: 'Device name updated successfully' };
   } catch (error) {
     console.error('Error updating device name:', error);
@@ -2398,35 +2438,34 @@ fastify.post('/api/devices/:deviceName/copy-from/:sourceDeviceName', async (requ
   }
 
   try {
-    const sourceExists = db.prepare('SELECT name FROM devices WHERE name = ?').get(sourceDeviceName);
+    const sourceExists = await knex('devices').select('name').where('name', sourceDeviceName).first();
     if (!sourceExists) {
       return reply.status(404).send({ error: 'Source device not found' });
     }
 
-    ensureDeviceExists(deviceName);
-    const sourceDeviceSettings = db.prepare('SELECT device_settings_json FROM devices WHERE name = ?').get(sourceDeviceName);
+    await ensureDeviceExists(deviceName);
+    const sourceDeviceSettings = await knex('devices').select('device_settings_json').where('name', sourceDeviceName).first();
 
-    const copyTransaction = db.transaction(() => {
-      db.prepare('DELETE FROM tabs WHERE device_name = ?').run(deviceName);
+    await knex.transaction(async (trx) => {
+      await trx('tabs').where('device_name', deviceName).del();
 
-      db.prepare(`
+      await trx.raw(`
         INSERT INTO tabs (device_name, label, icon, show_label, number, created_at, config_json)
         SELECT ?, label, icon, show_label, number, created_at, COALESCE(config_json, '{}')
         FROM tabs
         WHERE device_name = ?
         ORDER BY number ASC
-      `).run(deviceName, sourceDeviceName);
+      `, [deviceName, sourceDeviceName]);
 
-      db.prepare('UPDATE devices SET device_settings_json = ?, updateTime = CURRENT_TIMESTAMP WHERE name = ?').run(
-        sourceDeviceSettings?.device_settings_json || '{}',
-        deviceName
-      );
+      await trx('devices').where('name', deviceName).update({
+        device_settings_json: sourceDeviceSettings?.device_settings_json || '{}',
+        updateTime: trx.raw('CURRENT_TIMESTAMP'),
+      });
 
-      ensureHomeTabExists(deviceName);
-      touchDeviceUpdateTime(deviceName);
+      await ensureHomeTabExists(deviceName, trx);
+      await touchDeviceUpdateTime(deviceName, trx);
     });
 
-    copyTransaction();
     return { success: true, message: 'Device tabs and widget settings copied successfully' };
   } catch (error) {
     console.error('Error copying device data:', error);
@@ -2442,8 +2481,7 @@ fastify.delete('/api/devices/:deviceName', async (request, reply) => {
   }
 
   try {
-    const stmt = db.prepare('DELETE FROM devices WHERE name = ?');
-    const result = stmt.run(deviceName);
+    const result = { changes: await Device.query().deleteById(deviceName) };
 
     if (result.changes === 0) {
       return reply.status(404).send({ error: 'Device not found' });
@@ -2473,7 +2511,7 @@ function normalizeChoreIcon(icon) {
 // Chore routes (updated for new schema)
 fastify.get('/api/chores', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM chores').all();
+    const rows = await Chore.query();
     return rows;
   } catch (error) {
     console.error('Error fetching chores:', error);
@@ -2484,11 +2522,15 @@ fastify.get('/api/chores', async (request, reply) => {
 fastify.post('/api/chores', async (request, reply) => {
   const { title, description, clam_value, icon } = request.body;
   try {
-    const stmt = db.prepare('INSERT INTO chores (title, description, clam_value, icon) VALUES (?, ?, ?, ?)');
     // Empty string and undefined both mean "no icon"; store NULL so the widget
     // has a single falsy case to check (issue #141).
-    const info = stmt.run(title, description, clam_value || 0, normalizeChoreIcon(icon));
-    return { id: info.lastInsertRowid, success: true };
+    const inserted = await Chore.query().insert({
+      title,
+      description,
+      clam_value: clam_value || 0,
+      icon: normalizeChoreIcon(icon),
+    });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding chore:', error);
     reply.status(500).send({ error: 'Failed to add chore' });
@@ -2499,9 +2541,10 @@ fastify.patch('/api/chores/:id', async (request, reply) => {
   const { id } = request.params;
   const { title, description, clam_value, icon } = request.body;
   try {
-    const stmt = db.prepare('UPDATE chores SET title = ?, description = ?, clam_value = ?, icon = ? WHERE id = ?');
-    const info = stmt.run(title, description, clam_value, normalizeChoreIcon(icon), id);
-    if (info.changes === 0) {
+    const updated = await Chore.query()
+      .patch({ title, description, clam_value, icon: normalizeChoreIcon(icon) })
+      .where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Chore not found' });
     }
     return { success: true };
@@ -2514,10 +2557,11 @@ fastify.patch('/api/chores/:id', async (request, reply) => {
 fastify.delete('/api/chores/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    db.prepare('DELETE FROM chore_schedules WHERE chore_id = ?').run(id);
-    const stmt = db.prepare('DELETE FROM chores WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    // chore_schedules.chore_id has ON DELETE CASCADE (and chore_history.
+    // chore_schedule_id ON DELETE SET NULL), so deleting the chore removes its
+    // schedules automatically.
+    const deleted = await Chore.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Chore not found' });
     }
     return { success: true, message: 'Chore deleted successfully' };
@@ -2531,35 +2575,25 @@ fastify.delete('/api/chores/:id', async (request, reply) => {
 fastify.get('/api/chore-schedules', async (request, reply) => {
   try {
     const { user_id, visible, usage, chore_id } = request.query;
-    let query = 'SELECT cs.*, c.title, c.description, c.clam_value, c.icon FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id';
-    const conditions = [];
-    const params = [];
+    const query = knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.title', 'c.description', 'c.clam_value', 'c.icon');
 
     if (user_id !== undefined) {
-      conditions.push('cs.user_id = ?');
-      params.push(user_id);
+      query.where('cs.user_id', user_id);
     }
     if (visible !== undefined) {
-      conditions.push('cs.visible = ?');
-      params.push(visible === 'true' || visible === '1' ? 1 : 0);
+      query.where('cs.visible', visible === 'true' || visible === '1' ? 1 : 0);
     }
     if (usage !== undefined && usage === 'chart') {
-      conditions.push('cs.visible = ?');
-      params.push(1);
-      conditions.push('(cs.duration IS NULL OR cs.duration NOT IN (?, ?))');
-      params.push('until-completed', 'once-completed');
+      query.where('cs.visible', 1);
+      query.whereRaw('(cs.duration IS NULL OR cs.duration NOT IN (?, ?))', ['until-completed', 'once-completed']);
     }
     if (chore_id !== undefined) {
-      conditions.push('cs.chore_id = ?');
-      params.push(chore_id);
+      query.where('cs.chore_id', chore_id);
     }
 
-    if (conditions.length > 0) {
-      query += ' WHERE ' + conditions.join(' AND ');
-    }
-
-    const rows = db.prepare(query).all(...params);
-    return rows;
+    return await query;
   } catch (error) {
     console.error('Error fetching chore schedules:', error);
     reply.status(500).send({ error: 'Failed to fetch chore schedules' });
@@ -2569,7 +2603,11 @@ fastify.get('/api/chore-schedules', async (request, reply) => {
 fastify.get('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const row = db.prepare('SELECT cs.*, c.title, c.description, c.clam_value FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id WHERE cs.id = ?').get(id);
+    const row = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.title', 'c.description', 'c.clam_value')
+      .where('cs.id', id)
+      .first();
     if (!row) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -2627,32 +2665,31 @@ fastify.post('/api/chore-schedules', async (request, reply) => {
       if (Number.isNaN(parsedParentScheduleId)) {
         return reply.status(400).send({ error: 'parent_schedule_id must be a number' });
       }
-      const parentExists = db.prepare('SELECT id FROM chore_schedules WHERE id = ?').get(parsedParentScheduleId);
+      const parentExists = await ChoreSchedule.query().findById(parsedParentScheduleId);
       if (!parentExists) {
         return reply.status(400).send({ error: 'parent_schedule_id must reference an existing schedule' });
       }
       normalizedParentScheduleId = parsedParentScheduleId;
     }
 
-    const stmt = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, crontab, duration, visible, interval, parent_schedule_id, due_time, sound, sound_enabled, reminder_interval_minutes, due_date, transferable, can_snooze, snoozed_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(
+    const inserted = await ChoreSchedule.query().insert({
       chore_id,
-      user_id || null,
-      crontab || null,
-      normalizedDuration,
-      visible !== undefined ? visible : 1,
-      normalizedDuration === 'once-completed' ? normalizedInterval : null,
-      normalizedParentScheduleId,
-      dueTimeResult.value,
-      sound || null,
-      sound_enabled ? 1 : 0,
-      reminderResult.value,
-      dueDateResult.value,
-      transferable !== undefined ? (transferable ? 1 : 0) : 1,
-      can_snooze !== undefined ? (can_snooze ? 1 : 0) : 1,
-      snoozedUntilResult.value
-    );
-    return { id: info.lastInsertRowid, success: true };
+      user_id: user_id || null,
+      crontab: crontab || null,
+      duration: normalizedDuration,
+      visible: visible !== undefined ? visible : 1,
+      interval: normalizedDuration === 'once-completed' ? normalizedInterval : null,
+      parent_schedule_id: normalizedParentScheduleId,
+      due_time: dueTimeResult.value,
+      sound: sound || null,
+      sound_enabled: sound_enabled ? 1 : 0,
+      reminder_interval_minutes: reminderResult.value,
+      due_date: dueDateResult.value,
+      transferable: transferable !== undefined ? (transferable ? 1 : 0) : 1,
+      can_snooze: can_snooze !== undefined ? (can_snooze ? 1 : 0) : 1,
+      snoozed_until: snoozedUntilResult.value,
+    });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding schedule:', error);
     reply.status(500).send({ error: 'Failed to add schedule' });
@@ -2678,12 +2715,22 @@ fastify.post('/api/chore-schedules/bulk', async (request, reply) => {
       }
     }
 
-    const stmt = db.prepare('INSERT INTO chore_schedules (chore_id, user_id, crontab, visible, due_time, sound, sound_enabled, reminder_interval_minutes, due_date, transferable, can_snooze) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const ids = [];
-
     for (const user_id of user_ids) {
-      const info = stmt.run(chore_id, user_id, crontab || null, visible !== undefined ? visible : 1, dueTimeResult.value, sound || null, sound_enabled ? 1 : 0, reminderResult.value, dueDateResult.value, transferable !== undefined ? (transferable ? 1 : 0) : 1, can_snooze !== undefined ? (can_snooze ? 1 : 0) : 1);
-      ids.push(info.lastInsertRowid);
+      const inserted = await ChoreSchedule.query().insert({
+        chore_id,
+        user_id,
+        crontab: crontab || null,
+        visible: visible !== undefined ? visible : 1,
+        due_time: dueTimeResult.value,
+        sound: sound || null,
+        sound_enabled: sound_enabled ? 1 : 0,
+        reminder_interval_minutes: reminderResult.value,
+        due_date: dueDateResult.value,
+        transferable: transferable !== undefined ? (transferable ? 1 : 0) : 1,
+        can_snooze: can_snooze !== undefined ? (can_snooze ? 1 : 0) : 1,
+      });
+      ids.push(inserted.id);
     }
 
     return { ids, success: true, count: ids.length };
@@ -2729,7 +2776,10 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       }
     }
 
-    const existingSchedule = db.prepare('SELECT id, user_id, crontab, duration, interval, snoozed_until FROM chore_schedules WHERE id = ?').get(id);
+    const existingSchedule = await knex('chore_schedules')
+      .select('id', 'user_id', 'crontab', 'duration', 'interval', 'snoozed_until')
+      .where('id', id)
+      .first();
     if (!existingSchedule) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -2752,20 +2802,18 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       return reply.status(400).send({ error: 'interval is only allowed for once-completed schedules' });
     }
 
-    const updates = [];
-    const params = [];
+    const patch = {};
 
-    if (chore_id !== undefined) { updates.push('chore_id = ?'); params.push(chore_id); }
-    if (user_id !== undefined) { updates.push('user_id = ?'); params.push(user_id || null); }
-    if (crontab !== undefined) { updates.push('crontab = ?'); params.push(crontab || null); }
-    if (duration !== undefined) { updates.push('duration = ?'); params.push(nextDuration); }
+    if (chore_id !== undefined) { patch.chore_id = chore_id; }
+    if (user_id !== undefined) { patch.user_id = user_id || null; }
+    if (crontab !== undefined) { patch.crontab = crontab || null; }
+    if (duration !== undefined) { patch.duration = nextDuration; }
     if (interval !== undefined || duration !== undefined) {
-      updates.push('interval = ?');
-      params.push(nextDuration === 'once-completed' ? nextInterval : null);
+      patch.interval = nextDuration === 'once-completed' ? nextInterval : null;
     }
     if (parent_schedule_id !== undefined) {
       if (parent_schedule_id === null || parent_schedule_id === '') {
-        updates.push('parent_schedule_id = NULL');
+        patch.parent_schedule_id = null;
       } else {
         const parsedParentScheduleId = parseInt(parent_schedule_id, 10);
         if (Number.isNaN(parsedParentScheduleId)) {
@@ -2774,34 +2822,31 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
         if (parsedParentScheduleId === parseInt(id, 10)) {
           return reply.status(400).send({ error: 'A schedule cannot reference itself as parent_schedule_id' });
         }
-        const parentExists = db.prepare('SELECT id FROM chore_schedules WHERE id = ?').get(parsedParentScheduleId);
+        const parentExists = await ChoreSchedule.query().findById(parsedParentScheduleId);
         if (!parentExists) {
           return reply.status(400).send({ error: 'parent_schedule_id must reference an existing schedule' });
         }
-        updates.push('parent_schedule_id = ?');
-        params.push(parsedParentScheduleId);
+        patch.parent_schedule_id = parsedParentScheduleId;
       }
     }
-    if (visible !== undefined) { updates.push('visible = ?'); params.push(visible ? 1 : 0); }
-    if (due_time !== undefined) { updates.push('due_time = ?'); params.push(dueTimeResult.value); }
-    if (sound !== undefined) { updates.push('sound = ?'); params.push(sound || null); }
-    if (sound_enabled !== undefined) { updates.push('sound_enabled = ?'); params.push(sound_enabled ? 1 : 0); }
-    if (reminder_interval_minutes !== undefined) { updates.push('reminder_interval_minutes = ?'); params.push(reminderResult.value); }
-    if (due_date !== undefined) { updates.push('due_date = ?'); params.push(dueDateResult.value); }
-    if (transferable !== undefined) { updates.push('transferable = ?'); params.push(transferable ? 1 : 0); }
-    if (can_snooze !== undefined) { updates.push('can_snooze = ?'); params.push(can_snooze ? 1 : 0); }
-    if (snoozed_until !== undefined) { updates.push('snoozed_until = ?'); params.push(snoozedUntilResult.value); }
-    if (transfer_bonus_clams !== undefined) { updates.push('transfer_bonus_clams = ?'); params.push(normalizedTransferBonus); }
+    if (visible !== undefined) { patch.visible = visible ? 1 : 0; }
+    if (due_time !== undefined) { patch.due_time = dueTimeResult.value; }
+    if (sound !== undefined) { patch.sound = sound || null; }
+    if (sound_enabled !== undefined) { patch.sound_enabled = sound_enabled ? 1 : 0; }
+    if (reminder_interval_minutes !== undefined) { patch.reminder_interval_minutes = reminderResult.value; }
+    if (due_date !== undefined) { patch.due_date = dueDateResult.value; }
+    if (transferable !== undefined) { patch.transferable = transferable ? 1 : 0; }
+    if (can_snooze !== undefined) { patch.can_snooze = can_snooze ? 1 : 0; }
+    if (snoozed_until !== undefined) { patch.snoozed_until = snoozedUntilResult.value; }
+    if (transfer_bonus_clams !== undefined) { patch.transfer_bonus_clams = normalizedTransferBonus; }
 
-    if (updates.length === 0) {
+    if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
     }
 
-    params.push(id);
-    const stmt = db.prepare(`UPDATE chore_schedules SET ${updates.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...params);
+    const updated = await ChoreSchedule.query().patch(patch).where({ id });
 
-    if (info.changes === 0) {
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
 
@@ -2820,15 +2865,15 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
       if (previousUserId !== nextUserId) {
         const today = getTodayLocalDateString();
         if (previousUserId) {
-          awardDailyRegularBonusIfDue(previousUserId, today);
+          await awardDailyRegularBonusIfDue(previousUserId, today);
         }
         if (nextUserId) {
           if (revoke_daily_bonus === true) {
-            revokeDailyRegularBonus(nextUserId, today);
+            await revokeDailyRegularBonus(nextUserId, today);
           }
           // Revoke-then-award is idempotent: if the receiver's due set is
           // somehow still complete, the bonus is immediately re-awarded.
-          awardDailyRegularBonusIfDue(nextUserId, today);
+          await awardDailyRegularBonusIfDue(nextUserId, today);
         }
       }
     }
@@ -2839,7 +2884,7 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
     if (snoozed_until !== undefined) {
       const assigneeId = user_id !== undefined ? (user_id || null) : existingSchedule.user_id;
       if (assigneeId) {
-        awardDailyRegularBonusIfDue(assigneeId, getTodayLocalDateString());
+        await awardDailyRegularBonusIfDue(assigneeId, getTodayLocalDateString());
       }
     }
 
@@ -2853,9 +2898,8 @@ fastify.patch('/api/chore-schedules/:id', async (request, reply) => {
 fastify.delete('/api/chore-schedules/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM chore_schedules WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await ChoreSchedule.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
     return { success: true, message: 'Schedule deleted successfully' };
@@ -2869,35 +2913,16 @@ fastify.delete('/api/chore-schedules/:id', async (request, reply) => {
 fastify.get('/api/chore-history', async (request, reply) => {
   try {
     const { user_id, date, date_from, date_to } = request.query;
-    let query = 'SELECT * FROM chore_history';
-    const conditions = [];
-    const params = [];
+    const query = knex('chore_history');
 
-    if (user_id !== undefined) {
-      conditions.push('user_id = ?');
-      params.push(user_id);
-    }
-    if (date) {
-      conditions.push('date = ?');
-      params.push(date);
-    }
-    if (date_from) {
-      conditions.push('date >= ?');
-      params.push(date_from);
-    }
-    if (date_to) {
-      conditions.push('date <= ?');
-      params.push(date_to);
-    }
+    if (user_id !== undefined) query.where('user_id', user_id);
+    if (date) query.where('date', date);
+    if (date_from) query.where('date', '>=', date_from);
+    if (date_to) query.where('date', '<=', date_to);
 
-    if (conditions.length > 0) {
-      query += ' WHERE ' + conditions.join(' AND ');
-    }
+    query.orderBy([{ column: 'date', order: 'desc' }, { column: 'created_at', order: 'desc' }]);
 
-    query += ' ORDER BY date DESC, created_at DESC';
-
-    const rows = db.prepare(query).all(...params);
-    return rows;
+    return await query;
   } catch (error) {
     console.error('Error fetching chore history:', error);
     reply.status(500).send({ error: 'Failed to fetch chore history' });
@@ -2907,7 +2932,9 @@ fastify.get('/api/chore-history', async (request, reply) => {
 fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const rows = db.prepare('SELECT * FROM chore_history WHERE user_id = ? ORDER BY date DESC, created_at DESC').all(userId);
+    const rows = await knex('chore_history')
+      .where('user_id', userId)
+      .orderBy([{ column: 'date', order: 'desc' }, { column: 'created_at', order: 'desc' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching user history:', error);
@@ -2918,8 +2945,8 @@ fastify.get('/api/chore-history/user/:userId', async (request, reply) => {
 fastify.get('/api/chore-history/summary/:userId', async (request, reply) => {
   const { userId } = request.params;
   try {
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(userId);
-    return { user_id: parseInt(userId), clam_total: result.total };
+    const total = await getUserClamTotal(userId);
+    return { user_id: parseInt(userId), clam_total: total };
   } catch (error) {
     console.error('Error getting clam summary:', error);
     reply.status(500).send({ error: 'Failed to get clam summary' });
@@ -2939,9 +2966,14 @@ fastify.post('/api/chore-history', async (request, reply) => {
     }
     const rowKind = kind || (chore_schedule_id ? 'completion' : 'adjustment');
 
-    const stmt = db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, kind) VALUES (?, ?, ?, ?, ?)');
-    const info = stmt.run(user_id, chore_schedule_id || null, date, clam_value || 0, rowKind);
-    return { id: info.lastInsertRowid, success: true };
+    const inserted = await ChoreHistory.query().insert({
+      user_id,
+      chore_schedule_id: chore_schedule_id || null,
+      date,
+      clam_value: clam_value || 0,
+      kind: rowKind,
+    });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding history entry:', error);
     reply.status(500).send({ error: 'Failed to add history entry' });
@@ -2954,14 +2986,12 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
     const since = new Date();
     since.setDate(since.getDate() - days);
     const sinceStr = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-${String(since.getDate()).padStart(2, '0')}`;
-    const rows = db.prepare(`
-      SELECT ch.id, ch.date, ch.clam_value, ch.title, ch.kind, ch.created_at,
-             u.username
-      FROM chore_history ch
-      LEFT JOIN users u ON ch.user_id = u.id
-      WHERE ch.date >= ? AND ch.clam_value != 0
-      ORDER BY ch.date DESC, ch.created_at DESC
-    `).all(sinceStr);
+    const rows = await knex('chore_history as ch')
+      .leftJoin('users as u', 'ch.user_id', 'u.id')
+      .select('ch.id', 'ch.date', 'ch.clam_value', 'ch.title', 'ch.kind', 'ch.created_at', 'u.username')
+      .where('ch.date', '>=', sinceStr)
+      .whereNot('ch.clam_value', 0)
+      .orderBy([{ column: 'ch.date', order: 'desc' }, { column: 'ch.created_at', order: 'desc' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching recent chore history:', error);
@@ -2972,9 +3002,8 @@ fastify.get('/api/chore-history/recent', async (request, reply) => {
 fastify.delete('/api/chore-history/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM chore_history WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await ChoreHistory.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'History entry not found' });
     }
     return { success: true, message: 'History entry deleted successfully' };
@@ -2990,9 +3019,9 @@ fastify.delete('/api/chore-history/:id', async (request, reply) => {
 // active, the nightly job skips missed-chore logging so days off never count
 // against completion rates, and the metrics plugin bridges streaks across
 // those days.
-function isVacationActiveOn(dateStr) {
+async function isVacationActiveOn(dateStr) {
   try {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('vacation_mode');
+    const row = await knex('settings').select('value').where('key', 'vacation_mode').first();
     if (!row || !row.value) return false;
     const vacation = JSON.parse(row.value);
     if (!vacation || vacation.enabled !== true) return false;
@@ -3009,29 +3038,28 @@ function isVacationActiveOn(dateStr) {
 // check: the award path uses real now (default); the nightly missed logger
 // passes end-of-that-day so "snoozed through the day" excludes the chore
 // (issue #72).
-function getTodaysRegularChoresForUser(userId, dateStr, referenceNow = new Date()) {
-  const allUserSchedules = db.prepare(`
-    SELECT cs.*,
-     c.clam_value,
-     c.title,
-     EXISTS (
+async function getTodaysRegularChoresForUser(userId, dateStr, referenceNow = new Date()) {
+  const allUserSchedules = await knex('chore_schedules as cs')
+    .join('chores as c', 'cs.chore_id', 'c.id')
+    .select(
+      'cs.*',
+      'c.clam_value',
+      'c.title',
+      knex.raw(
+        `EXISTS (
          SELECT 1
          FROM chore_history ch
          WHERE ch.chore_schedule_id = cs.id
            AND ch.user_id = cs.user_id
            AND ch.date = ?
            AND ch.kind = 'completion'
-     ) AS completed_today
-    FROM chore_schedules cs
-    JOIN chores c
-      ON cs.chore_id = c.id
-    WHERE cs.user_id = ?
-      AND cs.visible = 1
-      AND NOT (
-        cs.crontab IS NOT NULL
-        AND cs.duration IN ('until-completed', 'once-completed')
+     ) AS completed_today`,
+        [dateStr]
       )
-  `).all(dateStr, userId);
+    )
+    .where('cs.user_id', userId)
+    .where('cs.visible', 1)
+    .whereRaw("NOT (cs.crontab IS NOT NULL AND cs.duration IN ('until-completed', 'once-completed'))");
 
   const regularChores = allUserSchedules
     .filter(s => s.clam_value === 0)
@@ -3069,29 +3097,34 @@ function getTodaysRegularChoresForUser(userId, dateStr, referenceNow = new Date(
 // Awards the daily "all regular chores completed" bonus to a user if every regular
 // chore due today is completed and the bonus hasn't already been recorded.
 // Never removes points; safe to call any time a user's chore set changes (e.g. reassignment).
-function awardDailyRegularBonusIfDue(userId, date) {
+async function awardDailyRegularBonusIfDue(userId, date) {
   const today = getTodayLocalDateString();
-  const todaysChores = getTodaysRegularChoresForUser(userId, today);
+  const todaysChores = await getTodaysRegularChoresForUser(userId, today);
   const uncompletedRegularChores = todaysChores.filter(cs => cs.completed_today == 0);
 
   if (!todaysChores.length || uncompletedRegularChores.length) {
     return;
   }
 
-  const dailyRewardSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('daily_completion_clam_reward');
+  const dailyRewardSetting = await knex('settings').select('value').where('key', 'daily_completion_clam_reward').first();
   const dailyReward = dailyRewardSetting ? parseInt(dailyRewardSetting.value, 10) : 2;
 
   // kind-based lookup (issue #72): unlike the old (clam_value = current
   // setting) tuple, this still matches bonuses awarded under an older reward.
-  const bonusAlreadyAwarded = db.prepare(`
-      SELECT id FROM chore_history
-      WHERE user_id = ?
-      AND date = ?
-      AND kind = 'daily_bonus'
-    `).get(userId, date);
+  const bonusAlreadyAwarded = await knex('chore_history')
+    .select('id')
+    .where({ user_id: userId, date, kind: 'daily_bonus' })
+    .first();
 
   if (!bonusAlreadyAwarded) {
-    db.prepare("INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, NULL, ?, ?, ?, 'daily_bonus')").run(userId, date, dailyReward, 'Regular chores');
+    await knex('chore_history').insert({
+      user_id: userId,
+      chore_schedule_id: null,
+      date,
+      clam_value: dailyReward,
+      title: 'Regular chores',
+      kind: 'daily_bonus',
+    });
 
     // This is the one moment "everything on today's list is done" becomes true
     // for a user, and every route that can finish someone's day funnels through
@@ -3104,8 +3137,8 @@ function awardDailyRegularBonusIfDue(userId, date) {
     // celebrate: it is a factual domain signal that plugins may want, and the
     // CHORE_CELEBRATION_ENABLED setting is a presentation preference applied
     // client-side, exactly as CHORE_SOUND_ENABLED gates playback rather than data.
-    const user = db.prepare('SELECT username FROM users WHERE id = ?').get(userId);
-    pluginEvents.emit('chore.allCompleted', {
+    const user = await knex('users').select('username').where('id', userId).first();
+    await emitPluginEvent('chore.allCompleted', {
       userId,
       username: user ? user.username : null,
       date,
@@ -3117,16 +3150,14 @@ function awardDailyRegularBonusIfDue(userId, date) {
 // Deletes the user's daily-completion bonus row for the given date, if present.
 // Used when uncompleting a regular chore, and by the transfer dialog's explicit
 // "revoke current reward and assign" option (issue #122).
-function revokeDailyRegularBonus(userId, date) {
-  const bonusEntry = db.prepare(`
-      SELECT id FROM chore_history
-      WHERE user_id = ?
-      AND date = ?
-      AND kind = 'daily_bonus'
-    `).get(userId, date);
+async function revokeDailyRegularBonus(userId, date) {
+  const bonusEntry = await knex('chore_history')
+    .select('id')
+    .where({ user_id: userId, date, kind: 'daily_bonus' })
+    .first();
 
   if (bonusEntry) {
-    db.prepare('DELETE FROM chore_history WHERE id = ?').run(bonusEntry.id);
+    await knex('chore_history').where('id', bonusEntry.id).del();
   }
 }
 
@@ -3138,7 +3169,11 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       return reply.status(400).send({ error: 'chore_schedule_id, user_id, and date are required' });
     }
 
-    const schedule = db.prepare('SELECT cs.*, c.clam_value, c.title FROM chore_schedules cs JOIN chores c ON cs.chore_id = c.id WHERE cs.id = ?').get(chore_schedule_id);
+    const schedule = await knex('chore_schedules as cs')
+      .join('chores as c', 'cs.chore_id', 'c.id')
+      .select('cs.*', 'c.clam_value', 'c.title')
+      .where('cs.id', chore_schedule_id)
+      .first();
     if (!schedule) {
       return reply.status(404).send({ error: 'Schedule not found' });
     }
@@ -3149,31 +3184,52 @@ fastify.post('/api/chores/complete', async (request, reply) => {
 
     // A 'missed' row must not block completion (retroactive catch-up is
     // legitimate); it is replaced by the completion below (issue #72).
-    const existing = db.prepare("SELECT id FROM chore_history WHERE chore_schedule_id = ? AND user_id = ? AND date = ? AND kind <> 'missed'").get(chore_schedule_id, user_id, date);
+    const existing = await knex('chore_history')
+      .select('id')
+      .where({ chore_schedule_id, user_id, date })
+      .whereNot('kind', 'missed')
+      .first();
     if (existing) {
       return reply.status(409).send({ error: 'Chore already completed for this date' });
     }
 
-    db.prepare("DELETE FROM chore_history WHERE chore_schedule_id = ? AND user_id = ? AND date = ? AND kind = 'missed'").run(chore_schedule_id, user_id, date);
-    db.prepare("INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, ?, ?, ?, ?, 'completion')").run(user_id, chore_schedule_id, date, schedule.clam_value, schedule.title);
+    await knex('chore_history').where({ chore_schedule_id, user_id, date, kind: 'missed' }).del();
+    await knex('chore_history').insert({
+      user_id,
+      chore_schedule_id,
+      date,
+      clam_value: schedule.clam_value,
+      title: schedule.title,
+      kind: 'completion',
+    });
 
     // Pay out a pending transfer bonus (attached by the parent when moving
     // this chore to a kid whose day was already complete) and clear it so it
     // pays only once.
     if (schedule.transfer_bonus_clams > 0) {
-      db.prepare("INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, ?, ?, ?, ?, 'transfer_bonus')").run(user_id, chore_schedule_id, date, schedule.transfer_bonus_clams, 'Transfer bonus');
-      db.prepare('UPDATE chore_schedules SET transfer_bonus_clams = 0 WHERE id = ?').run(chore_schedule_id);
+      await knex('chore_history').insert({
+        user_id,
+        chore_schedule_id,
+        date,
+        clam_value: schedule.transfer_bonus_clams,
+        title: 'Transfer bonus',
+        kind: 'transfer_bonus',
+      });
+      await knex('chore_schedules').where('id', chore_schedule_id).update({ transfer_bonus_clams: 0 });
     }
 
     if (schedule.parent_schedule_id) {
-      const parentSchedule = db.prepare('SELECT id, duration, interval FROM chore_schedules WHERE id = ?').get(schedule.parent_schedule_id);
+      const parentSchedule = await knex('chore_schedules')
+        .select('id', 'duration', 'interval')
+        .where('id', schedule.parent_schedule_id)
+        .first();
       if (parentSchedule && parentSchedule.duration === 'once-completed') {
         const completionDate = parseDateOnlyToLocalDate(date);
         const nextDueDate = completionDate ? addIntervalToDate(completionDate, parentSchedule.interval) : null;
         const nextCrontab = buildDateCrontab(nextDueDate);
 
         if (nextCrontab) {
-          db.prepare('UPDATE chore_schedules SET crontab = ?, visible = 1 WHERE id = ?').run(nextCrontab, parentSchedule.id);
+          await knex('chore_schedules').where('id', parentSchedule.id).update({ crontab: nextCrontab, visible: 1 });
         } else {
           console.warn(`Could not reschedule once-completed parent schedule ${parentSchedule.id}; invalid interval: ${parentSchedule.interval}`);
         }
@@ -3184,7 +3240,7 @@ fastify.post('/api/chores/complete', async (request, reply) => {
     // award emits chore.allCompleted. Emitting in the other order would tell a
     // subscriber the day was finished while the chore that finished it had not
     // been announced yet — a plugin counting completions would be one short.
-    pluginEvents.emit('chore.completed', {
+    await emitPluginEvent('chore.completed', {
       userId: user_id,
       choreId: schedule.chore_id,
       scheduleId: chore_schedule_id,
@@ -3192,12 +3248,12 @@ fastify.post('/api/chores/complete', async (request, reply) => {
       date,
     });
 
-    awardDailyRegularBonusIfDue(user_id, date);
+    await awardDailyRegularBonusIfDue(user_id, date);
 
     // Read the total after the award so the response includes the bonus.
-    const totalResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(user_id);
+    const total = await getUserClamTotal(user_id);
 
-    return { success: true, clam_total: totalResult.total };
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error completing chore:', error);
     reply.status(500).send({ error: 'Failed to complete chore' });
@@ -3213,33 +3269,39 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
 
     // kind-based lookup finds the actual completion record, never a transfer
     // payout or a stale missed row (issue #72).
-    const history = db.prepare("SELECT id, clam_value FROM chore_history WHERE chore_schedule_id = ? AND user_id = ? AND date = ? AND kind = 'completion'").get(chore_schedule_id, user_id, date);
+    const history = await knex('chore_history')
+      .select('id', 'clam_value')
+      .where({ chore_schedule_id, user_id, date, kind: 'completion' })
+      .first();
     if (!history) {
       return reply.status(404).send({ error: 'Completion record not found' });
     }
 
-    db.prepare('DELETE FROM chore_history WHERE id = ?').run(history.id);
+    await knex('chore_history').where('id', history.id).del();
 
     // If completing this chore paid out a transfer bonus, take the payout back
     // and re-arm it on the schedule so re-completing pays again.
-    const transferBonusRow = db.prepare("SELECT id, clam_value FROM chore_history WHERE chore_schedule_id = ? AND user_id = ? AND date = ? AND kind = 'transfer_bonus'").get(chore_schedule_id, user_id, date);
+    const transferBonusRow = await knex('chore_history')
+      .select('id', 'clam_value')
+      .where({ chore_schedule_id, user_id, date, kind: 'transfer_bonus' })
+      .first();
     if (transferBonusRow) {
-      db.prepare('DELETE FROM chore_history WHERE id = ?').run(transferBonusRow.id);
-      db.prepare('UPDATE chore_schedules SET transfer_bonus_clams = ? WHERE id = ?').run(transferBonusRow.clam_value, chore_schedule_id);
+      await knex('chore_history').where('id', transferBonusRow.id).del();
+      await knex('chore_schedules').where('id', chore_schedule_id).update({ transfer_bonus_clams: transferBonusRow.clam_value });
     }
 
     // if the uncompleted chore was a bonus chore (has clam value), don't remove the daily bonus when uncompleting
     if (!history.clam_value) {
-      revokeDailyRegularBonus(user_id, date);
+      await revokeDailyRegularBonus(user_id, date);
     }
 
-    const totalResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(user_id);
+    const total = await getUserClamTotal(user_id);
 
     // Mirror of chore.completed so plugins (and declarative reactions with a
     // negative factor) can compensate — without this, complete → uncomplete →
     // re-complete double-counts durable reaction effects.
-    const uncompletedSchedule = db.prepare('SELECT chore_id FROM chore_schedules WHERE id = ?').get(chore_schedule_id);
-    pluginEvents.emit('chore.uncompleted', {
+    const uncompletedSchedule = await knex('chore_schedules').select('chore_id').where('id', chore_schedule_id).first();
+    await emitPluginEvent('chore.uncompleted', {
       userId: user_id,
       choreId: uncompletedSchedule?.chore_id ?? null,
       scheduleId: chore_schedule_id,
@@ -3247,7 +3309,7 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
       date,
     });
 
-    return { success: true, clam_total: totalResult.total };
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error uncompleting chore:', error);
     reply.status(500).send({ error: 'Failed to uncomplete chore' });
@@ -3258,8 +3320,8 @@ fastify.post('/api/chores/uncomplete', async (request, reply) => {
 fastify.get('/api/users/:id/clams', async (request, reply) => {
   const { id } = request.params;
   try {
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    return { user_id: parseInt(id), clam_total: result.total };
+    const total = await getUserClamTotal(id);
+    return { user_id: parseInt(id), clam_total: total };
   } catch (error) {
     console.error('Error getting user clams:', error);
     reply.status(500).send({ error: 'Failed to get user clams' });
@@ -3275,11 +3337,18 @@ fastify.post('/api/users/:id/clams/add', async (request, reply) => {
     }
 
     const useDate = date || getTodayLocalDateString();
-    db.prepare("INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, NULL, ?, ?, ?, 'adjustment')").run(id, useDate, amount, 'Adjustment');
+    await knex('chore_history').insert({
+      user_id: id,
+      chore_schedule_id: null,
+      date: useDate,
+      clam_value: amount,
+      title: 'Adjustment',
+      kind: 'adjustment',
+    });
 
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    pluginEvents.emit('clam.deposited', { userId: parseInt(id), amount, newTotal: result.total });
-    return { success: true, clam_total: result.total };
+    const total = await getUserClamTotal(id);
+    await emitPluginEvent('clam.deposited', { userId: parseInt(id), amount, newTotal: total });
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error adding clams:', error);
     reply.status(500).send({ error: 'Failed to add clams' });
@@ -3303,8 +3372,8 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
     // avatar quick-spend) — lands in the ledger and metrics.
     const trimmedTitle = typeof title === 'string' ? title.trim().slice(0, 120) : '';
 
-    const currentResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    if (currentResult.total < amount) {
+    const currentTotal = await getUserClamTotal(id);
+    if (currentTotal < amount) {
       return reply.status(400).send({ error: 'Insufficient clams' });
     }
 
@@ -3313,17 +3382,18 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
     // SUM(clam_value) everywhere, so totals are unchanged — but history no
     // longer shrinks retroactively when clams are spent.
     const useDate = getTodayLocalDateString();
-    db.prepare('INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, NULL, ?, ?, ?, ?)').run(
-      id,
-      useDate,
-      -amount,
-      trimmedTitle || (rowKind === 'spent' ? 'Spent' : 'Adjustment'),
-      rowKind
-    );
+    await knex('chore_history').insert({
+      user_id: id,
+      chore_schedule_id: null,
+      date: useDate,
+      clam_value: -amount,
+      title: trimmedTitle || (rowKind === 'spent' ? 'Spent' : 'Adjustment'),
+      kind: rowKind,
+    });
 
-    const result = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(id);
-    pluginEvents.emit('clam.withdrawn', { userId: parseInt(id), amount, newTotal: result.total });
-    return { success: true, clam_total: result.total };
+    const total = await getUserClamTotal(id);
+    await emitPluginEvent('clam.withdrawn', { userId: parseInt(id), amount, newTotal: total });
+    return { success: true, clam_total: total };
   } catch (error) {
     console.error('Error reducing clams:', error);
     reply.status(500).send({ error: 'Failed to reduce clams' });
@@ -3332,20 +3402,30 @@ fastify.post('/api/users/:id/clams/reduce', async (request, reply) => {
 
 
 // User routes (updated to calculate clam_total from history)
+// Clam balances are derived from chore_history (not stored on the user).
+async function getUserClamTotal(userId) {
+  const row = await knex('chore_history').where('user_id', userId).sum({ total: 'clam_value' }).first();
+  return Number(row && row.total != null ? row.total : 0);
+}
+
 fastify.get('/api/users', async (request, reply) => {
   try {
     // Admin-chosen display order (issue #134). Every consumer — the chore
     // widget columns, assignment dropdowns, transfer and split pickers —
     // renders in the order returned here, so this one clause orders them all.
-    const users = db.prepare('SELECT id, username, email, profile_picture, sort_order FROM users ORDER BY sort_order, id').all();
+    const users = await knex('users')
+      .select('id', 'username', 'email', 'profile_picture', 'sort_order')
+      .orderBy([{ column: 'sort_order' }, { column: 'id' }]);
 
-    const usersWithClams = users.map(user => {
-      const clamResult = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?').get(user.id);
-      return {
-        ...user,
-        clam_total: clamResult.total
-      };
-    });
+    const usersWithClams = await Promise.all(
+      users.map(async (user) => ({
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        profile_picture: user.profile_picture,
+        clam_total: await getUserClamTotal(user.id),
+      }))
+    );
 
     return usersWithClams;
   } catch (error) {
@@ -3358,10 +3438,14 @@ fastify.post('/api/users', async (request, reply) => {
   const { username, email, profile_picture } = request.body;
   try {
     // New users land at the end of the display order.
-    const maxOrder = db.prepare('SELECT MAX(sort_order) as max FROM users').get();
-    const stmt = db.prepare('INSERT INTO users (username, email, profile_picture, sort_order) VALUES (?, ?, ?, ?)');
-    const info = stmt.run(username, email, profile_picture, (maxOrder?.max ?? 0) + 1);
-    return { id: info.lastInsertRowid };
+    const maxOrder = await knex('users').max({ max: 'sort_order' }).first();
+    const inserted = await User.query().insert({
+      username,
+      email,
+      profile_picture,
+      sort_order: (maxOrder?.max ?? 0) + 1,
+    });
+    return { id: inserted.id };
   } catch (error) {
     console.error('Error adding user:', error);
     reply.status(500).send({ error: 'Failed to add user' });
@@ -3380,7 +3464,7 @@ fastify.patch('/api/users/reorder', async (request, reply) => {
 
     // The bonus pseudo-user (id 0) never renders on the dashboard and keeps
     // sort_order 0, so it stays pinned first and is not reorderable.
-    const reorderable = db.prepare('SELECT id FROM users WHERE id != 0').all().map((row) => row.id);
+    const reorderable = (await knex('users').select('id').whereNot('id', 0)).map((row) => row.id);
     const unique = new Set(orderedUserIds);
     const coversEveryUser = unique.size === orderedUserIds.length
       && orderedUserIds.length === reorderable.length
@@ -3391,11 +3475,11 @@ fastify.patch('/api/users/reorder', async (request, reply) => {
 
     // Dense 1..n keeps bonus (0) first; no UNIQUE constraint here, so unlike
     // the tab reorder this needs no temporary-value pass.
-    const applyOrder = db.transaction((ids) => {
-      const stmt = db.prepare('UPDATE users SET sort_order = ? WHERE id = ?');
-      ids.forEach((id, index) => stmt.run(index + 1, id));
+    await knex.transaction(async (trx) => {
+      for (let index = 0; index < orderedUserIds.length; index++) {
+        await trx('users').where('id', orderedUserIds[index]).update({ sort_order: index + 1 });
+      }
     });
-    applyOrder(orderedUserIds);
 
     return { success: true, orderedUserIds };
   } catch (error) {
@@ -3409,9 +3493,8 @@ fastify.patch('/api/users/:id', async (request, reply) => {
   const { id } = request.params;
   const { username, email, profile_picture } = request.body;
   try {
-    const stmt = db.prepare('UPDATE users SET username = ?, email = ?, profile_picture = ? WHERE id = ?');
-    const info = stmt.run(username, email, profile_picture, id);
-    if (info.changes === 0) {
+    const updated = await User.query().patch({ username, email, profile_picture }).where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'User not found' });
     }
     return { success: true, message: 'User updated successfully' };
@@ -3470,8 +3553,8 @@ fastify.post('/api/users/:id/avatar', async (request, reply) => {
     if (!fsSync.existsSync(path.join(AVATARS_UPLOAD_DIR, base))) {
       return reply.status(404).send({ error: 'Unknown default avatar' });
     }
-    const info = db.prepare('UPDATE users SET profile_picture = ? WHERE id = ?').run(filename, id);
-    if (info.changes === 0) {
+    const updated = await User.query().patch({ profile_picture: filename }).where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'User not found' });
     }
     return { success: true, filename };
@@ -3520,12 +3603,9 @@ fastify.post('/api/users/:id/upload-picture', async (request, reply) => {
     console.log('File saved successfully');
 
     // Update user record
-    const stmt = db.prepare('UPDATE users SET profile_picture = ? WHERE id = ?');
-    const info = stmt.run(filename, id);
+    const updated = await User.query().findById(id).patch({ profile_picture: filename });
 
-    console.log('Database update:', info);
-
-    if (info.changes === 0) {
+    if (updated === 0) {
       // Clean up uploaded file if user doesn't exist
       await fs.unlink(filepath);
       console.log('User not found, file deleted');
@@ -3549,11 +3629,8 @@ fastify.post('/api/users/:id/upload-picture', async (request, reply) => {
 fastify.delete('/api/users/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    // Optional: Delete associated chores first if desired, or set user_id to NULL
-    // db.prepare('DELETE FROM chores WHERE user_id = ?').run(id);\
-    const stmt = db.prepare('DELETE FROM users WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await User.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'User not found' });
     }
     return { success: true, message: 'User deleted successfully' };
@@ -3567,7 +3644,7 @@ fastify.delete('/api/users/:id', async (request, reply) => {
 // Calendar routes (existing)
 fastify.get('/api/calendar', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM events').all();
+    const rows = await Event.query();
     return rows;
   } catch (error) {
     console.error('Error fetching events:', error);
@@ -3578,9 +3655,8 @@ fastify.get('/api/calendar', async (request, reply) => {
 fastify.post('/api/calendar', async (request, reply) => {
   const { user_id, summary, start, end, description } = request.body;
   try {
-    const stmt = db.prepare('INSERT INTO events (user_id, summary, start, end, description) VALUES (?, ?, ?, ?, ?)');
-    const info = stmt.run(user_id, summary, start, end, description);
-    return { id: info.lastInsertRowid };
+    const inserted = await Event.query().insert({ user_id, summary, start, end, description });
+    return { id: inserted.id };
   } catch (error) {
     console.error('Error adding event:', error);
     reply.status(500).send({ error: 'Failed to add event' });
@@ -3589,7 +3665,7 @@ fastify.post('/api/calendar', async (request, reply) => {
 
 fastify.get('/api/calendar/ics', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM events').all();
+    const rows = await Event.query();
     const calendar = ical({ name: 'HomeGlow Calendar' });
     rows.forEach((event) => {
       calendar.createEvent({
@@ -3622,7 +3698,7 @@ fastify.get('/api/demo', async () => {
 fastify.get('/api/weather', async (request, reply) => {
   try {
     const { location, lat, lon, units, lang, refresh } = request.query || {};
-    const payload = await weatherService.getWeather(db, {
+    const payload = await weatherService.getWeather({
       locationQuery: location,
       lat: lat === undefined ? undefined : Number(lat),
       lon: lon === undefined ? undefined : Number(lon),
@@ -3652,9 +3728,9 @@ fastify.get('/api/weather/geocode', async (request, reply) => {
     // Home Assistant household already told HA where it lives, so auto dark
     // mode should not need a second answer — or an OpenWeatherMap key.
     if (!query) {
-      if (weatherService.getConfiguredProvider(db) === weatherService.PROVIDERS.HOMEASSISTANT
-        && homeAssistant.isConfigured(db)) {
-        const config = await homeAssistant.homeAssistantFetch(db, 'GET', '/api/config');
+      if ((await weatherService.getConfiguredProvider()) === weatherService.PROVIDERS.HOMEASSISTANT
+        && (await homeAssistant.isConfigured())) {
+        const config = await homeAssistant.homeAssistantFetch('GET', '/api/config');
         if (Number.isFinite(config?.latitude) && Number.isFinite(config?.longitude)) {
           return {
             lat: config.latitude,
@@ -3666,7 +3742,7 @@ fastify.get('/api/weather/geocode', async (request, reply) => {
       return reply.status(400).send({ error: 'A location query is required.' });
     }
 
-    const apiKey = db.prepare('SELECT value FROM settings WHERE key = ?').get('WEATHER_API_KEY')?.value;
+    const apiKey = (await knex('settings').select('value').where('key', 'WEATHER_API_KEY').first())?.value;
     if (!apiKey) {
       return reply.status(400).send({
         error: 'Geocoding needs an OpenWeatherMap API key. Save one in the Connections tab, or let Home Assistant supply the location.',
@@ -3748,7 +3824,7 @@ const rowsToSettingsObject = (rows) => rows.reduce((acc, row) => {
 fastify.get('/api/settings', async (request, reply) => {
   try {
     console.log('=== FETCHING SETTINGS ===');
-    const rows = db.prepare('SELECT key, value FROM settings').all();
+    const rows = await knex('settings').select('key', 'value');
     console.log('Raw settings from database:', rows);
     const settings = rowsToSettingsObject(rows);
     console.log('Processed settings object:', settings);
@@ -3761,19 +3837,21 @@ fastify.get('/api/settings', async (request, reply) => {
 
 fastify.post('/api/settings/search', async (request, reply) => {
   try {
-    console.log('=== SEARCHING SETTINGS ===');
     // coerce the request body to array of strings to search the settings database by key:
     const keys = Array.isArray(request.body) ? request.body : [request.body];
 
-    // use parameters to filter settings by key if provided, otherwise return all settings
-    // accept simple wildcards for partial match via * (e.g. WEATHER_* to match all weather related settings)
-    let query = 'SELECT key, value FROM settings';
+    // accept simple wildcards for partial match via * (e.g. WEATHER_* to match all
+    // weather related settings)
+    const query = knex('settings').select('key', 'value');
     if (keys.length) {
-      const conditions = keys.map(() => 'key LIKE ?').join(' OR ');
-      query += ' WHERE ' + conditions;
+      query.where((builder) => {
+        keys.forEach((key) => builder.orWhere('key', 'like', String(key).replaceAll('*', '%')));
+      });
     }
-    const rows = db.prepare(query).all(...keys.map(key => key.replaceAll('*', '%')));
+    const rows = await query;
     console.log('Raw settings from database:', rows);
+    // rowsToSettingsObject drops REDACTED_SETTING_KEYS, so a wildcard search is
+    // not a way around the redaction that GET /api/settings applies.
     const settings = rowsToSettingsObject(rows);
     console.log('Processed settings object:', settings);
     return settings;
@@ -3785,11 +3863,8 @@ fastify.post('/api/settings/search', async (request, reply) => {
 
 fastify.post('/api/settings', async (request, reply) => {
   const { key, value } = request.body;
-  // single log message showing the details of the save:
-  console.log(`=== SAVING SETTING === Key: ${key} - Value: ${value} Value type: ${typeof value} Value length: ${value ? value.length : 'null/undefined'}`);
 
   if (!key || value === undefined) {
-    console.log('ERROR: Missing key or value');
     return reply.status(400).send({ error: 'Key and value are required.' });
   }
   try {
@@ -3802,13 +3877,11 @@ fastify.post('/api/settings', async (request, reply) => {
       return { success: true, message: `Setting '${key}' left unchanged.` };
     }
 
-    // Use INSERT OR REPLACE to either insert a new setting or update an existing one
-    const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const result = stmt.run(key, value);
-    console.log('Database insert result:', result);
+    // Use an upsert to either insert a new setting or update an existing one
+    await knex('settings').insert({ key, value }).onConflict('key').merge({ value });
 
     // Verify the setting was saved
-    const verification = db.prepare('SELECT key, value FROM settings WHERE key = ?').get(key);
+    const verification = await knex('settings').select('key', 'value').where('key', key).first();
     console.log('Verification query result:', verification);
 
     // Changing the provider or its credentials invalidates anything cached
@@ -3816,7 +3889,6 @@ fastify.post('/api/settings', async (request, reply) => {
     if (key === 'WEATHER_API_KEY' || key === weatherService.PROVIDER_SETTING_KEY) {
       weatherService.clearCache();
     }
-
     return { success: true, message: `Setting '${key}' saved successfully.` };
   } catch (error) {
     console.error(`Error saving setting '${key}':`, error);
@@ -3832,8 +3904,8 @@ fastify.get('/api/devices/:deviceName/tabs', async (request, reply) => {
   }
 
   try {
-    const tabs = db.prepare('SELECT * FROM tabs WHERE device_name = ? ORDER BY number ASC').all(deviceName);
-    const lastModifiedMs = getDeviceUpdateTimeMs(deviceName);
+    const tabs = await knex('tabs').where('device_name', deviceName).orderBy('number', 'asc');
+    const lastModifiedMs = await getDeviceUpdateTimeMs(deviceName);
     // region #98 - expected to get removed in the future (legacy empty-tabs API fallback)
     if (tabs.length === 0) {
       return sendJsonWithConditionalCache(request, reply, [buildDefaultHomeTab(deviceName)], null);
@@ -3851,7 +3923,7 @@ fastify.post('/api/devices/:deviceName/tabs', async (request, reply) => {
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
   const { label, icon, show_label } = request.body;
 
   if (!label || !icon) {
@@ -3859,12 +3931,12 @@ fastify.post('/api/devices/:deviceName/tabs', async (request, reply) => {
   }
 
   try {
-    const maxOrder = db.prepare('SELECT MAX(number) as max FROM tabs WHERE device_name = ?').get(deviceName);
-    const nextTabNumber = (maxOrder.max || 0) + 1;
+    const maxRow = await knex('tabs').max({ max: 'number' }).where('device_name', deviceName).first();
+    const nextTabNumber = ((maxRow && maxRow.max) || 0) + 1;
 
-    const stmt = db.prepare('INSERT INTO tabs (device_name, label, icon, show_label, number, config_json) VALUES (?, ?, ?, ?, ?, ?) RETURNING *');
-    const row = stmt.get(deviceName, label, icon, show_label ? 1 : 0, nextTabNumber, '{}');
-    touchDeviceUpdateTime(deviceName);
+    await Tab.query().insert({ device_name: deviceName, label, icon, show_label: show_label ? 1 : 0, number: nextTabNumber, config_json: '{}' });
+    const row = await getTabByNumber(deviceName, nextTabNumber);
+    await touchDeviceUpdateTime(deviceName);
 
     return row;
   } catch (error) {
@@ -3879,37 +3951,24 @@ fastify.patch('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply)
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
   if (parseInt(tabNumber) === 1) {
     return reply.status(400).send({ error: 'Cannot modify home tab' });
   }
 
   try {
-    const updates = [];
-    const values = [];
+    const patch = {};
+    if (label !== undefined) { patch.label = label; }
+    if (icon !== undefined) { patch.icon = icon; }
+    if (show_label !== undefined) { patch.show_label = show_label ? 1 : 0; }
 
-    if (label !== undefined) {
-      updates.push('label = ?');
-      values.push(label);
-    }
-    if (icon !== undefined) {
-      updates.push('icon = ?');
-      values.push(icon);
-    }
-    if (show_label !== undefined) {
-      updates.push('show_label = ?');
-      values.push(show_label ? 1 : 0);
-    }
-
-    if (updates.length === 0) {
+    if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
     }
 
-    values.push(tabNumber);
-    values.push(deviceName);
-    const stmt = db.prepare(`UPDATE tabs SET ${updates.join(', ')} WHERE number = ? AND device_name = ? RETURNING *`);
-    const row = stmt.get(...values);
-    touchDeviceUpdateTime(deviceName);
+    await knex('tabs').where({ number: tabNumber, device_name: deviceName }).update(patch);
+    const row = await getTabByNumber(deviceName, tabNumber);
+    await touchDeviceUpdateTime(deviceName);
 
     return row;
   } catch (error) {
@@ -3925,16 +3984,14 @@ fastify.patch('/api/devices/:deviceName/tabs/reorder', async (request, reply) =>
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
 
   if (!Array.isArray(orderedTabNumbers)) {
     return reply.status(400).send({ error: 'orderedTabNumbers array is required' });
   }
 
   try {
-    const nonHomeTabs = db
-      .prepare('SELECT id, number FROM tabs WHERE device_name = ? AND number != 1 ORDER BY number ASC')
-      .all(deviceName);
+    const nonHomeTabs = await knex('tabs').select('id', 'number').where('device_name', deviceName).whereNot('number', 1).orderBy('number', 'asc');
 
     if (orderedTabNumbers.length !== nonHomeTabs.length) {
       return reply.status(400).send({ error: 'orderedTabNumbers length does not match current tab count' });
@@ -3954,24 +4011,18 @@ fastify.patch('/api/devices/:deviceName/tabs/reorder', async (request, reply) =>
     const tabsByNumber = new Map(nonHomeTabs.map(tab => [tab.number, tab]));
     const orderedTabIds = orderedTabNumbers.map(number => tabsByNumber.get(number).id);
 
-    const reorderTransaction = db.transaction((ids) => {
-      const tempStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-      const finalStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-
-      ids.forEach((id, index) => {
-        // Move to temporary values to avoid UNIQUE(device_name, number) collisions.
-        tempStmt.run(-1000 - index, id, deviceName);
-      });
-
-      ids.forEach((id, index) => {
-        finalStmt.run(index + 2, id, deviceName);
-      });
+    await knex.transaction(async (trx) => {
+      // Move to temporary values to avoid UNIQUE(device_name, number) collisions.
+      for (let index = 0; index < orderedTabIds.length; index++) {
+        await trx('tabs').where({ id: orderedTabIds[index], device_name: deviceName }).update({ number: -1000 - index });
+      }
+      for (let index = 0; index < orderedTabIds.length; index++) {
+        await trx('tabs').where({ id: orderedTabIds[index], device_name: deviceName }).update({ number: index + 2 });
+      }
     });
+    await touchDeviceUpdateTime(deviceName);
 
-    reorderTransaction(orderedTabIds);
-    touchDeviceUpdateTime(deviceName);
-
-    const updatedTabs = db.prepare('SELECT * FROM tabs WHERE device_name = ? ORDER BY number ASC').all(deviceName);
+    const updatedTabs = await knex('tabs').where('device_name', deviceName).orderBy('number', 'asc');
     return updatedTabs;
   } catch (error) {
     console.error('Error reordering tabs:', error);
@@ -3984,7 +4035,7 @@ fastify.delete('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply
   if (!deviceName) {
     return reply.status(400).send({ error: 'deviceName is required' });
   }
-  ensureDeviceExists(deviceName);
+  await ensureDeviceExists(deviceName);
 
   if (parseInt(tabNumber) === 1) {
     return reply.status(400).send({ error: 'Cannot delete home tab' });
@@ -3993,12 +4044,12 @@ fastify.delete('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply
   try {
     const parsedTabNumber = parseInt(tabNumber, 10);
 
-    const sourceTab = getTabByNumber(deviceName, parsedTabNumber);
+    const sourceTab = await getTabByNumber(deviceName, parsedTabNumber);
     if (!sourceTab) {
       return reply.status(404).send({ error: 'Tab not found' });
     }
 
-    const homeTab = getTabByNumber(deviceName, 1);
+    const homeTab = await getTabByNumber(deviceName, 1);
     const sourceLayoutMap = parseTabConfigJson(sourceTab.config_json);
     const homeLayoutMap = parseTabConfigJson(homeTab?.config_json);
     let homeChanged = false;
@@ -4011,31 +4062,22 @@ fastify.delete('/api/devices/:deviceName/tabs/:tabNumber', async (request, reply
     });
 
     if (homeTab && homeChanged) {
-      saveTabConfigById(homeTab.id, homeLayoutMap);
+      await saveTabConfigById(homeTab.id, homeLayoutMap);
     }
 
-    const deleteStmt = db.prepare('DELETE FROM tabs WHERE number = ? AND device_name = ?');
-    deleteStmt.run(parsedTabNumber, deviceName);
+    await knex('tabs').where({ number: parsedTabNumber, device_name: deviceName }).del();
 
-    const remainingTabs = db
-      .prepare('SELECT id FROM tabs WHERE device_name = ? AND number != 1 ORDER BY number ASC')
-      .all(deviceName);
+    const remainingTabs = await knex('tabs').select('id').where('device_name', deviceName).whereNot('number', 1).orderBy('number', 'asc');
 
-    const renumberTransaction = db.transaction((tabRows) => {
-      const tempStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-      const finalStmt = db.prepare('UPDATE tabs SET number = ? WHERE id = ? AND device_name = ?');
-
-      tabRows.forEach((row, index) => {
-        tempStmt.run(-2000 - index, row.id, deviceName);
-      });
-
-      tabRows.forEach((row, index) => {
-        finalStmt.run(index + 2, row.id, deviceName);
-      });
+    await knex.transaction(async (trx) => {
+      for (let index = 0; index < remainingTabs.length; index++) {
+        await trx('tabs').where({ id: remainingTabs[index].id, device_name: deviceName }).update({ number: -2000 - index });
+      }
+      for (let index = 0; index < remainingTabs.length; index++) {
+        await trx('tabs').where({ id: remainingTabs[index].id, device_name: deviceName }).update({ number: index + 2 });
+      }
     });
-
-    renumberTransaction(remainingTabs);
-    touchDeviceUpdateTime(deviceName);
+    await touchDeviceUpdateTime(deviceName);
 
     return { success: true, message: 'Tab deleted successfully' };
   } catch (error) {
@@ -4051,8 +4093,8 @@ fastify.get('/api/devices/:deviceName/widget-assignments', async (request, reply
     return reply.status(400).send({ error: 'deviceName is required' });
   }
   try {
-    const lastModifiedMs = getDeviceUpdateTimeMs(deviceName);
-    return sendJsonWithConditionalCache(request, reply, listWidgetAssignmentsFromTabLayouts(deviceName), lastModifiedMs);
+    const lastModifiedMs = await getDeviceUpdateTimeMs(deviceName);
+    return sendJsonWithConditionalCache(request, reply, await listWidgetAssignmentsFromTabLayouts(deviceName), lastModifiedMs);
   } catch (error) {
     console.error('Error fetching widget assignments:', error);
     reply.status(500).send({ error: 'Failed to fetch widget assignments' });
@@ -4070,9 +4112,9 @@ fastify.post('/api/devices/:deviceName/widget-assignments', async (request, repl
   }
 
   try {
-    ensureDeviceExists(deviceName);
+    await ensureDeviceExists(deviceName);
     const parsedTabNumber = parseInt(tabNumber, 10);
-    const tab = getTabByNumber(deviceName, parsedTabNumber);
+    const tab = await getTabByNumber(deviceName, parsedTabNumber);
     if (!tab) {
       return reply.status(404).send({ error: 'Tab not found' });
     }
@@ -4091,8 +4133,8 @@ fastify.post('/api/devices/:deviceName/widget-assignments', async (request, repl
       layout_h: null,
     };
 
-    saveTabConfigById(tab.id, layoutMap);
-    touchDeviceUpdateTime(deviceName);
+    await saveTabConfigById(tab.id, layoutMap);
+    await touchDeviceUpdateTime(deviceName);
 
     return {
       id: buildAssignmentId(parsedTabNumber, widget_name),
@@ -4122,7 +4164,7 @@ fastify.delete('/api/devices/:deviceName/widget-assignments/:id', async (request
       return reply.status(400).send({ error: 'Invalid assignment id' });
     }
 
-    const tab = getTabByNumber(deviceName, parsedId.tabNumber);
+    const tab = await getTabByNumber(deviceName, parsedId.tabNumber);
     if (!tab) {
       return reply.status(404).send({ error: 'Assignment not found' });
     }
@@ -4133,8 +4175,8 @@ fastify.delete('/api/devices/:deviceName/widget-assignments/:id', async (request
     }
 
     delete layoutMap[parsedId.widgetName];
-    saveTabConfigById(tab.id, layoutMap);
-    touchDeviceUpdateTime(deviceName);
+    await saveTabConfigById(tab.id, layoutMap);
+    await touchDeviceUpdateTime(deviceName);
     return { success: true, message: 'Assignment deleted successfully' };
   } catch (error) {
     console.error('Error deleting widget assignment:', error);
@@ -4149,20 +4191,20 @@ fastify.delete('/api/devices/:deviceName/widget-assignments/widget/:widgetName',
   }
 
   try {
-    const tabs = getTabsForDevice(deviceName);
+    const tabs = await getTabsForDevice(deviceName);
     let changed = false;
 
-    tabs.forEach((tab) => {
+    for (const tab of tabs) {
       const layoutMap = parseTabConfigJson(tab.config_json);
       if (widgetName in layoutMap) {
         delete layoutMap[widgetName];
-        saveTabConfigById(tab.id, layoutMap);
+        await saveTabConfigById(tab.id, layoutMap);
         changed = true;
       }
-    });
+    }
 
     if (changed) {
-      touchDeviceUpdateTime(deviceName);
+      await touchDeviceUpdateTime(deviceName);
     }
     return { success: true, message: 'Widget assignments deleted successfully' };
   } catch (error) {
@@ -4193,9 +4235,9 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout', async (reque
   }
 
   try {
-    ensureDeviceExists(deviceName);
+    await ensureDeviceExists(deviceName);
     const parsedTabNumber = parseInt(tabNumber, 10);
-    const tab = getTabByNumber(deviceName, parsedTabNumber);
+    const tab = await getTabByNumber(deviceName, parsedTabNumber);
     if (!tab) {
       return reply.status(404).send({ error: 'Assignment not found' });
     }
@@ -4223,9 +4265,9 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout', async (reque
       ...normalizedLayout,
       ...mergedSettings,
     };
-    saveTabConfigById(tab.id, layoutMap);
+    await saveTabConfigById(tab.id, layoutMap);
 
-    touchDeviceUpdateTime(deviceName);
+    await touchDeviceUpdateTime(deviceName);
     return {
       id: buildAssignmentId(parsedTabNumber, widget_name),
       device_name: deviceName,
@@ -4250,9 +4292,9 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout/bulk', async (
   }
 
   try {
-    ensureDeviceExists(deviceName);
+    await ensureDeviceExists(deviceName);
     const tabsByNumber = new Map(
-      getTabsForDevice(deviceName).map(tab => [tab.number, {
+      (await getTabsForDevice(deviceName)).map(tab => [tab.number, {
         tab,
         layoutMap: parseTabConfigJson(tab.config_json),
         changed: false,
@@ -4290,14 +4332,14 @@ fastify.patch('/api/devices/:deviceName/widget-assignments/layout/bulk', async (
       anyChanged = true;
     }
 
-    tabsByNumber.forEach((tabEntry) => {
+    for (const tabEntry of tabsByNumber.values()) {
       if (tabEntry.changed) {
-        saveTabConfigById(tabEntry.tab.id, tabEntry.layoutMap);
+        await saveTabConfigById(tabEntry.tab.id, tabEntry.layoutMap);
       }
-    });
+    }
 
     if (anyChanged) {
-      touchDeviceUpdateTime(deviceName);
+      await touchDeviceUpdateTime(deviceName);
     }
 
     return { success: true, message: 'Layouts updated successfully' };
@@ -4316,13 +4358,11 @@ fastify.post('/api/test-api-key', async (request, reply) => {
   console.log('API key length:', apiKey ? apiKey.length : 'null/undefined');
 
   try {
-    // Test direct database insertion
-    const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
-    const result = stmt.run('WEATHER_API_KEY', apiKey);
-    console.log('Direct insert result:', result);
+    // Test insertion via the ORM
+    await Setting.query().insert({ key: 'WEATHER_API_KEY', value: apiKey }).onConflict('key').merge();
 
     // Verify it was saved
-    const verification = db.prepare('SELECT key, value FROM settings WHERE key = ?').get('WEATHER_API_KEY');
+    const verification = await Setting.query().findById('WEATHER_API_KEY');
     console.log('Verification result:', verification);
 
     return {
@@ -4355,7 +4395,7 @@ fastify.get('/api/proxy', async (request, reply) => {
   let whitelist = [];
   try {
     // Fetch whitelist from DB. It should be a comma-separated string of hostnames.
-    const whitelistSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('PROXY_WHITELIST');
+    const whitelistSetting = await Setting.query().select('value').findById('PROXY_WHITELIST');
     if (whitelistSetting && whitelistSetting.value) {
       whitelist = whitelistSetting.value.split(',').map(domain => domain.trim());
     }
@@ -4492,7 +4532,7 @@ const validatePrizeBody = (body) => {
 
 fastify.get('/api/prizes', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT * FROM prizes').all();
+    const rows = await Prize.query();
     return rows;
   } catch (error) {
     console.error('Error fetching prizes:', error);
@@ -4507,9 +4547,8 @@ fastify.post('/api/prizes', async (request, reply) => {
   }
   try {
     const repeatable = request.body.repeatable === true ? 1 : 0;
-    const stmt = db.prepare('INSERT INTO prizes (name, clam_cost, repeatable) VALUES (?, ?, ?)');
-    const info = stmt.run(name, clam_cost, repeatable);
-    return { id: info.lastInsertRowid };
+    const inserted = await Prize.query().insert({ name, clam_cost, repeatable });
+    return { id: inserted.id };
   } catch (error) {
     console.error('Error adding prize:', error);
     reply.status(500).send({ error: 'Failed to add prize' });
@@ -4524,10 +4563,10 @@ fastify.patch('/api/prizes/:id', async (request, reply) => {
   }
   try {
     const repeatable = request.body.repeatable === true ? 1 : (request.body.repeatable === false ? 0 : null);
-    const info = repeatable === null
-      ? db.prepare('UPDATE prizes SET name = ?, clam_cost = ? WHERE id = ?').run(name, clam_cost, id)
-      : db.prepare('UPDATE prizes SET name = ?, clam_cost = ?, repeatable = ? WHERE id = ?').run(name, clam_cost, repeatable, id);
-    if (info.changes === 0) {
+    const updated = repeatable === null
+      ? await Prize.query().patch({ name, clam_cost }).where({ id })
+      : await Prize.query().patch({ name, clam_cost, repeatable }).where({ id });
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
     return { success: true, message: 'Prize updated successfully' };
@@ -4540,9 +4579,8 @@ fastify.patch('/api/prizes/:id', async (request, reply) => {
 fastify.delete('/api/prizes/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const stmt = db.prepare('DELETE FROM prizes WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await Prize.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
     return { success: true, message: 'Prize deleted successfully' };
@@ -4563,17 +4601,18 @@ fastify.delete('/api/prizes/:id', async (request, reply) => {
 // definition and the requesting kid.
 fastify.get('/api/prize-offers', async (request, reply) => {
   try {
-    return db.prepare(`
-      SELECT po.id, po.prize_id, po.status, po.requested_by, po.requested_at, po.created_at,
-             po.split_user_ids,
-             p.name, p.clam_cost, p.repeatable,
-             u.username AS requested_by_name
-      FROM prize_offers po
-      JOIN prizes p ON po.prize_id = p.id
-      LEFT JOIN users u ON po.requested_by = u.id
-      WHERE po.status != 'redeemed'
-      ORDER BY po.created_at ASC, po.id ASC
-    `).all().map((offer) => ({
+    const offers = await knex('prize_offers as po')
+      .join('prizes as p', 'po.prize_id', 'p.id')
+      .leftJoin('users as u', 'po.requested_by', 'u.id')
+      .select(
+        'po.id', 'po.prize_id', 'po.status', 'po.requested_by', 'po.requested_at', 'po.created_at',
+        'po.split_user_ids',
+        'p.name', 'p.clam_cost', 'p.repeatable',
+        'u.username as requested_by_name'
+      )
+      .whereNot('po.status', 'redeemed')
+      .orderBy([{ column: 'po.created_at', order: 'asc' }, { column: 'po.id', order: 'asc' }]);
+    return offers.map((offer) => ({
       ...offer,
       repeatable: offer.repeatable === 1,
       split_user_ids: offer.split_user_ids ? JSON.parse(offer.split_user_ids) : [],
@@ -4588,12 +4627,12 @@ fastify.get('/api/prize-offers', async (request, reply) => {
 fastify.post('/api/prize-offers', async (request, reply) => {
   const { prize_id } = request.body;
   try {
-    const prize = db.prepare('SELECT id FROM prizes WHERE id = ?').get(prize_id);
+    const prize = await Prize.query().select('id').findById(prize_id);
     if (!prize) {
       return reply.status(404).send({ error: 'Prize not found' });
     }
-    const info = db.prepare("INSERT INTO prize_offers (prize_id, status) VALUES (?, 'available')").run(prize_id);
-    return { id: info.lastInsertRowid, success: true };
+    const inserted = await PrizeOffer.query().insert({ prize_id, status: 'available' });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error creating prize offer:', error);
     reply.status(500).send({ error: 'Failed to add prize to the store' });
@@ -4604,8 +4643,8 @@ fastify.post('/api/prize-offers', async (request, reply) => {
 fastify.delete('/api/prize-offers/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const info = db.prepare("DELETE FROM prize_offers WHERE id = ? AND status != 'redeemed'").run(id);
-    if (info.changes === 0) {
+    const deleted = await PrizeOffer.query().delete().where('id', id).whereNot('status', 'redeemed');
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Offer not found (or already redeemed)' });
     }
     return { success: true };
@@ -4626,7 +4665,7 @@ fastify.post('/api/prize-offers/:id/request', async (request, reply) => {
     if (!user_id) {
       return reply.status(400).send({ error: 'user_id is required' });
     }
-    const user = db.prepare('SELECT id FROM users WHERE id = ?').get(user_id);
+    const user = await User.query().select('id').findById(user_id);
     if (!user) {
       return reply.status(404).send({ error: 'User not found' });
     }
@@ -4638,18 +4677,22 @@ fastify.post('/api/prize-offers/:id/request', async (request, reply) => {
       }
       const distinct = [...new Set(split_user_ids)].filter((sid) => sid !== user_id && sid !== 0);
       for (const sid of distinct) {
-        if (!db.prepare('SELECT id FROM users WHERE id = ?').get(sid)) {
+        if (!(await User.query().select('id').findById(sid))) {
           return reply.status(404).send({ error: `Split user ${sid} not found` });
         }
       }
       if (distinct.length > 0) splitJson = JSON.stringify(distinct);
     }
 
-    const info = db.prepare(`
-      UPDATE prize_offers SET status = 'requested', requested_by = ?, requested_at = CURRENT_TIMESTAMP, split_user_ids = ?
-      WHERE id = ? AND status = 'available'
-    `).run(user_id, splitJson, id);
-    if (info.changes === 0) {
+    const updated = await PrizeOffer.query()
+      .patch({
+        status: 'requested',
+        requested_by: user_id,
+        requested_at: knex.raw('CURRENT_TIMESTAMP'),
+        split_user_ids: splitJson,
+      })
+      .where({ id, status: 'available' });
+    if (updated === 0) {
       return reply.status(409).send({ error: 'Offer is not available (already requested or redeemed)' });
     }
     return { success: true };
@@ -4661,12 +4704,11 @@ fastify.post('/api/prize-offers/:id/request', async (request, reply) => {
 
 // Cancel (kid withdraws) and decline (parent refuses) are the same
 // transition: requested → back on the store shelf.
-const returnOfferToStore = (offerId, reply) => {
-  const info = db.prepare(`
-    UPDATE prize_offers SET status = 'available', requested_by = NULL, requested_at = NULL, split_user_ids = NULL
-    WHERE id = ? AND status = 'requested'
-  `).run(offerId);
-  if (info.changes === 0) {
+const returnOfferToStore = async (offerId, reply) => {
+  const updated = await PrizeOffer.query()
+    .patch({ status: 'available', requested_by: null, requested_at: null, split_user_ids: null })
+    .where({ id: offerId, status: 'requested' });
+  if (updated === 0) {
     reply.status(409).send({ error: 'Offer has no pending request' });
     return null;
   }
@@ -4675,7 +4717,7 @@ const returnOfferToStore = (offerId, reply) => {
 
 fastify.post('/api/prize-offers/:id/cancel-request', async (request, reply) => {
   try {
-    return returnOfferToStore(request.params.id, reply);
+    return await returnOfferToStore(request.params.id, reply);
   } catch (error) {
     console.error('Error cancelling prize request:', error);
     reply.status(500).send({ error: 'Failed to cancel request' });
@@ -4684,7 +4726,7 @@ fastify.post('/api/prize-offers/:id/cancel-request', async (request, reply) => {
 
 fastify.post('/api/prize-offers/:id/decline', async (request, reply) => {
   try {
-    return returnOfferToStore(request.params.id, reply);
+    return await returnOfferToStore(request.params.id, reply);
   } catch (error) {
     console.error('Error declining prize request:', error);
     reply.status(500).send({ error: 'Failed to decline request' });
@@ -4698,14 +4740,17 @@ fastify.post('/api/prize-offers/:id/decline', async (request, reply) => {
 fastify.post('/api/prize-offers/:id/approve', async (request, reply) => {
   const { id } = request.params;
   try {
-    const offer = db.prepare(`
-      SELECT po.id, po.prize_id, po.requested_by, po.split_user_ids, p.name, p.clam_cost, p.repeatable,
-             u.username AS requested_by_name
-      FROM prize_offers po
-      JOIN prizes p ON po.prize_id = p.id
-      LEFT JOIN users u ON po.requested_by = u.id
-      WHERE po.id = ? AND po.status = 'requested'
-    `).get(id);
+    const offer = await knex('prize_offers as po')
+      .join('prizes as p', 'po.prize_id', 'p.id')
+      .leftJoin('users as u', 'po.requested_by', 'u.id')
+      .select(
+        'po.id', 'po.prize_id', 'po.requested_by', 'po.split_user_ids',
+        'p.name', 'p.clam_cost', 'p.repeatable',
+        'u.username as requested_by_name'
+      )
+      .where('po.id', id)
+      .where('po.status', 'requested')
+      .first();
     if (!offer) {
       return reply.status(409).send({ error: 'Offer has no pending request' });
     }
@@ -4716,42 +4761,63 @@ fastify.post('/api/prize-offers/:id/approve', async (request, reply) => {
     const participantIds = [offer.requested_by, ...splitIds];
     const share = Math.floor(offer.clam_cost / participantIds.length);
 
-    const balanceStmt = db.prepare('SELECT COALESCE(SUM(clam_value), 0) as total FROM chore_history WHERE user_id = ?');
-    const nameStmt = db.prepare('SELECT username FROM users WHERE id = ?');
-    const short = participantIds.filter((pid) => balanceStmt.get(pid).total < share);
+    const usernameFor = async (pid) => {
+      const row = await knex('users').select('username').where('id', pid).first();
+      return row?.username;
+    };
+
+    const short = [];
+    for (const pid of participantIds) {
+      if ((await getUserClamTotal(pid)) < share) short.push(pid);
+    }
     if (short.length > 0) {
-      const names = short.map((pid) => nameStmt.get(pid)?.username || `user ${pid}`).join(', ');
+      const names = (await Promise.all(short.map(async (pid) => (await usernameFor(pid)) || `user ${pid}`))).join(', ');
       return reply.status(400).send({
         error: `Insufficient clams: ${names} ${short.length === 1 ? 'has' : 'have'} less than the ${share}-clam share`,
       });
     }
 
     const today = getTodayLocalDateString();
-    const redeem = db.transaction(() => {
+    await knex.transaction(async (trx) => {
       for (const pid of participantIds) {
-        db.prepare(
-          "INSERT INTO chore_history (user_id, chore_schedule_id, date, clam_value, title, kind) VALUES (?, NULL, ?, ?, ?, 'spent')"
-        ).run(pid, today, -share, offer.name);
+        await trx('chore_history').insert({
+          user_id: pid,
+          chore_schedule_id: null,
+          date: today,
+          clam_value: -share,
+          title: offer.name,
+          kind: 'spent',
+        });
       }
       if (offer.repeatable === 1) {
         // Repeatable prize: back on the shelf for the next redemption.
-        db.prepare("UPDATE prize_offers SET status = 'available', requested_by = NULL, requested_at = NULL, split_user_ids = NULL WHERE id = ?").run(offer.id);
+        await trx('prize_offers').where('id', offer.id).update({
+          status: 'available',
+          requested_by: null,
+          requested_at: null,
+          split_user_ids: null,
+        });
       } else {
-        db.prepare("UPDATE prize_offers SET status = 'redeemed', redeemed_at = CURRENT_TIMESTAMP WHERE id = ?").run(offer.id);
+        await trx('prize_offers').where('id', offer.id).update({
+          status: 'redeemed',
+          redeemed_at: trx.raw('CURRENT_TIMESTAMP'),
+        });
       }
     });
-    redeem();
 
-    const participants = participantIds.map((pid) => ({
-      userId: pid,
-      username: nameStmt.get(pid)?.username || null,
-      share,
-      newTotal: balanceStmt.get(pid).total,
-    }));
-    for (const participant of participants) {
-      pluginEvents.emit('clam.withdrawn', { userId: participant.userId, amount: share, newTotal: participant.newTotal });
+    const participants = [];
+    for (const pid of participantIds) {
+      participants.push({
+        userId: pid,
+        username: (await usernameFor(pid)) || null,
+        share,
+        newTotal: await getUserClamTotal(pid),
+      });
     }
-    pluginEvents.emit('prize.redeemed', {
+    for (const participant of participants) {
+      await emitPluginEvent('clam.withdrawn', { userId: participant.userId, amount: share, newTotal: participant.newTotal });
+    }
+    await emitPluginEvent('prize.redeemed', {
       userId: offer.requested_by,
       prizeId: offer.prize_id,
       offerId: offer.id,
@@ -4771,10 +4837,10 @@ fastify.post('/api/prize-offers/:id/approve', async (request, reply) => {
 // Google Connections routes
 fastify.get('/api/connections/google/status', async (request, reply) => {
   try {
-    const oauth = googleConnection.getOAuthStatus(db);
-    const account = googleConnection.getConnectedAccount(db);
+    const oauth = await googleConnection.getOAuthStatus();
+    const account = await googleConnection.getConnectedAccount();
     let redirectUri = '';
-    try { redirectUri = googleConnection.deriveRedirectUri(db, request); } catch (_) { }
+    try { redirectUri = await googleConnection.deriveRedirectUri(request); } catch (_) { }
     return {
       encryption: { configured: oauth.encryption_configured, status: getEncryptionStatus() },
       oauth: {
@@ -4807,7 +4873,7 @@ fastify.post('/api/connections/google/config', async (request, reply) => {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
     }
     const { client_id, client_secret, redirect_uri_override } = request.body || {};
-    googleConnection.saveOAuthConfig(db, {
+    await googleConnection.saveOAuthConfig({
       clientId: client_id,
       clientSecret: client_secret,
       redirectUriOverride: redirect_uri_override,
@@ -4825,14 +4891,14 @@ fastify.get('/api/connections/google/authorize', async (request, reply) => {
     if (!isEncryptionConfigured()) {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
     }
-    const status = googleConnection.getOAuthStatus(db);
+    const status = await googleConnection.getOAuthStatus();
     if (!status.has_client_id || !status.has_client_secret) {
       return reply.status(400).send({ error: 'Google OAuth credentials are not configured.' });
     }
-    const redirectUri = googleConnection.deriveRedirectUri(db, request);
+    const redirectUri = await googleConnection.deriveRedirectUri(request);
     const returnUrl = request.query && request.query.return_url;
-    const state = googleConnection.createAuthState(db, redirectUri, returnUrl);
-    const url = googleConnection.buildAuthUrl(db, { redirectUri, state });
+    const state = await googleConnection.createAuthState(redirectUri, returnUrl);
+    const url = await googleConnection.buildAuthUrl({ redirectUri, state });
     return { url, redirect_uri: redirectUri };
   } catch (error) {
     console.error('Error building authorize URL:', error);
@@ -4863,13 +4929,13 @@ button:hover{background:#1d4ed8}</style></head>
     if (!code || !state) {
       return renderPage('Authorization failed', 'Missing authorization code or state.', false);
     }
-    const stateRow = googleConnection.consumeAuthState(db, state);
+    const stateRow = await googleConnection.consumeAuthState(state);
     if (!stateRow) {
       return renderPage('Authorization failed', 'Invalid or expired OAuth state.', false);
     }
-    const tokens = await googleConnection.exchangeCodeForTokens(db, { code, redirectUri: stateRow.redirect_uri });
+    const tokens = await googleConnection.exchangeCodeForTokens({ code, redirectUri: stateRow.redirect_uri });
     const userInfo = await googleConnection.fetchUserInfo(tokens.access_token);
-    googleConnection.upsertGoogleAccount(db, {
+    await googleConnection.upsertGoogleAccount({
       sub: userInfo.sub,
       email: userInfo.email,
       name: userInfo.name,
@@ -4885,9 +4951,9 @@ button:hover{background:#1d4ed8}</style></head>
 
 fastify.get('/api/connections/google/albums', async (request, reply) => {
   try {
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount();
     if (!account) return reply.status(404).send({ error: 'No Google account connected.' });
-    const albums = await googlePhotos.listAlbums(db, account.id);
+    const albums = await googlePhotos.listAlbums(account.id);
     return { albums };
   } catch (error) {
     console.error('Error listing Google Photos albums:', error);
@@ -4897,9 +4963,9 @@ fastify.get('/api/connections/google/albums', async (request, reply) => {
 
 fastify.get('/api/connections/google/calendars', async (request, reply) => {
   try {
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount();
     if (!account) return reply.status(404).send({ error: 'No Google account connected.' });
-    const calendars = await googleCalendar.listCalendars(db, account.id);
+    const calendars = await googleCalendar.listCalendars(account.id);
     return { calendars };
   } catch (error) {
     console.error('Error listing Google calendars:', error);
@@ -4909,8 +4975,8 @@ fastify.get('/api/connections/google/calendars', async (request, reply) => {
 
 // Loads a calendar source by id, asserting it's a writable Google source.
 // Sends a 404 (missing) or 400 (read-only, non-Google) and returns null on failure.
-const loadGoogleCalendarSource = (id, reply) => {
-  const source = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+const loadGoogleCalendarSource = async (id, reply) => {
+  const source = await CalendarSource.query().findById(id);
   if (!source) {
     reply.status(404).send({ error: 'Calendar source not found' });
     return null;
@@ -4925,12 +4991,12 @@ const loadGoogleCalendarSource = (id, reply) => {
 fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
   try {
     const { id } = request.params;
-    const source = loadGoogleCalendarSource(id, reply);
+    const source = await loadGoogleCalendarSource(id, reply);
     if (!source) return;
-    const account = loadConnectedGoogleAccountOr400(reply);
+    const account = await loadConnectedGoogleAccountOr400(reply);
     if (!account) return;
 
-    const created = await googleCalendar.createEvent(db, account.id, source.url, request.body || {});
+    const created = await googleCalendar.createEvent(account.id, source.url, request.body || {});
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
     return { success: true, event: created };
   } catch (error) {
@@ -4942,12 +5008,12 @@ fastify.post('/api/calendar-sources/:id/events', async (request, reply) => {
 fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply) => {
   try {
     const { id, eventId } = request.params;
-    const source = loadGoogleCalendarSource(id, reply);
+    const source = await loadGoogleCalendarSource(id, reply);
     if (!source) return;
-    const account = loadConnectedGoogleAccountOr400(reply);
+    const account = await loadConnectedGoogleAccountOr400(reply);
     if (!account) return;
 
-    const updated = await googleCalendar.updateEvent(db, account.id, source.url, eventId, request.body || {});
+    const updated = await googleCalendar.updateEvent(account.id, source.url, eventId, request.body || {});
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
     return { success: true, event: updated };
   } catch (error) {
@@ -4959,12 +5025,12 @@ fastify.patch('/api/calendar-sources/:id/events/:eventId', async (request, reply
 fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, reply) => {
   try {
     const { id, eventId } = request.params;
-    const source = loadGoogleCalendarSource(id, reply);
+    const source = await loadGoogleCalendarSource(id, reply);
     if (!source) return;
-    const account = loadConnectedGoogleAccountOr400(reply);
+    const account = await loadConnectedGoogleAccountOr400(reply);
     if (!account) return;
 
-    await googleCalendar.deleteEvent(db, account.id, source.url, eventId);
+    await googleCalendar.deleteEvent(account.id, source.url, eventId);
     if (calendarSyncService) calendarSyncService.syncSource(source.id).catch(() => { });
     return { success: true };
   } catch (error) {
@@ -4976,11 +5042,11 @@ fastify.delete('/api/calendar-sources/:id/events/:eventId', async (request, repl
 fastify.delete('/api/connections/google/account', async (request, reply) => {
   if (demoBlocked(reply)) return;
   try {
-    const account = googleConnection.getConnectedAccount(db);
+    const account = await googleConnection.getConnectedAccount();
     if (!account) {
       return { success: true, message: 'No Google account connected.' };
     }
-    await googleConnection.revokeAndDisconnect(db, account.id);
+    await googleConnection.revokeAndDisconnect(account.id);
     return { success: true };
   } catch (error) {
     console.error('Error disconnecting Google account:', error);
@@ -4995,7 +5061,7 @@ fastify.delete('/api/connections/google/account', async (request, reply) => {
 // encrypted, redacted from GET /api/settings, and written blind.
 fastify.get('/api/connections/homeassistant/status', async (request, reply) => {
   try {
-    const status = homeAssistant.getHomeAssistantStatus(db);
+    const status = await homeAssistant.getHomeAssistantStatus();
     return {
       ...status,
       encryption: { configured: status.encryption_configured, status: getEncryptionStatus() },
@@ -5016,10 +5082,13 @@ fastify.put('/api/connections/homeassistant', async (request, reply) => {
       return reply.status(400).send({ error: 'ENCRYPTION_KEY is not configured on the server.' });
     }
 
-    homeAssistant.saveConfig(db, { url, token, weatherEntity: weather_entity });
+    // saveConfig is async and rejects a bad URL, so it has to be awaited INSIDE
+    // this try for that rejection to become the 400 below rather than an
+    // unhandled rejection.
+    await homeAssistant.saveConfig({ url, token, weatherEntity: weather_entity });
     // Provider config changed, so anything cached under the old settings is stale.
     weatherService.clearCache();
-    return { success: true, status: homeAssistant.getHomeAssistantStatus(db) };
+    return { success: true, status: await homeAssistant.getHomeAssistantStatus() };
   } catch (error) {
     console.error('Error saving Home Assistant config:', error);
     reply.status(400).send({ error: error.message || 'Failed to save Home Assistant config' });
@@ -5029,7 +5098,7 @@ fastify.put('/api/connections/homeassistant', async (request, reply) => {
 fastify.post('/api/connections/homeassistant/test', async (request, reply) => {
   if (demoBlocked(reply)) return;
   try {
-    return await homeAssistant.testConnection(db);
+    return await homeAssistant.testConnection();
   } catch (error) {
     console.error('Error testing Home Assistant connection:', error);
     reply.status(500).send({ error: error.message || 'Failed to test Home Assistant connection' });
@@ -5039,10 +5108,10 @@ fastify.post('/api/connections/homeassistant/test', async (request, reply) => {
 fastify.get('/api/connections/homeassistant/weather-entities', async (request, reply) => {
   if (demoBlocked(reply)) return;
   try {
-    if (!homeAssistant.isConfigured(db)) {
+    if (!(await homeAssistant.isConfigured())) {
       return reply.status(400).send({ error: 'Home Assistant is not configured.' });
     }
-    return { entities: await homeAssistant.listWeatherEntities(db) };
+    return { entities: await homeAssistant.listWeatherEntities() };
   } catch (error) {
     const status = Number.isInteger(error.status) ? error.status : 500;
     console.error('Error listing Home Assistant weather entities:', error.message);
@@ -5053,7 +5122,7 @@ fastify.get('/api/connections/homeassistant/weather-entities', async (request, r
 fastify.delete('/api/connections/homeassistant', async (request, reply) => {
   if (demoBlocked(reply)) return;
   try {
-    homeAssistant.clearConfig(db);
+    await homeAssistant.clearConfig();
     weatherService.clearCache();
     return { success: true };
   } catch (error) {
@@ -5066,8 +5135,8 @@ fastify.delete('/api/connections/homeassistant', async (request, reply) => {
 // Panel show "no API key saved" without the key ever being sent to it.
 fastify.get('/api/connections/weather/status', async (request, reply) => {
   try {
-    const status = weatherService.getProviderStatus(db, { demoMode: DEMO_MODE });
-    const hasApiKey = !!db.prepare('SELECT value FROM settings WHERE key = ?').get('WEATHER_API_KEY')?.value;
+    const status = await weatherService.getProviderStatus({ demoMode: DEMO_MODE });
+    const hasApiKey = !!(await knex('settings').select('value').where('key', 'WEATHER_API_KEY').first())?.value;
     return { ...status, has_api_key: hasApiKey };
   } catch (error) {
     console.error('Error fetching weather provider status:', error);
@@ -5094,7 +5163,9 @@ fastify.post('/api/connections/apple/calendars', async (request, reply) => {
 // Calendar sources routes
 fastify.get('/api/calendar-sources', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT id, name, type, url, username, color, enabled, sort_order, created_at FROM calendar_sources ORDER BY sort_order, id').all();
+    const rows = await CalendarSource.query()
+      .select('id', 'name', 'type', 'url', 'username', 'color', 'enabled', 'sort_order', 'created_at')
+      .orderBy([{ column: 'sort_order' }, { column: 'id' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching calendar sources:', error);
@@ -5113,7 +5184,7 @@ fastify.post('/api/calendar-sources', async (request, reply) => {
   if (!['ICS', 'CalDAV', 'Google', 'Apple'].includes(type)) {
     return reply.status(400).send({ error: 'Type must be ICS, CalDAV, Google, or Apple.' });
   }
-  if (type === 'Google' && !googleConnection.getConnectedAccount(db)) {
+  if (type === 'Google' && !(await googleConnection.getConnectedAccount())) {
     return reply.status(400).send({ error: 'Connect your Google account before adding a Google calendar.' });
   }
   if (type === 'Apple' && (!request.body.username || !password)) {
@@ -5121,20 +5192,25 @@ fastify.post('/api/calendar-sources', async (request, reply) => {
   }
   try {
     const encryptedPassword = password ? encryptPassword(password) : null;
-    const maxOrder = db.prepare('SELECT MAX(sort_order) as max FROM calendar_sources').get();
-    const nextOrder = (maxOrder.max || 0) + 1;
+    const maxRow = await knex('calendar_sources').max({ max: 'sort_order' }).first();
+    const nextOrder = ((maxRow && maxRow.max) || 0) + 1;
 
-    const stmt = db.prepare(`
-      INSERT INTO calendar_sources (name, type, url, username, password, color, enabled, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(name, type, url, username || null, encryptedPassword, color || '#6e44ff', 1, nextOrder);
+    const inserted = await CalendarSource.query().insert({
+      name,
+      type,
+      url,
+      username: username || null,
+      password: encryptedPassword,
+      color: color || '#6e44ff',
+      enabled: 1,
+      sort_order: nextOrder,
+    });
 
     if (calendarSyncService) {
-      calendarSyncService.onSourceCreated(info.lastInsertRowid);
+      calendarSyncService.onSourceCreated(inserted.id);
     }
 
-    return { id: info.lastInsertRowid, success: true };
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding calendar source:', error);
     reply.status(500).send({ error: 'Failed to add calendar source' });
@@ -5149,41 +5225,35 @@ fastify.patch('/api/calendar-sources/:id', async (request, reply) => {
   const { name, type, url, username, password, color, enabled } = request.body;
 
   try {
-    const existing = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const existing = await CalendarSource.query().findById(id);
     if (!existing) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
 
-    const updateFields = [];
-    const updateValues = [];
+    const patch = {};
 
-    if (name !== undefined) { updateFields.push('name = ?'); updateValues.push(name); }
+    if (name !== undefined) { patch.name = name; }
     if (type !== undefined) {
       if (!['ICS', 'CalDAV', 'Apple'].includes(type)) {
         return reply.status(400).send({ error: 'Type must be ICS, CalDAV, or Apple.' });
       }
-      updateFields.push('type = ?');
-      updateValues.push(type);
+      patch.type = type;
     }
-    if (url !== undefined) { updateFields.push('url = ?'); updateValues.push(url); }
-    if (username !== undefined) { updateFields.push('username = ?'); updateValues.push(username || null); }
+    if (url !== undefined) { patch.url = url; }
+    if (username !== undefined) { patch.username = username || null; }
     if (password !== undefined && password !== '') {
-      const encryptedPassword = encryptPassword(password);
-      updateFields.push('password = ?');
-      updateValues.push(encryptedPassword);
+      patch.password = encryptPassword(password);
     }
-    if (color !== undefined) { updateFields.push('color = ?'); updateValues.push(color); }
-    if (enabled !== undefined) { updateFields.push('enabled = ?'); updateValues.push(enabled ? 1 : 0); }
+    if (color !== undefined) { patch.color = color; }
+    if (enabled !== undefined) { patch.enabled = enabled ? 1 : 0; }
 
-    if (updateFields.length === 0) {
+    if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
     }
 
-    updateValues.push(id);
-    const stmt = db.prepare(`UPDATE calendar_sources SET ${updateFields.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...updateValues);
+    const updated = await CalendarSource.query().patch(patch).where({ id });
 
-    if (info.changes === 0) {
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
 
@@ -5211,9 +5281,8 @@ fastify.delete('/api/calendar-sources/:id', async (request, reply) => {
       calendarSyncService.onSourceDeleted(parseInt(id));
     }
 
-    const stmt = db.prepare('DELETE FROM calendar_sources WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await CalendarSource.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
     return { success: true, message: 'Calendar source deleted successfully' };
@@ -5227,7 +5296,7 @@ fastify.post('/api/calendar-sources/:id/test', async (request, reply) => {
   if (demoBlocked(reply)) return;
   const { id } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM calendar_sources WHERE id = ?').get(id);
+    const source = await CalendarSource.query().findById(id);
     if (!source) {
       return reply.status(404).send({ error: 'Calendar source not found' });
     }
@@ -5271,7 +5340,7 @@ fastify.get('/api/calendar-events', async (request, reply) => {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
 
-    const events = calendarSyncService.getCachedEvents(start, end);
+    const events = await calendarSyncService.getCachedEvents(start, end);
     return events;
   } catch (error) {
     console.error('Error fetching calendar events:', error);
@@ -5285,7 +5354,7 @@ fastify.get('/api/calendar-sync/status', async (request, reply) => {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
-    const status = calendarSyncService.getSyncStatus();
+    const status = await calendarSyncService.getSyncStatus();
     return status;
   } catch (error) {
     console.error('Error fetching sync status:', error);
@@ -5300,7 +5369,7 @@ fastify.get('/api/calendar-sync/status/:sourceId', async (request, reply) => {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
-    const status = calendarSyncService.getSyncStatus(parseInt(sourceId));
+    const status = await calendarSyncService.getSyncStatus(parseInt(sourceId));
     return status || { source_id: sourceId, last_sync_at: null, last_sync_status: 'never' };
   } catch (error) {
     console.error('Error fetching sync status:', error);
@@ -5354,7 +5423,7 @@ fastify.patch('/api/calendar-sync/:sourceId/interval', async (request, reply) =>
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
 
-    calendarSyncService.setSyncInterval(parseInt(sourceId), interval_minutes);
+    await calendarSyncService.setSyncInterval(parseInt(sourceId), interval_minutes);
     return { success: true, message: `Sync interval set to ${interval_minutes} minutes` };
   } catch (error) {
     console.error('Error setting sync interval:', error);
@@ -5369,7 +5438,7 @@ fastify.get('/api/calendar-sync/:sourceId/interval', async (request, reply) => {
     if (!calendarSyncService) {
       return reply.status(503).send({ error: 'Calendar sync service not initialized' });
     }
-    const interval = calendarSyncService.getSyncInterval(parseInt(sourceId));
+    const interval = await calendarSyncService.getSyncInterval(parseInt(sourceId));
     return { source_id: parseInt(sourceId), interval_minutes: interval };
   } catch (error) {
     console.error('Error getting sync interval:', error);
@@ -5381,7 +5450,9 @@ fastify.get('/api/calendar-sync/:sourceId/interval', async (request, reply) => {
 // Photo sources routes
 fastify.get('/api/photo-sources', async (request, reply) => {
   try {
-    const rows = db.prepare('SELECT id, name, type, url, album_id, enabled, sort_order, created_at FROM photo_sources ORDER BY sort_order, id').all();
+    const rows = await PhotoSource.query()
+      .select('id', 'name', 'type', 'url', 'album_id', 'enabled', 'sort_order', 'created_at')
+      .orderBy([{ column: 'sort_order' }, { column: 'id' }]);
     return rows;
   } catch (error) {
     console.error('Error fetching photo sources:', error);
@@ -5401,15 +5472,22 @@ fastify.post('/api/photo-sources', async (request, reply) => {
     const encryptedApiKey = api_key ? encryptPassword(api_key) : null;
     const encryptedPassword = password ? encryptPassword(password) : null;
     const encryptedRefreshToken = refresh_token ? encryptPassword(refresh_token) : null;
-    const maxOrder = db.prepare('SELECT MAX(sort_order) as max FROM photo_sources').get();
-    const nextOrder = (maxOrder.max || 0) + 1;
+    const maxRow = await knex('photo_sources').max({ max: 'sort_order' }).first();
+    const nextOrder = ((maxRow && maxRow.max) || 0) + 1;
 
-    const stmt = db.prepare(`
-      INSERT INTO photo_sources (name, type, url, api_key, username, password, album_id, refresh_token, enabled, sort_order)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(name, type, url || null, encryptedApiKey, username || null, encryptedPassword, album_id || null, encryptedRefreshToken, 1, nextOrder);
-    return { id: info.lastInsertRowid, success: true };
+    const inserted = await PhotoSource.query().insert({
+      name,
+      type,
+      url: url || null,
+      api_key: encryptedApiKey,
+      username: username || null,
+      password: encryptedPassword,
+      album_id: album_id || null,
+      refresh_token: encryptedRefreshToken,
+      enabled: 1,
+      sort_order: nextOrder,
+    });
+    return { id: inserted.id, success: true };
   } catch (error) {
     console.error('Error adding photo source:', error);
     reply.status(500).send({ error: 'Failed to add photo source' });
@@ -5421,51 +5499,41 @@ fastify.patch('/api/photo-sources/:id', async (request, reply) => {
   const { name, type, url, api_key, username, password, album_id, refresh_token, enabled } = request.body;
 
   try {
-    const existing = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(id);
+    const existing = await PhotoSource.query().findById(id);
     if (!existing) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
 
-    const updateFields = [];
-    const updateValues = [];
+    const patch = {};
 
-    if (name !== undefined) { updateFields.push('name = ?'); updateValues.push(name); }
+    if (name !== undefined) { patch.name = name; }
     if (type !== undefined) {
       if (!['Immich', 'GooglePhotos', 'HomeGlowPhotos'].includes(type)) {
         return reply.status(400).send({ error: 'Type must be Immich, GooglePhotos, or HomeGlowPhotos.' });
       }
-      updateFields.push('type = ?');
-      updateValues.push(type);
+      patch.type = type;
     }
-    if (url !== undefined) { updateFields.push('url = ?'); updateValues.push(url || null); }
+    if (url !== undefined) { patch.url = url || null; }
     if (api_key !== undefined && api_key !== '') {
-      const encryptedApiKey = encryptPassword(api_key);
-      updateFields.push('api_key = ?');
-      updateValues.push(encryptedApiKey);
+      patch.api_key = encryptPassword(api_key);
     }
-    if (username !== undefined) { updateFields.push('username = ?'); updateValues.push(username || null); }
+    if (username !== undefined) { patch.username = username || null; }
     if (password !== undefined && password !== '') {
-      const encryptedPassword = encryptPassword(password);
-      updateFields.push('password = ?');
-      updateValues.push(encryptedPassword);
+      patch.password = encryptPassword(password);
     }
-    if (album_id !== undefined) { updateFields.push('album_id = ?'); updateValues.push(album_id || null); }
+    if (album_id !== undefined) { patch.album_id = album_id || null; }
     if (refresh_token !== undefined && refresh_token !== '') {
-      const encryptedRefreshToken = encryptPassword(refresh_token);
-      updateFields.push('refresh_token = ?');
-      updateValues.push(encryptedRefreshToken);
+      patch.refresh_token = encryptPassword(refresh_token);
     }
-    if (enabled !== undefined) { updateFields.push('enabled = ?'); updateValues.push(enabled ? 1 : 0); }
+    if (enabled !== undefined) { patch.enabled = enabled ? 1 : 0; }
 
-    if (updateFields.length === 0) {
+    if (Object.keys(patch).length === 0) {
       return reply.status(400).send({ error: 'No fields to update' });
     }
 
-    updateValues.push(id);
-    const stmt = db.prepare(`UPDATE photo_sources SET ${updateFields.join(', ')} WHERE id = ?`);
-    const info = stmt.run(...updateValues);
+    const updated = await PhotoSource.query().patch(patch).where({ id });
 
-    if (info.changes === 0) {
+    if (updated === 0) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
     return { success: true, message: 'Photo source updated successfully' };
@@ -5478,17 +5546,16 @@ fastify.patch('/api/photo-sources/:id', async (request, reply) => {
 fastify.delete('/api/photo-sources/:id', async (request, reply) => {
   const { id } = request.params;
   try {
-    const picked = db.prepare('SELECT local_path FROM google_picked_media WHERE source_id = ?').all(id);
+    const picked = await GooglePickedMedia.query().select('local_path').where('source_id', id);
     for (const p of picked) googlePhotosPicker.removeLocalFile(p.local_path);
-    db.prepare('DELETE FROM google_picked_media WHERE source_id = ?').run(id);
+    await GooglePickedMedia.query().delete().where('source_id', id);
 
     const homeglowDir = path.join(__dirname, 'uploads', 'homeglow-photos', String(id));
     try { fsSync.rmSync(homeglowDir, { recursive: true, force: true }); } catch (_) { }
-    db.prepare('DELETE FROM homeglow_photos WHERE source_id = ?').run(id);
+    await HomeglowPhoto.query().delete().where('source_id', id);
 
-    const stmt = db.prepare('DELETE FROM photo_sources WHERE id = ?');
-    const info = stmt.run(id);
-    if (info.changes === 0) {
+    const deleted = await PhotoSource.query().deleteById(id);
+    if (deleted === 0) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
     return { success: true, message: 'Photo source deleted successfully' };
@@ -5501,7 +5568,7 @@ fastify.delete('/api/photo-sources/:id', async (request, reply) => {
 fastify.post('/api/photo-sources/:id/test', async (request, reply) => {
   const { id } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(id);
+    const source = await PhotoSource.query().findById(id);
     if (!source) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
@@ -5524,14 +5591,14 @@ fastify.post('/api/photo-sources/:id/test', async (request, reply) => {
       );
       return { success: true, assetCount: response.data.length || 0, message: `Immich connection successful (${response.data.length || 0} assets found)` };
     } else if (source.type === 'GooglePhotos') {
-      const account = googleConnection.getConnectedAccount(db);
+      const account = await googleConnection.getConnectedAccount();
       if (!account) {
         return reply.status(400).send({ success: false, error: 'No Google account connected. Connect one in Admin > Connections.' });
       }
-      const count = db.prepare('SELECT COUNT(*) AS c FROM google_picked_media WHERE source_id = ?').get(source.id).c;
+      const count = Number((await knex('google_picked_media').where('source_id', source.id).count({ c: '*' }).first()).c);
       return { success: true, message: `${count} picked photo${count === 1 ? '' : 's'} available for this source.` };
     } else if (source.type === 'HomeGlowPhotos') {
-      const count = db.prepare('SELECT COUNT(*) AS c FROM homeglow_photos WHERE source_id = ?').get(source.id).c;
+      const count = Number((await knex('homeglow_photos').where('source_id', source.id).count({ c: '*' }).first()).c);
       return { success: true, message: `${count} uploaded photo${count === 1 ? '' : 's'} available for this source.` };
     }
     return reply.status(400).send({ success: false, error: `Unsupported photo source type: ${source.type}` });
@@ -5571,7 +5638,7 @@ fastify.get('/api/photo-proxy/:sourceId/:assetId', async (request, reply) => {
   const { size = 'preview' } = request.query;
 
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await PhotoSource.query().findById(sourceId);
     if (!source) {
       return reply.status(404).send({ error: 'Photo source not found' });
     }
@@ -5603,8 +5670,8 @@ fastify.get('/api/photo-proxy/:sourceId/:assetId', async (request, reply) => {
 
 // Loads a HomeGlow Photos source by id, asserting its type. On miss, sends a
 // 404 and returns null so the caller can `if (!source) return;`.
-const loadHomeGlowPhotoSourceOr404 = (sourceId, reply) => {
-  const source = db.prepare('SELECT id, type FROM photo_sources WHERE id = ?').get(sourceId);
+const loadHomeGlowPhotoSourceOr404 = async (sourceId, reply) => {
+  const source = await PhotoSource.query().select('id', 'type').findById(sourceId);
   if (!source || source.type !== 'HomeGlowPhotos') {
     reply.status(404).send({ error: 'HomeGlow Photos source not found' });
     return null;
@@ -5616,11 +5683,12 @@ const loadHomeGlowPhotoSourceOr404 = (sourceId, reply) => {
 fastify.get('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = loadHomeGlowPhotoSourceOr404(sourceId, reply);
+    const source = await loadHomeGlowPhotoSourceOr404(sourceId, reply);
     if (!source) return;
-    const rows = db.prepare(
-      'SELECT id, filename, original_name, mime_type, size, uploaded_at FROM homeglow_photos WHERE source_id = ? ORDER BY uploaded_at DESC'
-    ).all(sourceId);
+    const rows = await HomeglowPhoto.query()
+      .select('id', 'filename', 'original_name', 'mime_type', 'size', 'uploaded_at')
+      .where('source_id', sourceId)
+      .orderBy('uploaded_at', 'desc');
     return rows.map((r) => ({
       ...r,
       url: `/api/photo-sources/${sourceId}/uploaded/${r.id}/file`,
@@ -5636,9 +5704,7 @@ fastify.get('/api/photo-sources/:sourceId/uploaded', async (request, reply) => {
 fastify.get('/api/photo-sources/:sourceId/uploaded/:photoId/file', async (request, reply) => {
   const { sourceId, photoId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT filename, mime_type FROM homeglow_photos WHERE id = ? AND source_id = ?'
-    ).get(photoId, sourceId);
+    const row = await HomeglowPhoto.query().select('filename', 'mime_type').where({ id: photoId, source_id: sourceId }).first();
     if (!row) return reply.status(404).send({ error: 'Photo not found' });
     const filePath = path.join(__dirname, 'uploads', 'homeglow-photos', String(sourceId), row.filename);
     if (!fsSync.existsSync(filePath)) return reply.status(404).send({ error: 'File missing' });
@@ -5656,7 +5722,7 @@ fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => 
   if (demoBlocked(reply)) return;
   const { sourceId } = request.params;
   try {
-    const source = loadHomeGlowPhotoSourceOr404(sourceId, reply);
+    const source = await loadHomeGlowPhotoSourceOr404(sourceId, reply);
     if (!source) return;
     const uploadDir = path.join(__dirname, 'uploads', 'homeglow-photos', String(sourceId));
     await fs.mkdir(uploadDir, { recursive: true });
@@ -5678,10 +5744,8 @@ fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => 
         const filePath = path.join(uploadDir, filename);
         const buffer = await part.toBuffer();
         await fs.writeFile(filePath, buffer);
-        const info = db.prepare(
-          `INSERT INTO homeglow_photos (source_id, filename, original_name, mime_type, size) VALUES (?, ?, ?, ?, ?)`
-        ).run(sourceId, filename, part.filename || null, part.mimetype, buffer.length);
-        added.push({ id: info.lastInsertRowid, filename, original_name: part.filename });
+        const inserted = await HomeglowPhoto.query().insert({ source_id: sourceId, filename, original_name: part.filename || null, mime_type: part.mimetype, size: buffer.length });
+        added.push({ id: inserted.id, filename, original_name: part.filename });
       } catch (err) {
         console.error('Upload failure for part:', err);
         failed.push({ name: part.filename, reason: err.message });
@@ -5698,13 +5762,11 @@ fastify.post('/api/photo-sources/:sourceId/uploaded', async (request, reply) => 
 fastify.delete('/api/photo-sources/:sourceId/uploaded/:photoId', async (request, reply) => {
   const { sourceId, photoId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT filename FROM homeglow_photos WHERE id = ? AND source_id = ?'
-    ).get(photoId, sourceId);
+    const row = await HomeglowPhoto.query().select('filename').where({ id: photoId, source_id: sourceId }).first();
     if (!row) return reply.status(404).send({ error: 'Photo not found' });
     const filePath = path.join(__dirname, 'uploads', 'homeglow-photos', String(sourceId), row.filename);
     try { await fs.unlink(filePath); } catch (_) { }
-    db.prepare('DELETE FROM homeglow_photos WHERE id = ?').run(photoId);
+    await HomeglowPhoto.query().deleteById(photoId);
     return { success: true };
   } catch (error) {
     console.error('Error deleting uploaded photo:', error);
@@ -5715,9 +5777,7 @@ fastify.delete('/api/photo-sources/:sourceId/uploaded/:photoId', async (request,
 fastify.get('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request, reply) => {
   const { sourceId, mediaRowId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT local_path, mime_type FROM google_picked_media WHERE id = ? AND source_id = ?'
-    ).get(mediaRowId, sourceId);
+    const row = await GooglePickedMedia.query().select('local_path', 'mime_type').where({ id: mediaRowId, source_id: sourceId }).first();
     if (!row || !fsSync.existsSync(row.local_path)) {
       return reply.status(404).send({ error: 'Picked media not found' });
     }
@@ -5733,9 +5793,7 @@ fastify.get('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request, r
 fastify.get('/api/photo-sources/:sourceId/picked', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const rows = db.prepare(
-      'SELECT id, google_media_id, filename, mime_type, width, height, created_time, downloaded_at FROM google_picked_media WHERE source_id = ? ORDER BY downloaded_at DESC'
-    ).all(sourceId);
+    const rows = await GooglePickedMedia.query().select('id', 'google_media_id', 'filename', 'mime_type', 'width', 'height', 'created_time', 'downloaded_at').where('source_id', sourceId).orderBy('downloaded_at', 'desc');
     return rows.map((r) => ({
       ...r,
       thumbnail_url: `/api/photo-sources/${sourceId}/picked/${r.id}`,
@@ -5749,12 +5807,10 @@ fastify.get('/api/photo-sources/:sourceId/picked', async (request, reply) => {
 fastify.delete('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request, reply) => {
   const { sourceId, mediaRowId } = request.params;
   try {
-    const row = db.prepare(
-      'SELECT local_path FROM google_picked_media WHERE id = ? AND source_id = ?'
-    ).get(mediaRowId, sourceId);
+    const row = await GooglePickedMedia.query().select('local_path').where({ id: mediaRowId, source_id: sourceId }).first();
     if (!row) return reply.status(404).send({ error: 'Picked media not found' });
     googlePhotosPicker.removeLocalFile(row.local_path);
-    db.prepare('DELETE FROM google_picked_media WHERE id = ?').run(mediaRowId);
+    await GooglePickedMedia.query().deleteById(mediaRowId);
     return { success: true };
   } catch (error) {
     console.error('Error deleting picked media:', error);
@@ -5764,8 +5820,8 @@ fastify.delete('/api/photo-sources/:sourceId/picked/:mediaRowId', async (request
 
 // Loads a Google Photos photo source by id. On miss (absent or wrong type),
 // sends a 404 and returns null so the caller can `if (!source) return;`.
-const loadGooglePhotoSourceOr404 = (sourceId, reply) => {
-  const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+const loadGooglePhotoSourceOr404 = async (sourceId, reply) => {
+  const source = await PhotoSource.query().findById(sourceId);
   if (!source || source.type !== 'GooglePhotos') {
     reply.status(404).send({ error: 'Google Photos source not found' });
     return null;
@@ -5774,8 +5830,8 @@ const loadGooglePhotoSourceOr404 = (sourceId, reply) => {
 };
 
 // Returns the connected Google account, or sends a 400 and returns null.
-const loadConnectedGoogleAccountOr400 = (reply) => {
-  const account = googleConnection.getConnectedAccount(db);
+const loadConnectedGoogleAccountOr400 = async (reply) => {
+  const account = await googleConnection.getConnectedAccount();
   if (!account) {
     reply.status(400).send({ error: 'No Google account connected.' });
     return null;
@@ -5786,15 +5842,13 @@ const loadConnectedGoogleAccountOr400 = (reply) => {
 fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = loadGooglePhotoSourceOr404(sourceId, reply);
+    const source = await loadGooglePhotoSourceOr404(sourceId, reply);
     if (!source) return;
-    const account = loadConnectedGoogleAccountOr400(reply);
+    const account = await loadConnectedGoogleAccountOr400(reply);
     if (!account) return;
 
-    const session = await googlePhotosPicker.createSession(db, account.id);
-    db.prepare(
-      'UPDATE photo_sources SET picker_session_id = ?, picker_session_expire = ? WHERE id = ?'
-    ).run(session.id || null, session.expireTime || null, sourceId);
+    const session = await googlePhotosPicker.createSession(account.id);
+    await PhotoSource.query().findById(sourceId).patch({ picker_session_id: session.id || null, picker_session_expire: session.expireTime || null });
 
     return {
       sessionId: session.id,
@@ -5812,15 +5866,15 @@ fastify.post('/api/photo-sources/:sourceId/picker-session', async (request, repl
 fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = loadGooglePhotoSourceOr404(sourceId, reply);
+    const source = await loadGooglePhotoSourceOr404(sourceId, reply);
     if (!source) return;
     if (!source.picker_session_id) {
       return { sessionId: null, mediaItemsSet: false };
     }
-    const account = loadConnectedGoogleAccountOr400(reply);
+    const account = await loadConnectedGoogleAccountOr400(reply);
     if (!account) return;
 
-    const session = await googlePhotosPicker.getSession(db, account.id, source.picker_session_id);
+    const session = await googlePhotosPicker.getSession(account.id, source.picker_session_id);
     return {
       sessionId: session.id,
       pickerUri: session.pickerUri,
@@ -5831,7 +5885,7 @@ fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply
   } catch (error) {
     console.error('Error polling picker session:', error);
     if (error.status === 404 || error.status === 400) {
-      db.prepare('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?').run(sourceId);
+      await PhotoSource.query().findById(sourceId).patch({ picker_session_id: null, picker_session_expire: null });
     }
     reply.status(error.status || 500).send({ error: error.message || 'Failed to poll picker session' });
   }
@@ -5840,26 +5894,20 @@ fastify.get('/api/photo-sources/:sourceId/picker-session', async (request, reply
 fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = loadGooglePhotoSourceOr404(sourceId, reply);
+    const source = await loadGooglePhotoSourceOr404(sourceId, reply);
     if (!source) return;
     if (!source.picker_session_id) {
       return reply.status(400).send({ error: 'No active picker session' });
     }
-    const account = loadConnectedGoogleAccountOr400(reply);
+    const account = await loadConnectedGoogleAccountOr400(reply);
     if (!account) return;
 
-    const session = await googlePhotosPicker.getSession(db, account.id, source.picker_session_id);
+    const session = await googlePhotosPicker.getSession(account.id, source.picker_session_id);
     if (!session.mediaItemsSet) {
       return reply.status(400).send({ error: 'Picker session not yet completed by user' });
     }
 
-    const items = await googlePhotosPicker.listPickedMediaItems(db, account.id, source.picker_session_id);
-    const insert = db.prepare(`
-      INSERT OR IGNORE INTO google_picked_media
-        (source_id, google_media_id, filename, mime_type, local_path, width, height, created_time)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
+    const items = await googlePhotosPicker.listPickedMediaItems(account.id, source.picker_session_id);
     let added = 0;
     let skipped = 0;
     let failed = 0;
@@ -5867,20 +5915,11 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
       const mediaFile = item.mediaFile || {};
       const mime = mediaFile.mimeType;
       if (!googlePhotosPicker.isImageMime(mime)) { skipped++; continue; }
-      const existing = db.prepare('SELECT id FROM google_picked_media WHERE source_id = ? AND google_media_id = ?').get(sourceId, item.id);
+      const existing = await GooglePickedMedia.query().select('id').where({ source_id: sourceId, google_media_id: item.id }).first();
       if (existing) { skipped++; continue; }
       try {
-        const saved = await googlePhotosPicker.downloadMedia(db, account.id, sourceId, item);
-        insert.run(
-          sourceId,
-          item.id,
-          saved.filename,
-          saved.mimeType,
-          saved.localPath,
-          saved.width,
-          saved.height,
-          item.createTime || null,
-        );
+        const saved = await googlePhotosPicker.downloadMedia(account.id, sourceId, item);
+        await GooglePickedMedia.query().insert({ source_id: sourceId, google_media_id: item.id, filename: saved.filename, mime_type: saved.mimeType, local_path: saved.localPath, width: saved.width, height: saved.height, created_time: item.createTime || null }).onConflict(['source_id', 'google_media_id']).ignore();
         added++;
       } catch (err) {
         console.error('Failed to ingest picked item', item.id, err.message);
@@ -5889,11 +5928,11 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
     }
 
     try {
-      await googlePhotosPicker.deleteSession(db, account.id, source.picker_session_id);
+      await googlePhotosPicker.deleteSession(account.id, source.picker_session_id);
     } catch (e) {
       console.warn('Failed to delete picker session (non-fatal):', e.message);
     }
-    db.prepare('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?').run(sourceId);
+    await PhotoSource.query().findById(sourceId).patch({ picker_session_id: null, picker_session_expire: null });
 
     return { added, skipped, failed, total: items.length };
   } catch (error) {
@@ -5905,15 +5944,15 @@ fastify.post('/api/photo-sources/:sourceId/picker-session/ingest', async (reques
 fastify.delete('/api/photo-sources/:sourceId/picker-session', async (request, reply) => {
   const { sourceId } = request.params;
   try {
-    const source = db.prepare('SELECT * FROM photo_sources WHERE id = ?').get(sourceId);
+    const source = await PhotoSource.query().findById(sourceId);
     if (!source) return reply.status(404).send({ error: 'Source not found' });
     if (source.picker_session_id) {
-      const account = googleConnection.getConnectedAccount(db);
+      const account = await googleConnection.getConnectedAccount();
       if (account) {
-        try { await googlePhotosPicker.deleteSession(db, account.id, source.picker_session_id); } catch (_) { }
+        try { await googlePhotosPicker.deleteSession(account.id, source.picker_session_id); } catch (_) { }
       }
     }
-    db.prepare('UPDATE photo_sources SET picker_session_id = NULL, picker_session_expire = NULL WHERE id = ?').run(sourceId);
+    await PhotoSource.query().findById(sourceId).patch({ picker_session_id: null, picker_session_expire: null });
     return { success: true };
   } catch (error) {
     console.error('Error clearing picker session:', error);
@@ -5923,7 +5962,7 @@ fastify.delete('/api/photo-sources/:sourceId/picker-session', async (request, re
 
 fastify.get('/api/photo-items', async (request, reply) => {
   try {
-    const sources = db.prepare('SELECT * FROM photo_sources WHERE enabled = 1 ORDER BY sort_order, id').all();
+    const sources = await PhotoSource.query().where('enabled', 1).orderBy([{ column: 'sort_order' }, { column: 'id' }]);
 
     if (sources.length === 0) {
       return [];
@@ -5983,9 +6022,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
             source_type: 'Immich'
           }));
         } else if (source.type === 'GooglePhotos') {
-          const rows = db.prepare(
-            'SELECT id, google_media_id FROM google_picked_media WHERE source_id = ?'
-          ).all(source.id);
+          const rows = await GooglePickedMedia.query().select('id', 'google_media_id').where('source_id', source.id);
           const photos = rows.map((r) => ({
             id: r.google_media_id,
             url: `/api/photo-sources/${source.id}/picked/${r.id}`,
@@ -5998,9 +6035,7 @@ fastify.get('/api/photo-items', async (request, reply) => {
           shuffleInPlace(photos);
           return photos;
         } else if (source.type === 'HomeGlowPhotos') {
-          const rows = db.prepare(
-            'SELECT id, filename FROM homeglow_photos WHERE source_id = ? ORDER BY uploaded_at DESC'
-          ).all(source.id);
+          const rows = await HomeglowPhoto.query().select('id', 'filename').where('source_id', source.id).orderBy('uploaded_at', 'desc');
           const photos = rows.map((r) => ({
             id: `homeglow-${r.id}`,
             url: `/api/photo-sources/${source.id}/uploaded/${r.id}/file`,
@@ -6044,7 +6079,7 @@ fastify.get('/api/admin-pin/exists', async (request, reply) => {
     if (DEMO_MODE) {
       return { exists: false, demo: true };
     }
-    const pin = db.prepare('SELECT id FROM admin_pin WHERE id = 1').get();
+    const pin = await AdminPin.query().select('id').findById(1);
     return { exists: !!pin };
   } catch (error) {
     console.error('Error checking PIN existence:', error);
@@ -6070,14 +6105,14 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 
   try {
     const pinHash = crypto.createHash('sha256').update(pin).digest('hex');
-    const existingPin = db.prepare('SELECT id FROM admin_pin WHERE id = 1').get();
+    const existingPin = await AdminPin.query().findById(1);
 
     if (existingPin) {
-      const stmt = db.prepare('UPDATE admin_pin SET pin_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1');
-      stmt.run(pinHash);
+      await AdminPin.query()
+        .findById(1)
+        .patch({ pin_hash: pinHash, updated_at: knex.raw('CURRENT_TIMESTAMP') });
     } else {
-      const stmt = db.prepare('INSERT INTO admin_pin (id, pin_hash) VALUES (1, ?)');
-      stmt.run(pinHash);
+      await AdminPin.query().insert({ id: 1, pin_hash: pinHash });
     }
 
     return { success: true, message: 'PIN set successfully' };
@@ -6090,7 +6125,7 @@ fastify.post('/api/admin-pin/set', async (request, reply) => {
 fastify.delete('/api/admin-pin', async (request, reply) => {
   if (demoBlocked(reply)) return;
   try {
-    db.prepare('DELETE FROM admin_pin WHERE id = 1').run();
+    await AdminPin.query().deleteById(1);
     return { success: true, message: 'PIN cleared successfully' };
   } catch (error) {
     console.error('Error clearing PIN:', error);
@@ -6107,7 +6142,7 @@ fastify.post('/api/admin-pin/verify', async (request, reply) => {
   }
 
   try {
-    const storedPin = db.prepare('SELECT pin_hash FROM admin_pin WHERE id = 1').get();
+    const storedPin = await AdminPin.query().findById(1);
 
     if (!storedPin) {
       return reply.status(404).send({ error: 'No PIN configured' });
@@ -6139,30 +6174,54 @@ fastify.get('/api/system/backgroundTasks', async (request, reply) => {
 const start = async () => {
   try {
     db = await ConnectOrCreateDb();
-    if (!doesTableExist('settings')) {
-      console.log('settings table not found; running initial bootstrap migrations');
-      await runLegacyMigrations();
+    // Wire Knex + Objection alongside the legacy better-sqlite3 connection. The
+    // legacy handle exists only for the pre-v14 schema lift below; all runtime
+    // data access goes through Knex/Objection.
+    //
+    // The filename is passed explicitly: createKnex() would otherwise resolve
+    // DB_PATH (or server/data/tasks.db) on its own and a demo instance would
+    // persist visitor data to a real file while only the legacy handle was
+    // in-memory.
+    knex = createKnex({ filename: dbPath });
+    Model.knex(knex);
+
+    // Schema management: Knex (knex_migrations) is the source of truth.
+    //  * Existing install (settings table present): lift any pre-baseline DB to
+    //    v14 with the legacy schema migrations (Option A), then Knex adopts it.
+    //  * Fresh install (including demo mode's in-memory DB, where the legacy
+    //    handle sees no schema at all): the Knex baseline migration builds v14
+    //    directly and the post-baseline migrations take it to the current level.
+    if (doesTableExist('settings')) {
+      const currentSchemaId = getCurrentSchemaVersion();
+      if (currentSchemaId < BASELINE_SCHEMA_VERSION) {
+        console.log(`Existing DB at schema ${currentSchemaId}; lifting to baseline v${BASELINE_SCHEMA_VERSION} via legacy migrations`);
+        await applySchemaMigrations(currentSchemaId);
+      }
     }
-    const currentSchemaId = getCurrentSchemaVersion();
-    await applySchemaMigrations(currentSchemaId);
+    const migrationResult = await adoptOrMigrate(knex);
+    console.log(`Knex migrations: adopted=${migrationResult.adopted}, applied=[${migrationResult.applied.join(', ')}]`);
 
     if (DEMO_MODE) {
       const { resetDemoData } = require('./utils/demoSeed');
       console.log(`DEMO MODE enabled: in-memory database, PIN disabled, sample data resets every ${DEMO_RESET_HOURS}h`);
-      resetDemoData(db);
+      await resetDemoData();
       setInterval(() => {
-        try {
-          resetDemoData(db);
-          // Reseeding assigns new source ids, so the running sync jobs point
-          // at rows that no longer exist. Restart them (this also kicks off an
-          // immediate syncAllSources to refill the wiped event cache).
-          if (calendarSyncService && process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
-            calendarSyncService.stopAllSyncJobs();
-            calendarSyncService.startAllSyncJobs();
+        // resetDemoData is async: an un-awaited rejection here would be a fatal
+        // unhandledRejection, so the promise is handled inside the callback.
+        (async () => {
+          try {
+            await resetDemoData();
+            // Reseeding assigns new source ids, so the running sync jobs point
+            // at rows that no longer exist. Restart them (this also kicks off an
+            // immediate syncAllSources to refill the wiped event cache).
+            if (calendarSyncService && process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
+              calendarSyncService.stopAllSyncJobs();
+              calendarSyncService.startAllSyncJobs();
+            }
+          } catch (err) {
+            console.error('Demo reset failed:', err);
           }
-        } catch (err) {
-          console.error('Demo reset failed:', err);
-        }
+        })();
       }, DEMO_RESET_HOURS * 60 * 60 * 1000).unref();
     }
 
@@ -6190,7 +6249,7 @@ const start = async () => {
     // fetched (SSRF guard). The seeded "Family Calendar" placeholder
     // (.invalid host) is skipped by the service itself.
     if (DEMO_MODE) {
-      calendarSyncService = new CalendarSyncService(db, decryptPassword);
+      calendarSyncService = new CalendarSyncService(null, decryptPassword);
       if (process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
         calendarSyncService.initialize();
         console.log('Calendar sync enabled in demo mode (seeded demo feeds only; source management is demo-blocked)');
@@ -6198,7 +6257,7 @@ const start = async () => {
         console.log('Calendar sync jobs disabled in demo mode by HOMEGLOW_DISABLE_CALENDAR_SYNC=1 (cached events only)');
       }
     } else if (process.env.HOMEGLOW_DISABLE_CALENDAR_SYNC !== '1') {
-      calendarSyncService = new CalendarSyncService(db, decryptPassword);
+      calendarSyncService = new CalendarSyncService(null, decryptPassword);
       calendarSyncService.initialize();
       console.log('Calendar sync service started');
     } else {

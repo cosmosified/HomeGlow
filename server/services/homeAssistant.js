@@ -12,6 +12,7 @@
 
 const { encrypt, decrypt, isEncryptionConfigured } = require('../utils/encryption');
 const { fetchTlsOptions, isCertificateVerificationSkipped } = require('../utils/outboundTls');
+const { Setting } = require('../db/models');
 
 const URL_KEY = 'HOME_ASSISTANT_URL';
 const TOKEN_KEY = 'HOME_ASSISTANT_TOKEN_ENC';
@@ -20,13 +21,13 @@ const WEATHER_ENTITY_KEY = 'HOME_ASSISTANT_WEATHER_ENTITY';
 const DEFAULT_WEATHER_ENTITY = 'weather.home';
 const REQUEST_TIMEOUT_MS = 10000;
 
-function getSetting(db, key) {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+async function getSetting(key) {
+    const row = await Setting.query().findById(key);
     return row ? row.value : null;
 }
 
-function setSetting(db, key, value) {
-    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
+async function setSetting(key, value) {
+    await Setting.query().insert({ key, value }).onConflict('key').merge();
 }
 
 // Accepts "http://homeassistant.local:8123" or a bare "homeassistant.local:8123",
@@ -64,16 +65,16 @@ function normalizeBaseUrl(rawUrl) {
     return `${parsed.protocol}//${parsed.host}`;
 }
 
-function getConfig(db) {
+async function getConfig() {
     return {
-        baseUrl: getSetting(db, URL_KEY) || '',
-        tokenEnc: getSetting(db, TOKEN_KEY) || '',
-        weatherEntity: getSetting(db, WEATHER_ENTITY_KEY) || DEFAULT_WEATHER_ENTITY,
+        baseUrl: (await getSetting(URL_KEY)) || '',
+        tokenEnc: (await getSetting(TOKEN_KEY)) || '',
+        weatherEntity: (await getSetting(WEATHER_ENTITY_KEY)) || DEFAULT_WEATHER_ENTITY,
     };
 }
 
-function getHomeAssistantStatus(db) {
-    const { baseUrl, tokenEnc, weatherEntity } = getConfig(db);
+async function getHomeAssistantStatus() {
+    const { baseUrl, tokenEnc, weatherEntity } = await getConfig();
     return {
         has_url: !!baseUrl,
         has_token: !!tokenEnc,
@@ -86,35 +87,35 @@ function getHomeAssistantStatus(db) {
 // An empty/undefined token leaves the stored one alone, so the Admin Panel can
 // save a URL change without the user re-entering the token. Passing null
 // explicitly clears it.
-function saveConfig(db, { url, token, weatherEntity }) {
+async function saveConfig({ url, token, weatherEntity }) {
     if (url !== undefined) {
-        setSetting(db, URL_KEY, normalizeBaseUrl(url));
+        await setSetting(URL_KEY, normalizeBaseUrl(url));
     }
     if (token === null) {
-        setSetting(db, TOKEN_KEY, '');
+        await setSetting(TOKEN_KEY, '');
     } else if (token !== undefined && String(token).trim() !== '') {
-        setSetting(db, TOKEN_KEY, encrypt(String(token).trim()));
+        await setSetting(TOKEN_KEY, encrypt(String(token).trim()));
     }
     if (weatherEntity !== undefined) {
         const normalized = String(weatherEntity || '').trim();
-        setSetting(db, WEATHER_ENTITY_KEY, normalized || DEFAULT_WEATHER_ENTITY);
+        await setSetting(WEATHER_ENTITY_KEY, normalized || DEFAULT_WEATHER_ENTITY);
     }
 }
 
-function clearConfig(db) {
-    setSetting(db, URL_KEY, '');
-    setSetting(db, TOKEN_KEY, '');
-    setSetting(db, WEATHER_ENTITY_KEY, '');
+async function clearConfig() {
+    await setSetting(URL_KEY, '');
+    await setSetting(TOKEN_KEY, '');
+    await setSetting(WEATHER_ENTITY_KEY, '');
 }
 
-function isConfigured(db) {
-    const { baseUrl, tokenEnc } = getConfig(db);
+async function isConfigured() {
+    const { baseUrl, tokenEnc } = await getConfig();
     return !!baseUrl && !!tokenEnc;
 }
 
 // Calls through module.exports so tests can stub the transport.
-async function homeAssistantFetch(db, method, apiPath, body) {
-    const { baseUrl, tokenEnc } = getConfig(db);
+async function homeAssistantFetch(method, apiPath, body) {
+    const { baseUrl, tokenEnc } = await getConfig();
     if (!baseUrl) throw new Error('Home Assistant URL is not configured.');
     if (!tokenEnc) throw new Error('Home Assistant token is not configured.');
 
@@ -183,8 +184,8 @@ async function homeAssistantFetch(db, method, apiPath, body) {
     return parsed === null ? {} : parsed;
 }
 
-async function testConnection(db) {
-    const { baseUrl, tokenEnc } = getConfig(db);
+async function testConnection() {
+    const { baseUrl, tokenEnc } = await getConfig();
     if (!baseUrl) return { ok: false, message: 'No Home Assistant URL is configured.' };
     if (!tokenEnc) return { ok: false, message: 'No Home Assistant token is configured.' };
 
@@ -192,11 +193,11 @@ async function testConnection(db) {
         // GET /api/ is the documented health check; /api/config gives us the
         // version, which is worth showing so the operator can confirm they
         // reached the instance they meant to.
-        await module.exports.homeAssistantFetch(db, 'GET', '/api/');
+        await module.exports.homeAssistantFetch('GET', '/api/');
         let version = null;
         let locationName = null;
         try {
-            const config = await module.exports.homeAssistantFetch(db, 'GET', '/api/config');
+            const config = await module.exports.homeAssistantFetch('GET', '/api/config');
             version = config?.version || null;
             locationName = config?.location_name || null;
         } catch (_) {
@@ -215,14 +216,14 @@ async function testConnection(db) {
     }
 }
 
-async function getState(db, entityId) {
-    return await module.exports.homeAssistantFetch(db, 'GET', `/api/states/${encodeURIComponent(entityId)}`);
+async function getState(entityId) {
+    return await module.exports.homeAssistantFetch('GET', `/api/states/${encodeURIComponent(entityId)}`);
 }
 
 // Powers the Admin Panel's entity picker so the operator doesn't have to know
 // their entity id by heart.
-async function listWeatherEntities(db) {
-    const states = await module.exports.homeAssistantFetch(db, 'GET', '/api/states');
+async function listWeatherEntities() {
+    const states = await module.exports.homeAssistantFetch('GET', '/api/states');
     if (!Array.isArray(states)) return [];
     return states
         .filter((entry) => typeof entry?.entity_id === 'string' && entry.entity_id.startsWith('weather.'))

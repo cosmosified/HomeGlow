@@ -79,10 +79,9 @@ function isoToUnixSeconds(value) {
  * Returns an array (possibly empty) — never throws, because a missing forecast
  * should cost the user their forecast panel, not their whole weather widget.
  */
-async function fetchForecast(homeAssistant, db, entityId, type, fallbackAttributes) {
+async function fetchForecast(homeAssistant, entityId, type, fallbackAttributes) {
     try {
         const response = await homeAssistant.homeAssistantFetch(
-            db,
             'POST',
             '/api/services/weather/get_forecasts?return_response',
             { entity_id: entityId, type }
@@ -107,14 +106,13 @@ async function fetchForecast(homeAssistant, db, entityId, type, fallbackAttribut
 
 /**
  * @param {object} options
- * @param {object} options.db
  * @param {object} options.homeAssistant the services/homeAssistant module (injected for testing)
  * @param {string} options.entityId
  * @param {{lat:number, lon:number}} options.coordinates used for the payload; HA is location-agnostic
  * @param {'imperial'|'metric'} options.units
  */
-async function fetchWeather({ db, homeAssistant, entityId, coordinates, units }) {
-    const state = await homeAssistant.getState(db, entityId);
+async function fetchWeather({ homeAssistant, entityId, coordinates, units }) {
+    const state = await homeAssistant.getState(entityId);
 
     if (!state || typeof state !== 'object' || !state.attributes) {
         const err = new Error(`Home Assistant entity "${entityId}" was not found.`);
@@ -127,8 +125,8 @@ async function fetchWeather({ db, homeAssistant, entityId, coordinates, units })
     const windUnit = attributes.wind_speed_unit;
 
     const [dailyRaw, hourlyRaw] = await Promise.all([
-        fetchForecast(homeAssistant, db, entityId, 'daily', attributes),
-        fetchForecast(homeAssistant, db, entityId, 'hourly', attributes),
+        fetchForecast(homeAssistant, entityId, 'daily', attributes),
+        fetchForecast(homeAssistant, entityId, 'hourly', attributes),
     ]);
 
     const forecast = dailyRaw

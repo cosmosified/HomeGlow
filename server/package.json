@@ -7,7 +7,11 @@
     "start": "node index.js",
     "test": "node tests/runServerTests.js",
     "test-debug": "node tests/runServerTests.js --debug",
-    "test:coverage": "c8 --reporter=text-summary --reporter=html --reporter=lcov node tests/runServerTests.js"
+    "test:coverage": "c8 --reporter=text-summary --reporter=html --reporter=lcov node tests/runServerTests.js",
+    "migrate": "knex migrate:latest --knexfile knexfile.js",
+    "migrate:make": "knex migrate:make --knexfile knexfile.js",
+    "migrate:rollback": "knex migrate:rollback --knexfile knexfile.js",
+    "migrate:status": "knex migrate:status --knexfile knexfile.js"
   },
   "devDependencies": {
     "c8": "^11.0.0"
@@ -24,7 +28,9 @@
     "fastify": "^5.10.0",
     "ical-generator": "^10.2.0",
     "ical.js": "^2.2.1",
+    "knex": "^3.3.0",
     "node-cron": "^4.6.0",
-    "node-ical": "^0.26.0"
+    "node-ical": "^0.26.0",
+    "objection": "^3.1.5"
   }
 }

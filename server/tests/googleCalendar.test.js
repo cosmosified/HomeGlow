@@ -81,7 +81,7 @@ test('listCalendars paginates and maps response fields', async () => {
         };
     };
 
-    const calendars = await googleCalendar.listCalendars({}, 1);
+    const calendars = await googleCalendar.listCalendars(1);
 
     assert.equal(calls.length, 2);
     assert.ok(calls[0].url.includes('/users/me/calendarList'));
@@ -115,7 +115,7 @@ test('createEvent builds all-day payload and sends bearer token', async () => {
         };
     };
 
-    const created = await googleCalendar.createEvent({}, 1, 'primary', {
+    const created = await googleCalendar.createEvent(1, 'primary', {
         title: 'All Day Event',
         description: 'Desc',
         location: 'Home',
