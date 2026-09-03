@@ -1,6 +1,8 @@
 const axios = require('axios');
-const ICAL = require('ical.js');
 const { XMLParser } = require('fast-xml-parser');
+// The ICS reader lives in utils: an iCloud calendar, a subscription's upstream
+// feed and a generic CalDAV URL all need the same one.
+const { icsToEvents, isAllDaySpan } = require('../utils/icsEvents');
 
 const CALDAV_BASE = 'https://caldav.icloud.com';
 
@@ -370,35 +372,6 @@ async function discoverAndListCalendars(appleId, appPassword) {
   return { principalUrl, homeUrl, calendars };
 }
 
-// Convert a parsed ICS payload into HomeGlow event objects.
-function icsToEvents(icsContent) {
-  const comp = new ICAL.Component(ICAL.parse(icsContent));
-  const vevents = comp.getAllSubcomponents('vevent');
-  const events = [];
-
-  for (const vevent of vevents) {
-    const event = new ICAL.Event(vevent);
-    const dtstart = vevent.getFirstPropertyValue('dtstart');
-    const isAllDay = dtstart?.isDate ?? false;
-    const startDate = event.startDate.toJSDate();
-    const rawEnd = event.endDate.toJSDate();
-    const endDate = isAllDay ? subtractOneDay(rawEnd) : rawEnd;
-
-    events.push({
-      uid: event.uid || `apple-${Date.now()}-${Math.random()}`,
-      title: event.summary || 'Untitled Event',
-      start: startDate,
-      end: endDate,
-      description: event.description || null,
-      location: event.location || null,
-      all_day: isAllDay,
-      raw: {},
-    });
-  }
-
-  return events;
-}
-
 // Ask iCloud whether a collection is a subscription, and if so where its events
 // really live. Depth:0 so it stays a cheap single-resource lookup.
 async function describeCollection(calendarUrl, appleId, appPassword) {
@@ -502,12 +475,6 @@ async function fetchCalendarEvents(calendarUrl, appleId, appPassword) {
   return events;
 }
 
-function subtractOneDay(date) {
-  const d = new Date(date);
-  d.setDate(d.getDate() - 1);
-  return d;
-}
-
 module.exports = {
   discoverAndListCalendars,
   fetchCalendarEvents,
@@ -519,5 +486,7 @@ module.exports = {
   parseCollectionSource,
   normalizeFeedUrl,
   extractIcsPayloads,
+  // Re-exported from utils/icsEvents so existing callers keep one import.
   icsToEvents,
+  isAllDaySpan,
 };

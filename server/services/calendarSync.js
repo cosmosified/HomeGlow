@@ -1,10 +1,11 @@
 const axios = require('axios');
-const ICAL = require('ical.js');
 const node_ical = require('node-ical');
 const googleConnection = require('./googleConnection');
 const googleCalendar = require('./googleCalendar');
 const appleCalDAV = require('./appleCalDAV');
 const { dedupeCalendarEvents } = require('../utils/calendarDedup');
+const { DAY_MS, utcMidnightFromLocalDate, inclusiveAllDayEnd } = require('../utils/calendarDates');
+const { icsToEvents } = require('../utils/icsEvents');
 
 class CalendarSyncService {
   constructor(db, decryptPassword) {
@@ -23,6 +24,18 @@ class CalendarSyncService {
     const d = new Date(end);
     d.setDate(d.getDate() - 1);
     return d;
+  }
+
+  // node-ical resolves date-only values against the server's local midnight,
+  // which bakes this machine's timezone into the cached row. Re-anchor the pair
+  // to UTC midnight of the calendar date so a display in another zone still
+  // renders the event on the day the feed named. See utils/calendarDates.
+  normalizeAllDayRange(start, end) {
+    const utcStart = utcMidnightFromLocalDate(start);
+    const exclusiveEnd = end === undefined || end === null
+      ? new Date(utcStart.getTime() + DAY_MS)
+      : utcMidnightFromLocalDate(end);
+    return { start: utcStart, end: inclusiveAllDayEnd(utcStart, exclusiveEnd) };
   }
 
   normalizeIcsTextValue(value) {
@@ -148,11 +161,14 @@ class CalendarSyncService {
       if (!instances) {
         const isAllDay = event.start?.dateOnly ?? false;
         const rawEnd = event.end;
+        const times = isAllDay
+          ? this.normalizeAllDayRange(event.start, rawEnd)
+          : { start: new Date(event.start), end: new Date(rawEnd) };
         out.push({
           uid: event.uid || `${source.id}-${Date.now()}-${Math.random()}`,
           title: this.normalizeIcsTextValue(event.summary) || 'Untitled Event',
-          start: new Date(event.start),
-          end: isAllDay ? this.normalizeAllDayEnd(rawEnd) : new Date(rawEnd),
+          start: times.start,
+          end: times.end,
           description: this.normalizeIcsTextValue(event.description),
           location: this.normalizeIcsTextValue(event.location),
           all_day: isAllDay,
@@ -163,12 +179,16 @@ class CalendarSyncService {
 
       for (const instance of instances) {
         const isAllDay = instance.start?.dateOnly ?? instance.event?.start?.dateOnly ?? false;
+        const rawStart = instance.start ?? instance.event?.start;
         const rawEnd = instance.end ?? instance.event?.end;
+        const times = isAllDay
+          ? this.normalizeAllDayRange(rawStart, rawEnd)
+          : { start: new Date(rawStart), end: new Date(rawEnd) };
         out.push({
-          uid: `${instance.uid ?? instance.event?.uid ?? source.id}-${new Date(instance.start ?? instance.event?.start).getTime()}`,
+          uid: `${instance.uid ?? instance.event?.uid ?? source.id}-${new Date(rawStart).getTime()}`,
           title: this.normalizeIcsTextValue(instance.summary ?? instance.event?.summary) || 'Untitled Event',
-          start: new Date(instance.start ?? instance.event?.start),
-          end: isAllDay ? this.normalizeAllDayEnd(rawEnd) : new Date(rawEnd),
+          start: times.start,
+          end: times.end,
           description: this.normalizeIcsTextValue(instance.description ?? instance.event?.description),
           location: this.normalizeIcsTextValue(instance.location ?? instance.event?.location),
           all_day: isAllDay,
@@ -180,37 +200,42 @@ class CalendarSyncService {
     return out;
   }
 
+  // A "CalDAV" source is an ICS document behind HTTP basic auth: the calendar
+  // export URL of a Nextcloud/Baikal/Radicale install, or any private ICS feed.
+  // (iCloud is its own source type — it needs PROPFIND discovery, see
+  // fetchAppleCalDAVEvents.)
+  //
+  // Parsing is delegated to the shared ICS reader. This used to hand-roll it,
+  // which meant a recurring event was cached once at the date the series began,
+  // and an all-day event was anchored to the server's local midnight — landing
+  // it on the previous day on any display in another timezone.
   async fetchCalDAVEvents(source) {
     const decryptedPassword = this.decryptPassword(source.password);
     const authHeader = 'Basic ' + Buffer.from(`${source.username}:${decryptedPassword}`).toString('base64');
 
     const response = await axios.get(source.url, {
       headers: { 'Authorization': authHeader },
-      timeout: 15000
+      timeout: 15000,
+      responseType: 'text',
+      // Keep the body a raw string; the ICS reader needs the original text.
+      transformResponse: [(data) => data],
+      maxRedirects: 5,
+      validateStatus: (s) => s < 500,
     });
 
-    const icsData = response.data;
-    const jcalData = ICAL.parse(icsData);
-    const comp = new ICAL.Component(jcalData);
-    const vevents = comp.getAllSubcomponents('vevent');
+    if (response.status !== 200) {
+      throw new Error(`CalDAV request failed (HTTP ${response.status}). Check the URL and credentials.`);
+    }
 
-    return vevents.map(vevent => {
-      const event = new ICAL.Event(vevent);
-      const dtstart = vevent.getFirstPropertyValue('dtstart');
-      const isAllDay = dtstart?.isDate ?? false;
-      const rawEnd = event.endDate.toJSDate();
+    const icsData = typeof response.data === 'string' ? response.data : '';
 
-      return {
-        uid: event.uid || `${source.id}-${Date.now()}-${Math.random()}`,
-        title: event.summary || 'Untitled Event',
-        start: event.startDate.toJSDate(),
-        end: isAllDay ? this.normalizeAllDayEnd(rawEnd) : rawEnd,
-        description: event.description,
-        location: event.location,
-        all_day: isAllDay,
-        raw: {}
-      };
-    });
+    // A collection URL that needs a REPORT, or an auth redirect, answers 200 with
+    // XML or a login page. Say so, rather than surfacing an ical.js parse error.
+    if (!icsData.includes('BEGIN:VCALENDAR')) {
+      throw new Error('CalDAV URL did not return an iCalendar document. Use the calendar\'s ICS export URL.');
+    }
+
+    return icsToEvents(icsData);
   }
 
   async fetchAppleCalDAVEvents(source) {
